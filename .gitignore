@@ -1,0 +1,29 @@
+# --- secrets & runtime data ---
+config.yaml
+data/
+!data/.gitkeep
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- editor ---
+.idea/
+.vscode/
+
+# --- dev ---
+CLAUDE.md
+spec.md
+spec-*
+AGENTS.md
+.agents
+
+# --- test ---
+.pytest_cache/
+.pytest-tmp/
+
+# --- custom ---
+config.md
