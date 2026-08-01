@@ -1,4 +1,4 @@
-# jira-safe-mcp
+# jira-local-mcp
 
 一个本地 STDIO MCP 服务，为大模型 Agent 提供 JIRA 能力，核心安全边界：
 
@@ -32,9 +32,9 @@ python server.py
 ```json
 {
   "mcpServers": {
-    "jira-safe-mcp": {
-      "command": "D:/SoftwareInstalled/miniconda3/envs/jira-dev/python.exe",
-      "args": ["D:/DevelopmentSpace/Jira-local-MCP/server.py"]
+    "jira-local-mcp": {
+      "command": "python",
+      "args": ["%{LOCAL_MCP_STORAGE_PATH}/Jira-local-MCP/server.py"]
     }
   }
 }

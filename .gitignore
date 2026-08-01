@@ -16,10 +16,12 @@ venv/
 
 # --- dev ---
 CLAUDE.md
+AGENTS.md
+.agents/
+.workbuddy/
+.dev/
 spec.md
 spec-*
-AGENTS.md
-.agents
 
 # --- test ---
 .pytest_cache/

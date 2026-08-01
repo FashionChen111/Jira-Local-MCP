@@ -1,4 +1,4 @@
-"""jira-safe-mcp —— JIRA 安全操作 MCP 服务入口。
+"""jira-local-mcp —— JIRA 安全操作本地 MCP 服务入口。
 
 层次：
   - 读工具：直连 JIRA，返回结果（无副作用）。
@@ -30,7 +30,7 @@ from knowledge.prompts import PROMPTS
 
 _KNOWLEDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge")
 
-mcp = FastMCP("jira-safe-mcp")
+mcp = FastMCP("jira-local-mcp")
 
 JIRA_QUERY_LIMIT_MIN = 1
 
@@ -694,7 +694,7 @@ def res_service_info() -> str:
     """服务元信息（不含任何凭证）。"""
     cfg = get_config()
     info = {
-        "service": "jira-safe-mcp",
+        "service": "jira-local-mcp",
         "version": SERVICE_VERSION,
         "web_port_default": cfg.web_port,
         "queue_expire_minutes": cfg.expire_minutes,
@@ -736,5 +736,5 @@ def no_delete_checklist() -> str:
 # 入口
 # ============================================================
 if __name__ == "__main__":
-    get_logger().info(f"jira-safe-mcp v{SERVICE_VERSION} 启动（STDIO）")
+    get_logger().info(f"jira-local-mcp v{SERVICE_VERSION} 启动（STDIO）")
     mcp.run(transport="stdio")

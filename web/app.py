@@ -120,7 +120,7 @@ def _unauthorized() -> JSONResponse:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="jira-safe-mcp confirm")
+    app = FastAPI(title="jira-local-mcp confirm")
 
     def _batch_payload(batch: Any) -> dict[str, Any]:
         return {
