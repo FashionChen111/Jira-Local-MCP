@@ -1,9 +1,5 @@
-"""Web 确认服务（FastAPI + 内嵌 uvicorn）。
+"""Localhost-only authenticated review and authorization service."""
 
-- 仅监听 127.0.0.1，端口冲突自动递增（spec §8.4）。
-- 在 daemon 线程中运行 uvicorn，MCP 主进程不阻塞。
-- 提交 /api/commit 是唯一真实执行入口，绝不通过 MCP 暴露；需 nonce 校验。
-"""
 from __future__ import annotations
 
 import os
@@ -13,82 +9,108 @@ import threading
 import time
 from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from config import get_config
-from core import commit_guard, jira_executor
-from core.audit_logger import get_logger
-from core.queue_manager import get_queue
+from core import jira_client
+from core.execution import worker as execution_worker
+from core.runtime_logger import get_logger
+from core.operations import (
+    ConfirmationRequired,
+    ExecutionBlocked,
+    RevisionConflict,
+    StoreError,
+    get_store,
+)
 
-_TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
-_templates = Jinja2Templates(directory=_TEMPLATES_DIR)
-
-# Web 服务运行时状态
+_WEB_DIR = os.path.dirname(os.path.abspath(__file__))
+_templates = Jinja2Templates(directory=os.path.join(_WEB_DIR, "templates"))
 _server_lock = threading.Lock()
 _server_thread: threading.Thread | None = None
 _server: Any | None = None
 _actual_port: int | None = None
-
 _STARTUP_TIMEOUT_SECONDS = 5.0
 _BOOTSTRAP_TTL_SECONDS = 60.0
 _SESSION_TTL_SECONDS = 15 * 60.0
 _SESSION_COOKIE = "jira_confirm_session"
-
-# bootstrap capability 只交给默认浏览器；换取的会话仅保存在 HttpOnly Cookie 中。
 _session_lock = threading.Lock()
 _bootstrap_tokens: dict[str, float] = {}
 _sessions: dict[str, float] = {}
-
-BATCH_ID_PATTERN = r"^batch-[0-9a-f]{32}$"
-TASK_ID_PATTERN = r"^task-[0-9a-f]{32}$"
-NONCE_PATTERN = r"^[0-9A-Fa-f]{8}$"
-
-BatchId = Annotated[str, Field(pattern=BATCH_ID_PATTERN)]
-TaskId = Annotated[str, Field(pattern=TASK_ID_PATTERN)]
+OperationId = Annotated[str, Field(pattern=r"^op-[0-9a-f]{32}$")]
 
 
-class CommitRequest(BaseModel):
-    """严格的提交请求；未知字段和隐式类型转换均拒绝。"""
-
+class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    batch_id: BatchId
-    task_ids: list[TaskId] = Field(min_length=1, max_length=1000)
-    nonce: str = Field(pattern=NONCE_PATTERN)
+
+class IdListModel(StrictModel):
+    operation_ids: list[OperationId] = Field(min_length=1, max_length=1000)
+
+    @field_validator("operation_ids")
+    @classmethod
+    def unique_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("operation_ids 不得重复")
+        return value
 
 
-class CancelRequest(BaseModel):
-    """严格的整批取消请求。"""
+class QueueGroup(StrictModel):
+    issue_key: str = Field(min_length=1, max_length=255)
+    operation_ids: list[OperationId] = Field(min_length=1, max_length=1000)
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    @field_validator("operation_ids")
+    @classmethod
+    def unique_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("组内 operation_ids 不得重复")
+        return value
 
-    batch_id: BatchId
+
+class ReorderRequest(StrictModel):
+    expected_queue_revision: int = Field(ge=0)
+    groups: list[QueueGroup] = Field(max_length=1000)
+    standalone_operation_ids: list[OperationId] = Field(max_length=1000)
+
+    @model_validator(mode="after")
+    def complete_unique_layout(self) -> "ReorderRequest":
+        ids = [item for group in self.groups for item in group.operation_ids]
+        ids.extend(self.standalone_operation_ids)
+        if len(ids) > 1000:
+            raise ValueError("排序布局最多包含 1000 个 operation")
+        if len(ids) != len(set(ids)):
+            raise ValueError("排序布局中的 operation ID 不得重复")
+        if len({group.issue_key for group in self.groups}) != len(self.groups):
+            raise ValueError("issue 分组不得重复")
+        return self
 
 
-class ResolveIndeterminateRequest(BaseModel):
-    """人工处置不确定任务；该操作本身不会写 Jira。"""
+class SubmitRequest(IdListModel):
+    expected_queue_revision: int = Field(ge=0)
+    high_risk_confirmed: bool
 
-    model_config = ConfigDict(extra="forbid", strict=True)
 
-    batch_id: BatchId
-    task_id: TaskId
+class ResolveIndeterminateRequest(StrictModel):
+    operation_id: OperationId
     resolution: Literal["succeeded", "not_applied", "abandoned"]
+    high_risk_confirmed: bool = False
+
+
+class ResolveHeldRequest(IdListModel):
+    action: Literal["resume", "requeue", "abandon"]
 
 
 def _purge_expired_sessions_locked(now: float) -> None:
-    for token, expires_at in list(_bootstrap_tokens.items()):
-        if expires_at <= now:
-            del _bootstrap_tokens[token]
-    for session_id, expires_at in list(_sessions.items()):
-        if expires_at <= now:
-            del _sessions[session_id]
+    for mapping in (_bootstrap_tokens, _sessions):
+        for token, expires_at in list(mapping.items()):
+            if expires_at <= now:
+                del mapping[token]
 
 
 def create_confirmation_url(base_url: str) -> str:
-    """创建只供默认浏览器使用的一次性、短时 bootstrap capability。"""
     token = secrets.token_urlsafe(32)
     now = time.monotonic()
     with _session_lock:
@@ -98,7 +120,6 @@ def create_confirmation_url(base_url: str) -> str:
 
 
 def confirmation_session_ttl_minutes() -> int:
-    """返回供确认工具向用户展示的浏览器会话有效分钟数。"""
     return int(_SESSION_TTL_SECONDS // 60)
 
 
@@ -109,40 +130,52 @@ def _has_valid_session(request: Request) -> bool:
     now = time.monotonic()
     with _session_lock:
         _purge_expired_sessions_locked(now)
-        expires_at = _sessions.get(session_id)
-        if expires_at is None:
-            return False
-        return True
+        return session_id in _sessions
 
 
 def _unauthorized() -> JSONResponse:
     return JSONResponse({"error": "确认会话无效，请重新打开确认页面"}, status_code=403)
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="jira-local-mcp confirm")
+def _store_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, ConfirmationRequired):
+        code = "confirmation_required"
+    elif isinstance(exc, RevisionConflict):
+        code = "revision_conflict"
+    elif isinstance(exc, ExecutionBlocked):
+        code = "execution_blocked"
+    else:
+        code = "state_conflict"
+    return JSONResponse({"error": str(exc), "code": code}, status_code=409)
 
-    def _batch_payload(batch: Any) -> dict[str, Any]:
-        return {
-            "batch_id": batch.batch_id,
-            "nonce": batch.nonce,  # nonce 仅经此 HTTP 通道展示
-            "created_at": batch.created_at,
-            "kind": batch.kind,
-            "recovery_from": batch.recovery_from,
-            "tasks": [
-                task.to_public_dict()
-                for task in batch.tasks
-                if task.state == "pending"
-            ],
-        }
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="jira-local-mcp review")
+    app.mount(
+        "/static",
+        StaticFiles(directory=os.path.join(_WEB_DIR, "static")),
+        name="static",
+    )
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Any) -> Response:
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        )
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/", response_class=HTMLResponse)
-    @app.get("/queue/all", response_class=HTMLResponse)
-    def confirm_page(request: Request) -> Any:
+    @app.get("/queue", response_class=HTMLResponse)
+    def review_page(request: Request) -> Any:
         if not _has_valid_session(request):
             return HTMLResponse(
-                "确认会话无效，请重新调用 jira_show_pending_queue 打开确认页面。",
-                status_code=403,
+                "确认会话无效，请重新调用 jira_show_queue。", status_code=403
             )
         return _templates.TemplateResponse(request, "confirm.html", {})
 
@@ -154,13 +187,11 @@ def create_app() -> FastAPI:
             expires_at = _bootstrap_tokens.pop(token, None)
             if expires_at is None or expires_at <= now:
                 return HTMLResponse(
-                    "确认链接无效或已过期，请重新打开确认页面。",
-                    status_code=403,
+                    "确认链接无效或已过期，请重新打开确认页面。", status_code=403
                 )
             session_id = secrets.token_urlsafe(32)
             _sessions[session_id] = now + _SESSION_TTL_SECONDS
-
-        response = RedirectResponse("/queue/all", status_code=303)
+        response = RedirectResponse("/queue", status_code=303)
         response.set_cookie(
             _SESSION_COOKIE,
             session_id,
@@ -169,137 +200,159 @@ def create_app() -> FastAPI:
             samesite="strict",
             path="/",
         )
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
-    @app.get("/api/queue/all")
-    def api_queue(request: Request) -> Any:
+    @app.get("/api/state")
+    def api_state(request: Request) -> Any:
         if not _has_valid_session(request):
             return _unauthorized()
-        queue = get_queue()
-        queue.recover_interrupted_tasks()
-        batches = [
-            _batch_payload(batch)
-            for batch in queue.list_presented_batches()
-        ]
-        attention_required = []
-        for task in queue.list_indeterminate_tasks():
-            item = task.to_public_dict()
-            item["state"] = task.state
-            attention_required.append(item)
-        return JSONResponse(
-            {
-                "batches": batches,
-                "attention_required": attention_required,
-                "execution_busy": commit_guard.execution_busy(),
-            }
-        )
+        state = get_store().get_state()
+        revisions = state["revisions"]
+        etag = f'W/"q{revisions["queue"]}-e{revisions["execution"]}-h{revisions["history"]}"'
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers={"ETag": etag})
+        return JSONResponse(state, headers={"ETag": etag})
 
-    @app.post("/api/commit")
-    async def api_commit(request: Request, body: CommitRequest) -> Any:
+    @app.post("/api/queue/reorder")
+    def api_reorder(request: Request, body: ReorderRequest) -> Any:
         if not _has_valid_session(request):
             return _unauthorized()
         try:
-            result = jira_executor.execute_batch(
-                body.batch_id, body.task_ids, body.nonce
+            revision = get_store().reorder(
+                body.expected_queue_revision,
+                [group.model_dump() for group in body.groups],
+                body.standalone_operation_ids,
             )
-            return JSONResponse(result)
-        except jira_executor.CommitBusyError as e:
-            return JSONResponse({"error": str(e)}, status_code=409)
-        except jira_executor.CommitError as e:
-            return JSONResponse({"error": str(e)}, status_code=400)
-        except Exception as e:  # 兜底，不泄露栈
-            get_logger().error(f"/api/commit 异常: {type(e).__name__}")
-            return JSONResponse({"error": "服务器内部错误"}, status_code=500)
+            return JSONResponse({"queue_revision": revision})
+        except (StoreError, ValueError) as exc:
+            return _store_error(exc)
 
-    @app.post("/api/cancel")
-    async def api_cancel(request: Request, body: CancelRequest) -> Any:
+    @app.post("/api/queue/cancel")
+    def api_cancel(request: Request, body: IdListModel) -> Any:
         if not _has_valid_session(request):
             return _unauthorized()
-        removed = get_queue().remove_batch(body.batch_id)
-        if not removed:
-            raise HTTPException(status_code=404, detail="批次不存在或不可取消")
-        return JSONResponse({"batch_id": body.batch_id, "removed": removed})
+        try:
+            revision = get_store().cancel(body.operation_ids)
+            return JSONResponse(
+                {
+                    "cancelled_operation_ids": body.operation_ids,
+                    "queue_revision": revision,
+                }
+            )
+        except StoreError as exc:
+            return _store_error(exc)
 
-    @app.post("/api/indeterminate/resolve")
-    async def api_resolve_indeterminate(
+    @app.post("/api/queue/submit")
+    def api_submit(request: Request, body: SubmitRequest) -> Any:
+        if not _has_valid_session(request):
+            return _unauthorized()
+        try:
+            store = get_store()
+            store.validate_submission(
+                body.expected_queue_revision,
+                body.operation_ids,
+                body.high_risk_confirmed,
+            )
+            if not jira_client.ping():
+                return JSONResponse(
+                    {"error": "Jira 连接不可用，队列保持不变"}, status_code=503
+                )
+            accepted, revisions = store.submit(
+                body.expected_queue_revision,
+                body.operation_ids,
+                body.high_risk_confirmed,
+            )
+            execution_worker.wake_worker()
+            return JSONResponse(
+                {"accepted_operation_ids": accepted, "revisions": revisions},
+                status_code=202,
+            )
+        except (StoreError, ValueError) as exc:
+            return _store_error(exc)
+        except Exception as exc:
+            get_logger().error(f"/api/queue/submit 异常: {type(exc).__name__}")
+            return JSONResponse({"error": "服务器内部错误"}, status_code=500)
+
+    @app.post("/api/execution/indeterminate/resolve")
+    def api_resolve_indeterminate(
         request: Request, body: ResolveIndeterminateRequest
     ) -> Any:
         if not _has_valid_session(request):
             return _unauthorized()
         try:
-            result = get_queue().resolve_indeterminate(
-                body.batch_id, body.task_id, body.resolution
+            result = get_store().resolve_indeterminate(
+                body.operation_id, body.resolution, body.high_risk_confirmed
             )
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=409)
-        jira_executor.append_reconciliation_log(body.batch_id, result)
+            execution_worker.wake_worker()
+            return JSONResponse(result)
+        except StoreError as exc:
+            return _store_error(exc)
+
+    @app.post("/api/execution/held/resolve")
+    def api_resolve_held(request: Request, body: ResolveHeldRequest) -> Any:
+        if not _has_valid_session(request):
+            return _unauthorized()
+        try:
+            result = get_store().resolve_held(body.operation_ids, body.action)
+            execution_worker.wake_worker()
+            return JSONResponse(result)
+        except StoreError as exc:
+            return _store_error(exc)
+
+    @app.get("/api/execution-history")
+    def api_execution_history(
+        request: Request,
+        start_at: int | None = Query(default=None, ge=0),
+        end_at: int | None = Query(default=None, ge=0),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=50, ge=1, le=200),
+    ) -> Any:
+        if not _has_valid_session(request):
+            return _unauthorized()
+        if start_at is not None and end_at is not None and end_at <= start_at:
+            return JSONResponse({"error": "end_at 必须晚于 start_at"}, status_code=422)
         return JSONResponse(
-            {
-                "batch_id": body.batch_id,
-                "task_id": body.task_id,
-                "state": result.resolved_state,
-                "resolution": body.resolution,
-                "execution_id": result.original_task.execution_id,
-                "recovery_task_id": (
-                    result.recovery_task.task_id if result.recovery_task else None
-                ),
-                "recovery_batch_id": result.recovery_batch_id,
-            }
+            get_store().execution_history(start_at, end_at, page, page_size)
         )
 
     return app
 
 
 def _find_free_port(start: int) -> int:
-    port = start
-    for _ in range(100):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", port)) != 0:
-                return port  # 未占用
-        port += 1
+    for port in range(start, start + 100):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if sock.connect_ex(("127.0.0.1", port)) != 0:
+                return port
     raise RuntimeError(f"未能在 {start}-{start+99} 找到可用端口")
 
 
 def ensure_started() -> str:
-    """确保 Web 服务已启动，返回访问 base url。幂等。"""
     global _server_thread, _server, _actual_port
+    execution_worker.start_worker()
     with _server_lock:
         if _server_thread is not None and _server_thread.is_alive():
             if _actual_port is None:
-                raise RuntimeError("Web 确认服务仍在启动，尚未就绪")
+                raise RuntimeError("Web 服务仍在启动")
             return f"http://127.0.0.1:{_actual_port}"
-
         import uvicorn
 
-        cfg = get_config()
-        port = _find_free_port(cfg.web_port)
+        port = _find_free_port(get_config().web_port)
         _actual_port = None
-        app = create_app()
-
-        config = uvicorn.Config(
-            app,
-            host="127.0.0.1",
-            port=port,
-            log_level="warning",
-            # uvicorn 默认日志走 stderr（access/default），不污染 stdout
+        server = uvicorn.Server(
+            uvicorn.Config(
+                create_app(), host="127.0.0.1", port=port, log_level="warning"
+            )
         )
-        server = uvicorn.Server(config)
         _server = server
-
-        def _run() -> None:
-            server.run()
-
-        _server_thread = threading.Thread(target=_run, daemon=True, name="jira-web")
+        _server_thread = threading.Thread(
+            target=server.run, daemon=True, name="jira-web"
+        )
         _server_thread.start()
-
         deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             if not _server_thread.is_alive():
                 _server_thread = None
                 _server = None
-                _actual_port = None
                 raise RuntimeError("Web 确认服务启动失败")
             if server.started:
                 _actual_port = port
@@ -310,14 +363,6 @@ def ensure_started() -> str:
             _server_thread.join(timeout=1)
             _server_thread = None
             _server = None
-            _actual_port = None
-            raise RuntimeError("Web 确认服务启动超时，Uvicorn 尚未就绪")
-
+            raise RuntimeError("Web 确认服务启动超时")
         get_logger().info(f"Web 确认服务已启动: http://127.0.0.1:{port}")
         return f"http://127.0.0.1:{port}"
-
-
-def get_base_url() -> str | None:
-    if _actual_port is None:
-        return None
-    return f"http://127.0.0.1:{_actual_port}"

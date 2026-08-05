@@ -1,9 +1,9 @@
-"""风险识别引擎 + 两阶段校验 + 删除语义拦截。
+"""Risk classification, target validation, and delete-semantic defence.
 
 三项职责：
-  1. classify_risk() —— 按 spec §6.3 给操作分级 low/medium/high。
-  2. check_two_phase() —— 入队修改类任务时拒绝"同批次针对本批次新建事务"的操作。
-  3. assert_not_delete() —— 防御式：白名单外操作类型、含删除语义的 payload 一律拒绝。
+  1. classify_risk() —— 给不可编辑的基础 operation 快照分级。
+  2. validate_operation_target() —— 拒绝用占位 issue key 串联尚未执行的创建操作。
+  3. assert_not_delete() —— 防御式拒绝白名单外类型和含删除语义的 payload。
 """
 from __future__ import annotations
 
@@ -38,9 +38,6 @@ HIGH_OPS = {"move_issue", "change_type", "transition_issue"}
 
 # 关闭/解决类流转关键词（高危附加说明）
 _CLOSE_KEYWORDS = ["关闭", "解决", "完成", "close", "resolve", "done", "cancel"]
-
-# 批量字段修改升级为高危的阈值：同批次对同一 issue 的字段修改任务数
-_BULK_FIELD_THRESHOLD = 5
 
 # 删除语义词（payload 深度扫描）
 _DELETE_PATTERN = re.compile(r"delete|remove|purge|删除|移除", re.IGNORECASE)
@@ -77,50 +74,17 @@ def classify_risk(operation_type: str, payload: dict[str, Any]) -> tuple[str, st
     return "high", "未知操作类型，按最高风险处理"
 
 
-def maybe_escalate_bulk_fields(tasks: list[Any]) -> None:
-    """对同批次同一 issue 的字段修改任务数超阈值者，升级为高危（批量字段修改）。
-
-    tasks 为 PendingTask 列表（需具备 operation_type / issue_key / risk_level 属性）。
-    就地修改 risk_level。
-    """
-    counter: dict[str, int] = {}
-    for t in tasks:
-        if t.operation_type in ("update_field", "update_custom_field") and t.issue_key:
-            counter[t.issue_key] = counter.get(t.issue_key, 0) + 1
-    hot = {k for k, c in counter.items() if c >= _BULK_FIELD_THRESHOLD}
-    for t in tasks:
-        if (
-            t.operation_type in ("update_field", "update_custom_field")
-            and t.issue_key in hot
-        ):
-            t.risk_level = "high"
-
-
-def check_two_phase(
-    operation_type: str, issue_key: str | None, batch_tasks: list[Any]
-) -> None:
-    """两阶段校验：禁止同批次内出现针对"本批次新建事务"的修改。
-
-    规则：若同批次已存在 create/clone 任务，则本批次任何修改类任务的
-    issue_key 必须是一个合法且真实存在的 key（形态校验）；不得为空、
-    不得含占位符（$ / {）。因为新建事务在确认前没有真实 issue_key。
-
-    Raises:
-        RiskError: 违反两阶段约束。
-    """
+def validate_operation_target(operation_type: str, issue_key: str | None) -> None:
+    """Reject placeholder chaining; modifications require a real-looking Jira key."""
     if operation_type not in MODIFY_OPS:
-        return  # 只约束修改类
-    has_create = any(t.operation_type in CREATE_OPS for t in batch_tasks)
-    if not has_create:
         return
 
     guide = (
-        "❌ 违反两阶段工作流：本批次已包含「新建/克隆事务」任务，"
-        "不能在同一批次内追加针对新事务的修改操作。\n"
+        "❌ 修改操作必须使用 Jira 已实际生成的 issue key，不能引用待创建事务或占位符。\n"
         "正确流程：\n"
-        "  1) 先只提交创建批次，等用户在页面确认执行；\n"
-        "  2) 调用 jira_get_commit_log 取回真实 issue_key；\n"
-        "  3) 用真实 issue_key 在新批次追加修改，再次确认。\n"
+        "  1) 先提交并执行创建 operation；\n"
+        "  2) 调用 jira_get_execution_log 取回真实 issue_key；\n"
+        "  3) 用真实 issue_key 新建修改 operation，再次审核。\n"
         "提示：能在创建时一并设置的字段，请直接写在创建调用里，不要拆到第二阶段。"
     )
 

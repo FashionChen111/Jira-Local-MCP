@@ -20,18 +20,6 @@ web:
   # Web 确认页默认端口，冲突时自动递增
   port: 8766
 
-queue:
-  # 待执行任务过期时长（分钟）
-  expire_minutes: 30
-  # 单个确认批次最多容纳的任务数；达到上限后自动切换到新批次
-  max_tasks_per_batch: 20
-
 files:
   # description_file 等本地 txt 文件读取的大小上限（字节），默认 256KB
   max_txt_bytes: 262144
-
-log:
-  # 审计日志与运行日志目录，相对路径以项目根为基准
-  dir: "data"
-  # 保留的历史提交记录条数
-  commit_log_keep: 200

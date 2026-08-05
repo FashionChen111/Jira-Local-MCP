@@ -10,7 +10,7 @@ import threading
 from typing import Any
 
 from config import get_config
-from core.audit_logger import get_logger
+from core.runtime_logger import get_logger
 
 _client: Any = None
 _lock = threading.Lock()

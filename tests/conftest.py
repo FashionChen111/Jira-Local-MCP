@@ -1,4 +1,4 @@
-"""pytest 公共夹具：注入临时目录配置，重置队列/客户端单例。"""
+"""Shared fixtures with all runtime output under pytest's tmp_path."""
 from __future__ import annotations
 
 import os
@@ -15,31 +15,47 @@ from config import Config, JiraConfig
 @pytest.fixture
 def cfg(tmp_path):
     data_dir = str(tmp_path / "data")
-    audit_dir = os.path.join(data_dir, "audit")
-    os.makedirs(audit_dir, exist_ok=True)
-    c = Config(
-        jira=JiraConfig(url="https://jira.example.com", auth_type="pat", token="SECRET_TOKEN"),
+    os.makedirs(data_dir, exist_ok=True)
+    value = Config(
+        jira=JiraConfig(
+            url="https://jira.example.com", auth_type="pat", token="SECRET_TOKEN"
+        ),
         web_port=8766,
-        expire_minutes=30,
-        max_tasks_per_batch=20,
         max_txt_bytes=1024,
-        log_dir=data_dir,
-        commit_log_keep=50,
-        data_dir=data_dir,
-        queue_file=os.path.join(data_dir, "pending_queue.json"),
-        commit_log_file=os.path.join(data_dir, "commit_log.json"),
-        audit_dir=audit_dir,
+        operations_db_file=os.path.join(data_dir, "operations.sqlite3"),
+        mcp_logs_db_file=os.path.join(data_dir, "mcp_logs.sqlite3"),
+        execution_lock_file=os.path.join(data_dir, "jira_execution.lock"),
     )
-    config_mod.set_config(c)
-    yield c
-    config_mod.set_config(None)  # type: ignore
+    config_mod.set_config(value)
+    from core.runtime_logger import reset_logger
+    from core.storage.database import reset_database_initialization
+    from core.operations import reset_store
+    reset_database_initialization()
+    reset_logger()
+    reset_store()
+    yield value
+    from core.execution import worker as execution_worker
+    execution_worker.stop_worker(timeout=2)
+    reset_store()
+    reset_database_initialization()
+    reset_logger()
+    config_mod.set_config(None)
 
 
 @pytest.fixture
 def queue(cfg):
-    from core import queue_manager
+    from core.operations import get_store
+    return get_store()
 
-    queue_manager.reset_queue()
-    q = queue_manager.get_queue()
-    yield q
-    queue_manager.reset_queue()
+
+@pytest.fixture
+def web_client(cfg):
+    from fastapi.testclient import TestClient
+    from web import app as web_app
+    web_app._bootstrap_tokens.clear()
+    web_app._sessions.clear()
+    client = TestClient(web_app.create_app())
+    bootstrap_url = web_app.create_confirmation_url("http://testserver")
+    response = client.get(bootstrap_url, follow_redirects=False)
+    assert response.status_code == 303
+    return client
