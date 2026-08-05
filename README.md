@@ -39,17 +39,31 @@ MCP append → queued → Web submit → staged → executing → success/failed
 
 ## 配置与运行
 
-要求 Python 3.10+，推荐使用 Conda 环境 `jira-dev`：
+要求 Python 3.10+。请先进入项目目录，并在你自己的 Python 环境中执行：
 
 ```powershell
-conda run -n jira-dev python -m pip install -r requirements.txt
-conda run -n jira-dev python -m playwright install chromium
+python -m pip install -r requirements.txt
+python -m playwright install chromium
 Copy-Item config.example.yaml config.yaml
-conda run -n jira-dev python -m pytest tests/ -q
-conda run -n jira-dev python server.py
+python -m pytest tests/ -q
+python server.py
 ```
 
 `server.py` 是 STDIO 服务，会等待 JSON-RPC 输入。Web 服务在 `jira_show_queue` 首次调用时延迟启动。stdout 只用于 MCP；运行日志只写脱敏 stderr。
+
+接入支持 STDIO MCP 的通用 Agent 工具时，可使用下面的 JSON 配置。将 `<JIRA_LOCAL_MCP_PROJECT_DIRECTORY>` 替换为你克隆本项目后的目录；如果 Agent 配置不支持 `cwd`，请改为在项目目录中启动 Agent，或按该 Agent 的配置格式为 `server.py` 指定项目路径。
+
+```json
+{
+  "mcpServers": {
+    "jira-local": {
+      "command": "python",
+      "args": ["server.py"],
+      "cwd": "<JIRA_LOCAL_MCP_PROJECT_DIRECTORY>"
+    }
+  }
+}
+```
 
 ## Web API
 
