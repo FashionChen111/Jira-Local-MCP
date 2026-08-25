@@ -26,18 +26,29 @@ def test_schema_initialization_runs_once_per_process_and_path(cfg, monkeypatch):
     assert calls == 1
 
 
-def test_queue_schema_contains_manual_anchor_column(cfg):
+def test_operations_v2_schema_contains_references_and_concrete_execution(cfg):
     connection = open_database("operations")
-    columns = {
+    queue_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(queue_items)").fetchall()
     }
+    execution_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(execution_records)").fetchall()
+    }
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
     connection.close()
-    assert "manual_after_operation_id" in columns
+    assert version == 2
+    assert {"manual_after_operation_id", "issue_references_json"} <= queue_columns
+    assert {
+        "issue_references_json",
+        "executed_issue_key",
+        "executed_payload_json",
+    } <= execution_columns
 
 
 def test_incompatible_operations_schema_requires_manual_clear(cfg):
     connection = sqlite3.connect(cfg.operations_db_file)
-    connection.execute("PRAGMA user_version=99")
+    connection.execute("PRAGMA user_version=1")
     connection.close()
     with pytest.raises(RuntimeError, match="不兼容"):
         open_database("operations")

@@ -236,17 +236,17 @@ def operation_queue_workflow() -> str:
 
 
 @mcp.prompt()
-def create_then_modify_workflow() -> str:
-    """提供先创建 Jira 事务、再修改新事务的两阶段工作流提示词。
+def create_with_followups_workflow() -> str:
+    """提供创建或克隆 Jira 事务并追加后续修改的单阶段审核提示词。
 
     返回：
-        中文工作流提示词，要求创建和后续修改分别经过人工审核，并在第一阶段
-        成功后使用真实 issue Key；禁止使用占位 Key 串联操作。
+        中文工作流提示词，说明如何用服务端 operation ID 引用待创建事务，
+        将创建及后续修改集中入队，并由执行层解析真实 issue Key。
 
     边界：
-        提示词不能跨越两次独立人工审核，也不能自行推定新 issue Key。
+        提示词不授权执行，不接受自定义占位符，也不能自行推定新 issue Key。
     """
-    return PROMPTS["create-then-modify-workflow"]
+    return PROMPTS["create-with-followups-workflow"]
 
 
 @mcp.prompt()

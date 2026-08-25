@@ -21,8 +21,9 @@ AGENTS.md
 .workbuddy/
 .dev/
 .VSCodeCounter/
-spec.md
-spec-*
+spec.*.md
+review.*.md
+plan.*.md
 
 # --- test ---
 .pytest_cache/

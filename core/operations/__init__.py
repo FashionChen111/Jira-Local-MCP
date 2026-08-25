@@ -2,6 +2,7 @@
 
 from core.operations.errors import (
     ConfirmationRequired,
+    DependencyConfirmationRequired,
     ExecutionBlocked,
     RevisionConflict,
     StoreError,
@@ -11,6 +12,7 @@ from core.operations.store import OperationStore, get_store, reset_store
 
 __all__ = [
     "ConfirmationRequired",
+    "DependencyConfirmationRequired",
     "ExecutionBlocked",
     "ExecutionClaim",
     "OperationRecord",

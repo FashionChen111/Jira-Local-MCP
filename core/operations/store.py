@@ -71,13 +71,24 @@ class OperationStore:
         expected_queue_revision: int,
         groups: list[dict[str, Any]],
         standalone_operation_ids: list[str],
+        planned_groups: list[dict[str, Any]] | None = None,
     ) -> int:
         return self._queue.reorder(
-            expected_queue_revision, groups, standalone_operation_ids
+            expected_queue_revision,
+            groups,
+            standalone_operation_ids,
+            planned_groups,
         )
 
-    def cancel(self, operation_ids: list[str]) -> int:
-        return self._queue.cancel(operation_ids)
+    def cancel(
+        self,
+        expected_queue_revision: int,
+        operation_ids: list[str],
+        cascade_confirmed: bool,
+    ) -> tuple[list[str], int]:
+        return self._queue.cancel(
+            expected_queue_revision, operation_ids, cascade_confirmed
+        )
 
     def validate_submission(
         self,
@@ -124,10 +135,14 @@ class OperationStore:
         return self._execution.recover_interrupted()
 
     def resolve_indeterminate(
-        self, operation_id: str, resolution: str, high_risk_confirmed: bool
+        self,
+        operation_id: str,
+        resolution: str,
+        high_risk_confirmed: bool,
+        new_issue_key: str | None = None,
     ) -> dict[str, Any]:
         return self._execution.resolve_indeterminate(
-            operation_id, resolution, high_risk_confirmed
+            operation_id, resolution, high_risk_confirmed, new_issue_key
         )
 
     def resolve_held(

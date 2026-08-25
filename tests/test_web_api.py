@@ -19,7 +19,14 @@ def test_api_requires_browser_session(cfg):
     from fastapi.testclient import TestClient
     client = TestClient(web_app.create_app())
     assert client.get("/api/state").status_code == 403
-    assert client.post("/api/queue/cancel", json={"operation_ids": ["op-" + "a" * 32]}).status_code == 403
+    assert client.post(
+        "/api/queue/cancel",
+        json={
+            "expected_queue_revision": 0,
+            "operation_ids": ["op-" + "a" * 32],
+            "cascade_confirmed": False,
+        },
+    ).status_code == 403
 
 
 def test_bootstrap_is_single_use_and_cookie_is_hardened(cfg):
@@ -140,12 +147,80 @@ def test_revision_conflict_refresh_contract(web_client, queue):
 
 def test_cancel_and_history_pagination(web_client, queue):
     operation = _comment(queue)
-    cancelled = web_client.post("/api/queue/cancel", json={"operation_ids": [operation.operation_id]})
+    cancelled = web_client.post(
+        "/api/queue/cancel",
+        json={
+            "expected_queue_revision": 1,
+            "operation_ids": [operation.operation_id],
+            "cascade_confirmed": False,
+        },
+    )
     assert cancelled.status_code == 200
     assert cancelled.json()["cancelled_operation_ids"] == [operation.operation_id]
     history = web_client.get("/api/execution-history?page=1&page_size=50")
     assert history.status_code == 200
     assert history.json() == {"items": [], "total": 0, "page": 1, "page_size": 50}
+
+
+def test_cancel_producer_requires_visible_cascade_confirmation(web_client, queue):
+    create = queue.enqueue(
+        "create_issue",
+        None,
+        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
+        "create",
+        "test",
+    )
+    child = queue.enqueue(
+        "add_comment",
+        create.operation_id,
+        {"issue_key": create.operation_id, "body": "x"},
+        "child",
+        "test",
+    )
+    body = {
+        "expected_queue_revision": 2,
+        "operation_ids": [create.operation_id],
+        "cascade_confirmed": False,
+    }
+    required = web_client.post("/api/queue/cancel", json=body)
+    assert required.status_code == 409
+    assert required.json()["code"] == "dependency_confirmation_required"
+    assert set(required.json()["affected_operation_ids"]) == {
+        create.operation_id,
+        child.operation_id,
+    }
+    body["cascade_confirmed"] = True
+    cancelled = web_client.post("/api/queue/cancel", json=body)
+    assert cancelled.status_code == 200
+    assert set(cancelled.json()["cancelled_operation_ids"]) == {
+        create.operation_id,
+        child.operation_id,
+    }
+
+
+def test_indeterminate_create_resolution_requires_real_key(web_client, queue):
+    create = queue.enqueue(
+        "create_issue",
+        None,
+        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
+        "create",
+        "test",
+    )
+    queue.submit(1, [create.operation_id], False)
+    queue.claim_next()
+    queue.recover_interrupted()
+    body = {
+        "operation_id": create.operation_id,
+        "resolution": "succeeded",
+        "high_risk_confirmed": False,
+        "new_issue_key": None,
+    }
+    missing = web_client.post("/api/execution/indeterminate/resolve", json=body)
+    assert missing.status_code == 409
+    body["new_issue_key"] = "PROJ-50"
+    resolved = web_client.post("/api/execution/indeterminate/resolve", json=body)
+    assert resolved.status_code == 200
+    assert resolved.json()["new_issue_key"] == "PROJ-50"
 
 
 def test_template_has_only_local_assets_and_no_html_sink(web_client):

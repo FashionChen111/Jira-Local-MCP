@@ -59,5 +59,64 @@ def test_delete_defence_is_rechecked_by_executor(queue, monkeypatch):
     assert queue.read_execution_log(1)[0]["outcome"] == "failed"
 
 
+def test_failed_producer_never_calls_executor_for_dependants(queue, monkeypatch):
+    create = queue.enqueue(
+        "create_issue",
+        None,
+        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
+        "create",
+        "test",
+    )
+    child = queue.enqueue(
+        "add_comment",
+        create.operation_id,
+        {"issue_key": create.operation_id, "body": "x"},
+        "child",
+        "test",
+    )
+    queue.submit(2, [create.operation_id, child.operation_id], False)
+    calls = []
+
+    def fail_create(task):
+        calls.append(task.operation_id)
+        raise RuntimeError("create failed")
+
+    monkeypatch.setattr(
+        execution_worker.jira_executor, "execute_operation", fail_create
+    )
+    assert execution_worker.process_once() is True
+    assert execution_worker.process_once() is False
+    assert calls == [create.operation_id]
+    records = {item["operation_id"]: item for item in queue.read_execution_log(10)}
+    assert records[child.operation_id]["outcome"] == "dependency_failed"
+    assert records[child.operation_id]["executed_issue_key"] is None
+    assert records[child.operation_id]["payload"]["issue_key"] == create.operation_id
+
+
+def test_unresolved_operation_id_never_reaches_jira_handler(queue, monkeypatch):
+    _stage(queue)
+    connection = open_database("operations")
+    connection.execute(
+        "UPDATE execution_staging SET payload_json=?",
+        ('{"issue_key":"op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"x"}',),
+    )
+    connection.close()
+    called = False
+
+    def should_not_execute(_task):
+        nonlocal called
+        called = True
+        return "bad", None
+
+    monkeypatch.setitem(
+        execution_worker.jira_executor._HANDLERS,
+        "add_comment",
+        should_not_execute,
+    )
+    execution_worker.process_once()
+    assert called is False
+    assert queue.read_execution_log(1)[0]["outcome"] == "failed"
+
+
 def test_no_work_returns_false(queue):
     assert execution_worker.process_once() is False

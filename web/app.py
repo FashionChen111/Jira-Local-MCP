@@ -21,6 +21,7 @@ from core.execution import worker as execution_worker
 from core.runtime_logger import get_logger
 from core.operations import (
     ConfirmationRequired,
+    DependencyConfirmationRequired,
     ExecutionBlocked,
     RevisionConflict,
     StoreError,
@@ -70,14 +71,34 @@ class QueueGroup(StrictModel):
         return value
 
 
+class PlannedQueueGroup(StrictModel):
+    producer_operation_id: OperationId
+    operation_ids: list[OperationId] = Field(min_length=1, max_length=1000)
+
+    @field_validator("operation_ids")
+    @classmethod
+    def unique_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("计划分组内 operation_ids 不得重复")
+        return value
+
+
 class ReorderRequest(StrictModel):
     expected_queue_revision: int = Field(ge=0)
     groups: list[QueueGroup] = Field(max_length=1000)
+    planned_groups: list[PlannedQueueGroup] = Field(
+        default_factory=list, max_length=1000
+    )
     standalone_operation_ids: list[OperationId] = Field(max_length=1000)
 
     @model_validator(mode="after")
     def complete_unique_layout(self) -> "ReorderRequest":
         ids = [item for group in self.groups for item in group.operation_ids]
+        ids.extend(
+            item
+            for group in self.planned_groups
+            for item in group.operation_ids
+        )
         ids.extend(self.standalone_operation_ids)
         if len(ids) > 1000:
             raise ValueError("排序布局最多包含 1000 个 operation")
@@ -85,6 +106,10 @@ class ReorderRequest(StrictModel):
             raise ValueError("排序布局中的 operation ID 不得重复")
         if len({group.issue_key for group in self.groups}) != len(self.groups):
             raise ValueError("issue 分组不得重复")
+        if len(
+            {group.producer_operation_id for group in self.planned_groups}
+        ) != len(self.planned_groups):
+            raise ValueError("待创建事务分组不得重复")
         return self
 
 
@@ -93,10 +118,24 @@ class SubmitRequest(IdListModel):
     high_risk_confirmed: bool
 
 
+class CancelRequest(IdListModel):
+    expected_queue_revision: int = Field(ge=0)
+    cascade_confirmed: bool = False
+
+
 class ResolveIndeterminateRequest(StrictModel):
     operation_id: OperationId
     resolution: Literal["succeeded", "not_applied", "abandoned"]
     high_risk_confirmed: bool = False
+    new_issue_key: str | None = Field(
+        default=None, pattern=r"^[A-Z][A-Z0-9]+-\d+$", max_length=255
+    )
+
+    @model_validator(mode="after")
+    def key_only_for_success(self) -> "ResolveIndeterminateRequest":
+        if self.resolution != "succeeded" and self.new_issue_key is not None:
+            raise ValueError("仅已生效处置可以提供 new_issue_key")
+        return self
 
 
 class ResolveHeldRequest(IdListModel):
@@ -138,7 +177,11 @@ def _unauthorized() -> JSONResponse:
 
 
 def _store_error(exc: Exception) -> JSONResponse:
-    if isinstance(exc, ConfirmationRequired):
+    extra: dict[str, Any] = {}
+    if isinstance(exc, DependencyConfirmationRequired):
+        code = "dependency_confirmation_required"
+        extra["affected_operation_ids"] = exc.operation_ids
+    elif isinstance(exc, ConfirmationRequired):
         code = "confirmation_required"
     elif isinstance(exc, RevisionConflict):
         code = "revision_conflict"
@@ -146,7 +189,9 @@ def _store_error(exc: Exception) -> JSONResponse:
         code = "execution_blocked"
     else:
         code = "state_conflict"
-    return JSONResponse({"error": str(exc), "code": code}, status_code=409)
+    return JSONResponse(
+        {"error": str(exc), "code": code, **extra}, status_code=409
+    )
 
 
 def create_app() -> FastAPI:
@@ -222,20 +267,25 @@ def create_app() -> FastAPI:
                 body.expected_queue_revision,
                 [group.model_dump() for group in body.groups],
                 body.standalone_operation_ids,
+                [group.model_dump() for group in body.planned_groups],
             )
             return JSONResponse({"queue_revision": revision})
         except (StoreError, ValueError) as exc:
             return _store_error(exc)
 
     @app.post("/api/queue/cancel")
-    def api_cancel(request: Request, body: IdListModel) -> Any:
+    def api_cancel(request: Request, body: CancelRequest) -> Any:
         if not _has_valid_session(request):
             return _unauthorized()
         try:
-            revision = get_store().cancel(body.operation_ids)
+            cancelled, revision = get_store().cancel(
+                body.expected_queue_revision,
+                body.operation_ids,
+                body.cascade_confirmed,
+            )
             return JSONResponse(
                 {
-                    "cancelled_operation_ids": body.operation_ids,
+                    "cancelled_operation_ids": cancelled,
                     "queue_revision": revision,
                 }
             )
@@ -281,7 +331,10 @@ def create_app() -> FastAPI:
             return _unauthorized()
         try:
             result = get_store().resolve_indeterminate(
-                body.operation_id, body.resolution, body.high_risk_confirmed
+                body.operation_id,
+                body.resolution,
+                body.high_risk_confirmed,
+                body.new_issue_key,
             )
             execution_worker.wake_worker()
             return JSONResponse(result)

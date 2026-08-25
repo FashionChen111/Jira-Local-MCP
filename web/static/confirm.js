@@ -4,6 +4,7 @@ const queueContent = document.getElementById("queue-content"),
   executingContent = document.getElementById("executing-content"),
   historyContent = document.getElementById("history-content");
 const selected = new Set(),
+  explicitSelected = new Set(),
   heldSelected = new Set(),
   expanded = new Set();
 let state = null,
@@ -31,8 +32,53 @@ function allQueueOperations() {
   if (!state) return [];
   return [
     ...state.queue.groups.flatMap((group) => group.operations),
+    ...(state.queue.planned_groups || []).flatMap((group) => group.operations),
     ...state.queue.standalone,
   ];
+}
+function queueOperationMap() {
+  return new Map(allQueueOperations().map((item) => [item.operation_id, item]));
+}
+function dependencyIds(operation) {
+  return operation.unresolved_dependency_operation_ids || [];
+}
+function recomputeSelected() {
+  const byId = queueOperationMap();
+  selected.clear();
+  const stack = [...explicitSelected];
+  while (stack.length) {
+    const id = stack.pop();
+    const operation = byId.get(id);
+    if (!operation || operation.submittable === false || selected.has(id)) continue;
+    selected.add(id);
+    dependencyIds(operation).forEach((dependencyId) => {
+      if (byId.has(dependencyId)) stack.push(dependencyId);
+    });
+  }
+}
+function setExplicitSelection(operationId, checked) {
+  if (checked) {
+    explicitSelected.add(operationId);
+  } else {
+    explicitSelected.delete(operationId);
+    const removed = new Set([operationId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      allQueueOperations().forEach((operation) => {
+        if (
+          explicitSelected.has(operation.operation_id) &&
+          dependencyIds(operation).some((id) => removed.has(id))
+        ) {
+          explicitSelected.delete(operation.operation_id);
+          removed.add(operation.operation_id);
+          changed = true;
+        }
+      });
+    }
+  }
+  recomputeSelected();
+  renderQueue();
 }
 function operationCard(operation, controls = []) {
   const card = el(
@@ -50,6 +96,16 @@ function operationCard(operation, controls = []) {
       `${operation.operation_type} · ${operation.operation_id} · ${operation.issue_key || "无 issue key"} · ${operation.submission_risk_level || operation.risk_level} risk`,
     ),
   );
+  if (operation.issue_references && Object.keys(operation.issue_references).length) {
+    const refs = Object.entries(operation.issue_references)
+      .map(([field, ref]) =>
+        `${field}: ${ref.operation_id}${ref.resolved_issue_key ? ` → ${ref.resolved_issue_key}` : "（待解析）"}`,
+      )
+      .join("；");
+    title.append(el("div", "meta dependency", refs));
+  }
+  if (operation.submission_block_reason)
+    title.append(el("div", "meta dependency-error", operation.submission_block_reason));
   head.append(title);
   if (controls.length) {
     const area = el("div", "operation-controls");
@@ -79,9 +135,9 @@ function renderQueue() {
     allQueueOperations().map((item) => item.operation_id),
   );
   for (const id of [...selected]) if (!available.has(id)) selected.delete(id);
-  for (const operation of allQueueOperations())
-    if (!selected.has(operation.operation_id) && operation.__new)
-      selected.add(operation.operation_id);
+  for (const id of [...explicitSelected])
+    if (!available.has(id)) explicitSelected.delete(id);
+  recomputeSelected();
   state.queue.groups.forEach((group, groupIndex) => {
     const box = el("div", "issue-group");
     box.append(el("h3", null, group.issue_key));
@@ -89,10 +145,14 @@ function renderQueue() {
       const check = el("input");
       check.type = "checkbox";
       check.checked = selected.has(operation.operation_id);
+      check.disabled = operation.submittable === false;
+      check.title =
+        selected.has(operation.operation_id) &&
+        !explicitSelected.has(operation.operation_id)
+          ? "因依赖关系自动勾选"
+          : "";
       check.addEventListener("change", () =>
-        check.checked
-          ? selected.add(operation.operation_id)
-          : selected.delete(operation.operation_id),
+        setExplicitSelection(operation.operation_id, check.checked),
       );
       const move = (delta) => {
         const target = index + delta;
@@ -119,6 +179,58 @@ function renderQueue() {
     });
     queueContent.append(box);
   });
+  (state.queue.planned_groups || []).forEach((group) => {
+    const box = el("div", "issue-group planned-group");
+    box.append(
+      el(
+        "h3",
+        null,
+        `待创建事务 · ${group.producer_operation_id} · ${group.producer_state}`,
+      ),
+    );
+    const producerPresent = group.operations.some(
+      (item) => item.operation_id === group.producer_operation_id,
+    );
+    group.operations.forEach((operation, index) => {
+      const check = el("input");
+      check.type = "checkbox";
+      check.checked = selected.has(operation.operation_id);
+      check.disabled = operation.submittable === false;
+      check.title =
+        selected.has(operation.operation_id) &&
+        !explicitSelected.has(operation.operation_id)
+          ? "因依赖关系自动勾选"
+          : "";
+      check.addEventListener("change", () =>
+        setExplicitSelection(operation.operation_id, check.checked),
+      );
+      const controls = [check];
+      if (operation.submittable === false) {
+        controls.push(
+          button(
+            "取消此项",
+            () => cancelOperations([operation.operation_id], false),
+            "danger",
+          ),
+        );
+      }
+      if (operation.operation_id !== group.producer_operation_id) {
+        const move = (delta) => {
+          const target = index + delta;
+          const minimum = producerPresent ? 1 : 0;
+          if (target < minimum || target >= group.operations.length) return;
+          [group.operations[index], group.operations[target]] = [
+            group.operations[target],
+            group.operations[index],
+          ];
+          saveLayout();
+        };
+        controls.push(button("↑", () => move(-1)), button("↓", () => move(1)));
+      }
+      box.append(operationCard(operation, controls));
+    });
+    queueContent.append(box);
+  });
   if (state.queue.standalone.length) {
     const box = el("div", "standalone");
     box.append(el("h3", null, "零散 Operations"));
@@ -126,11 +238,19 @@ function renderQueue() {
       const check = el("input");
       check.type = "checkbox";
       check.checked = selected.has(operation.operation_id);
+      check.disabled = operation.submittable === false;
       check.addEventListener("change", () =>
-        check.checked
-          ? selected.add(operation.operation_id)
-          : selected.delete(operation.operation_id),
+        setExplicitSelection(operation.operation_id, check.checked),
       );
+      const controls = [check];
+      if (operation.submittable === false)
+        controls.push(
+          button(
+            "取消此项",
+            () => cancelOperations([operation.operation_id], false),
+            "danger",
+          ),
+        );
       const move = (delta) => {
         const target = index + delta;
         if (target < 0 || target >= state.queue.standalone.length) return;
@@ -140,13 +260,8 @@ function renderQueue() {
         ];
         saveLayout();
       };
-      box.append(
-        operationCard(operation, [
-          check,
-          button("↑", () => move(-1)),
-          button("↓", () => move(1)),
-        ]),
-      );
+      controls.push(button("↑", () => move(-1)), button("↓", () => move(1)));
+      box.append(operationCard(operation, controls));
     });
     queueContent.append(box);
   }
@@ -158,6 +273,10 @@ async function saveLayout() {
     expected_queue_revision: state.revisions.queue,
     groups: state.queue.groups.map((group) => ({
       issue_key: group.issue_key,
+      operation_ids: group.operations.map((item) => item.operation_id),
+    })),
+    planned_groups: (state.queue.planned_groups || []).map((group) => ({
+      producer_operation_id: group.producer_operation_id,
       operation_ids: group.operations.map((item) => item.operation_id),
     })),
     standalone_operation_ids: state.queue.standalone.map(
@@ -266,10 +385,24 @@ async function resolveIndeterminate(operation, resolution) {
     !high
   )
     return;
+  let newIssueKey = null;
+  if (
+    resolution === "succeeded" &&
+    ["create_issue", "clone_issue"].includes(operation.operation_type)
+  ) {
+    newIssueKey = prompt("请输入 Jira 实际生成的事务 Key（例如 PROJ-123）");
+    if (newIssueKey === null) return;
+    newIssueKey = newIssueKey.trim();
+    if (!/^[A-Z][A-Z0-9]+-\d+$/.test(newIssueKey)) {
+      message("事务 Key 格式无效");
+      return;
+    }
+  }
   await mutate("/api/execution/indeterminate/resolve", {
     operation_id: operation.operation_id,
     resolution,
     high_risk_confirmed: high,
+    new_issue_key: newIssueKey,
   });
 }
 async function resolveHeld(ids, action) {
@@ -328,20 +461,68 @@ async function submitSelected(highRiskConfirmed = false) {
     }
     return;
   }
-  ids.forEach((id) => selected.delete(id));
+  ids.forEach((id) => {
+    selected.delete(id);
+    explicitSelected.delete(id);
+  });
   message("已授权并移入暂存区；页面将持续显示实际执行结果。");
   etag = null;
   await loadState(true);
 }
 async function cancelSelected() {
-  const ids = [...selected];
+  const ids = [...explicitSelected];
   if (!ids.length) {
     message("请先勾选 operation");
     return;
   }
   if (!confirm("确认从队列取消选中的 operation？这不会写入 Jira。")) return;
-  await mutate("/api/queue/cancel", { operation_ids: ids });
-  ids.forEach((id) => selected.delete(id));
+  await cancelOperations(ids, false);
+}
+async function cancelOperations(ids, cascadeConfirmed) {
+  const response = await fetch("/api/queue/cancel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      expected_queue_revision: state.revisions.queue,
+      operation_ids: ids,
+      cascade_confirmed: cascadeConfirmed,
+    }),
+  });
+  const data = await response.json();
+  if (
+    response.status === 409 &&
+    data.code === "dependency_confirmation_required" &&
+    !cascadeConfirmed
+  ) {
+    const requested = new Set(ids);
+    const dependentCount = (data.affected_operation_ids || []).filter(
+      (id) => !requested.has(id),
+    ).length;
+    const totalCount = (data.affected_operation_ids || []).length;
+    if (
+      confirm(
+        `所选创建/克隆项仍有 ${dependentCount} 个队列依赖，`
+          + `将原子取消共 ${totalCount} 个 operation。确认继续？`,
+      )
+    )
+      return cancelOperations(ids, true);
+    return;
+  }
+  if (!response.ok) {
+    message(data.error || "取消失败");
+    if (data.code === "revision_conflict") {
+      etag = null;
+      await loadState(true);
+    }
+    return;
+  }
+  (data.cancelled_operation_ids || []).forEach((id) => {
+    selected.delete(id);
+    explicitSelected.delete(id);
+  });
+  message("已从本地审核队列取消所选 operation；未写入 Jira。");
+  etag = null;
+  await loadState(true);
 }
 async function loadHistory(force = false) {
   if (!state) return;
@@ -404,9 +585,11 @@ async function loadState(force = false) {
       allQueueOperations().forEach((item) => {
         if (!previous.has(item.operation_id)) {
           item.__new = true;
-          selected.add(item.operation_id);
+          if (item.submittable !== false)
+            explicitSelected.add(item.operation_id);
         }
       });
+      recomputeSelected();
       renderQueue();
       renderExecution();
       await loadHistory(false);
@@ -420,7 +603,10 @@ async function loadState(force = false) {
   pollTimer = setTimeout(() => loadState(false), active ? 1000 : 5000);
 }
 document.getElementById("select-all").addEventListener("click", () => {
-  allQueueOperations().forEach((item) => selected.add(item.operation_id));
+  allQueueOperations().forEach((item) => {
+    if (item.submittable !== false) explicitSelected.add(item.operation_id);
+  });
+  recomputeSelected();
   renderQueue();
 });
 document

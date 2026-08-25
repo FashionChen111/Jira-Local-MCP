@@ -22,6 +22,7 @@ def operation_from_row(row: sqlite3.Row) -> OperationRecord:
         issue_key=row["issue_key"],
         risk_level=row["risk_level"],
         payload=parse_json(row["payload_json"]),  # type: ignore[arg-type]
+        issue_references=parse_json(row["issue_references_json"]),  # type: ignore[arg-type]
         description=row["description"],
         source=row["source"],
         created_at=row["created_at"],
@@ -36,6 +37,7 @@ def operation_values(operation: OperationRecord) -> tuple[Any, ...]:
         operation.issue_key,
         operation.risk_level,
         canonical_json(operation.payload),
+        canonical_json(operation.issue_references),
         operation.description,
         operation.source,
         operation.created_at,
@@ -44,7 +46,16 @@ def operation_values(operation: OperationRecord) -> tuple[Any, ...]:
 
 
 def queue_public(row: sqlite3.Row) -> dict[str, Any]:
-    data = operation_from_row(row).to_public_dict()
+    operation = operation_from_row(row)
+    data = operation.to_public_dict()
+    description = operation.description
+    for reference in operation.issue_references.values():
+        resolved = reference.get("resolved_issue_key")
+        if resolved:
+            description = description.replace(
+                str(reference["operation_id"]), str(resolved)
+            )
+    data["description"] = description
     data.update(
         layout_kind=row["layout_kind"],
         category=row["category"],
@@ -55,7 +66,16 @@ def queue_public(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def staging_public(row: sqlite3.Row) -> dict[str, Any]:
-    data = operation_from_row(row).to_public_dict()
+    operation = operation_from_row(row)
+    data = operation.to_public_dict()
+    description = operation.description
+    for reference in operation.issue_references.values():
+        resolved = reference.get("resolved_issue_key")
+        if resolved:
+            description = description.replace(
+                str(reference["operation_id"]), str(resolved)
+            )
+    data["description"] = description
     for key in (
         "stage_order",
         "state",
@@ -72,7 +92,16 @@ def staging_public(row: sqlite3.Row) -> dict[str, Any]:
 
 def execution_record_public(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
-    item["payload"] = parse_json(item.pop("payload_json"))
+    reviewed_payload = parse_json(item.pop("payload_json"))
+    item["issue_references"] = parse_json(item.pop("issue_references_json"))
+    concrete_json = item.pop("executed_payload_json")
+    item["payload"] = (
+        parse_json(concrete_json) if concrete_json is not None else reviewed_payload
+    )
+    if item["issue_references"]:
+        item["reviewed_payload"] = reviewed_payload
+    if item.get("executed_issue_key") is not None:
+        item["issue_key"] = item["executed_issue_key"]
     return item
 
 

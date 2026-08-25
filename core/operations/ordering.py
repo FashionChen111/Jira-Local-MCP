@@ -14,12 +14,14 @@ CATEGORY_BY_OPERATION = {
     "add_worklog": "worklog",
 }
 CATEGORY_RANK = {
+    "producer": -1,
     "standard_field": 0,
     "custom_field": 1,
     "workflow": 2,
     "attachment": 3,
     "comment": 4,
     "worklog": 5,
+    "other": 6,
 }
 
 _Row = TypeVar("_Row")

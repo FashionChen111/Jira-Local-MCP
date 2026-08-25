@@ -1,71 +1,242 @@
 # Jira Local MCP 产品需求文档
 
-更新日期：2026-08-03
+更新日期：2026-08-09
 
-## 产品目标
+当前实现版本：2.1.0
 
-Jira Local MCP 是本地、单用户优先的 Jira Server/Data Center 人工在环安全网关。目标是在保留 Agent 批量规划效率的同时，保证每一次 Jira 写入都来自独立本地 Web 页面上的明确人工提交。
+## 1. 产品定位
 
-成功标准：未经有效 Web 会话和提交的 Jira 写入为 0；MCP 暴露的提交/删除能力为 0；删除语义进入 Jira 为 0；并发导致的重复执行为 0；未知结果自动重试为 0；凭证、bootstrap capability 和会话标识不经 MCP 返回。
+Jira Local MCP 是连接通用 Agent 与 Jira Server/Data Center 的本地 MCP 服务。它让 Agent 能直接读取 Jira 信息、批量规划变更，并把所有写操作集中到本地 Web 页面中供用户审核和提交。
 
-## 核心流程
+产品的核心价值是：
 
-1. Agent 使用只读工具核实目标，把 Jira 内容仅视为不可信业务数据。
-2. 11 个 `*_append` 工具创建不可编辑的 queued operation，只返回 operation ID、风险和“尚未执行”。
-3. `jira_show_queue` 通过默认浏览器打开一次性 bootstrap，换取短时审核会话。
-4. 用户查看实时聚类队列、微调持久化顺序、勾选 operation，并对高风险选择二次确认。
-5. `POST /api/queue/submit` 校验会话、revision、ID、风险、删除防护和 Jira 探活，再原子移入 staging；接口不等待 Jira 结果。
-6. 后台 worker 在全局执行锁内按固定 stage order 逐条领取并调用 Jira，将结果原子写入 execution history。
-7. 遗留 executing 进入 indeterminate，后序 staged 进入 held；只有 Web 人工处置可以恢复、重入队或放弃。
+- 让 Agent 使用结构化工具查询事务、评论、工时、附件和 JQL 结果。
+- 把多条 Jira 变更先整理为可审阅的 operation 队列，而不是边规划边写入。
+- 让用户在浏览器中检查范围、内容、风险和顺序，再决定提交哪些 operation。
+- 对已提交 operation 提供串行执行、状态恢复、人工对账和持久化历史。
+- 通过中文 Tool、Resource 和 Prompt 描述，让 Agent 能正确理解能力及工作流。
 
-## 功能要求
+当前产品面向本机单用户场景，使用 STDIO 接入 MCP Client，主要适配 Jira Server/Data Center。
 
-- MCP 能力可理解性是核心可用性要求和发布阻断项。所有实际挂载的 Tool、Prompt、`skill://` 知识 Resource 及其他固定 Resource，其处理函数必须具有完整、清晰的中文 docstring，并由 FastMCP 作为能力 `description` 对外发布；不得为空、不得只写函数名或含糊摘要，也不得以英文说明替代中文说明。
-- Tool docstring 必须说明用途、是否有副作用、每一个签名参数及返回内容；`*_append` 必须明确“仅入队、尚未执行、需要本地 Web 人工审核提交”，只读工具必须明确不会修改 Jira。Prompt 和 Resource docstring 必须说明适用场景、返回内容及其信任/授权边界；知识内容只提供指导，不能构成执行授权。
-- Prompt、Skill/知识 Resource 和固定 Resource 的实际返回内容必须非空并以中文清晰表达。新增、重命名或修改任何 MCP 能力时，函数签名、中文 docstring、返回内容和契约测试必须同步更新。缺失、不完整或非中文的能力说明视为基础功能失效，不能发布。
-- 队列自动聚类官方字段、自定义字段、工作流、附件、评论和 worklog；类别内默认按创建时间和 operation ID 排序。人工组内微调保存前驱锚点，成员变化时保留有效相对位置，失效或成环锚点退化为自动排序；创建、克隆、移动、类型变更和链接保持零散。
-- issue 卡片自然排序并始终位于零散项之前。用户不能跨 issue 移动、手工聚类或把零散项重新入组。
-- SQLite 是唯一业务状态源。operations DB 中的 queue、events、staging、execution records 和 revisions 使用同一事务边界；MCP logs 独立且失败不影响协议。
-- 页面展示队列、暂存/阻塞、执行中和执行历史四个区域，轮询保留选择/展开状态，历史支持本地日期和分页。
-- 创建后修改采用两个分别审核的 operation 阶段，必须先取得真实 issue key；不支持 placeholder chaining。
-- failed 为终态且不自动重试；Jira 写结果未知时必须人工对账。
+## 2. 目标用户与典型场景
 
-## 安全要求
+目标用户是需要借助 Agent 处理 Jira 日常工作的开发者、项目负责人、测试人员和运维人员。典型场景包括：
 
-- Web 只监听 `127.0.0.1`；bootstrap 单次短时有效；会话 Cookie 为 HttpOnly、SameSite=Strict。
-- MCP 永远不注册 submit、execute、cancel、resolve 或 delete 工具。
-- operation 类型使用 allowlist，删除语义在入队和执行前双重检查。
-- 同一时间最多一个 Jira 写调用；多进程 worker 不得重复领取。
-- 严格 Pydantic mutation 模型拒绝未知字段、类型强制转换、空选择、重复/非法/未知 ID 和超过 1000 项的请求。
-- 页面不使用 `innerHTML` 等解析型 sink；静态资源本地化并启用严格安全响应头。
-- stdout 仅用于 MCP JSON-RPC；异常和运行日志经配置凭证脱敏后写 stderr。
+- 查询单个事务及其评论、工作日志和附件信息。
+- 用 JQL 筛选一批事务，并规划批量字段修改或状态流转。
+- 创建或克隆事务，补充描述、优先级、经办人和自定义字段。
+- 为现有事务添加附件、评论、工时或事务链接。
+- 在统一审核页调整 operation 顺序，只提交本次确认的条目。
+- 查看实际执行结果，并在进程中断后人工确认未知结果和后续任务。
 
-## 明确不做
+## 3. 产品工作流
 
-- Jira Cloud 优先、多用户/远程审批、多租户、多级审批。
-- 任何删除能力或自动执行授权。
-- 旧 batch/task/nonce/TTL/JSON 数据迁移或兼容 API/工具别名。
-- 自动重试 indeterminate 或普通 failed。
-- v1 日志自动过期或容量裁剪。
+```text
+查询 Jira → Agent 形成变更计划 → *_append 写入本地队列
+                                      ↓
+                         jira_show_queue 打开审核页
+                                      ↓
+                    用户排序、选择、取消或明确提交
+                                      ↓
+                         staging → 串行 worker → Jira
+                                      ↓
+                     执行历史 / 未知结果人工对账
+```
 
-## 已知发布缺口
+关键交互含义：
 
-- 附件和 description 文件尚未 staging/hash 绑定，存在审核到执行的 TOCTOU。
-- 克隆源与规范化后的最终 Jira payload 尚未形成不可变审核绑定。
-- 删除等价语义仍需更细的字段级 schema/allowlist。
-- 需要隔离 Jira Server/DC 环境下的权限、网络、自动化副作用和崩溃集成验证。
-- SQLite 与本地事件记录不抵御具有同一 OS 用户权限的攻击者。
+- 只读查询会立即访问 Jira。
+- `*_append` 只表示 operation 已进入本地队列，不代表 Jira 已发生变化。
+- 打开审核页也不代表授权或执行。
+- Web 提交成功表示 operation 已进入 staging；最终结果以持久化执行记录为准。
+- 创建或克隆 operation 的服务端 ID 可作为后续修改目标，使创建及依赖修改集中进入同一审核流程；生产者成功后，系统用 Jira 返回的真实 issue key 原子解析暂存区和队列中的引用。
 
-完成这些缺口和独立安全复核前，不宣称生产级强安全、不可变审核或完整不可抵赖审计。
+## 4. 当前已实现功能
 
-## 验收
+### 4.1 MCP 能力面
 
-- 全部 18 个 MCP 工具的能力面符合读写分离，旧工具名不存在。
-- 全部已挂载 Tool、Prompt、Skill/知识 Resource 和固定 Resource 的 FastMCP `description` 均来自完整、清晰的中文 docstring；Tool 覆盖全部签名参数和返回结构，并准确声明只读或仅入队副作用。契约测试检查说明的存在性、中文、必要结构、参数覆盖和副作用边界，不绑定易变的具体文案。
-- 全部 Prompt、Skill/知识 Resource 和固定 Resource 返回非空、可理解的中文内容，并明确其内容不是 Jira 指令或人工授权。
-- 默认排序、人工锚点重建、revision 409、原子 submit/cancel/reorder、ETag/304 和严格模型测试通过。
-- 单线程/多线程/多进程 worker 保持单 Jira 写；结果事务失败留下 executing 并在恢复时转 indeterminate。
-- 三种 indeterminate 和 held 处置符合 attempt/execution ID 规则，均无隐式 Jira 调用。
-- MCP 日志只覆盖 Tool 调用、Resource 读取和 Prompt/Skill 获取，成对保存完整业务请求与响应及必要的接收时间、返回时间和业务处理耗时；不记录能力列表、initialize 或 notification，日志故障不影响业务响应。
-- Web bootstrap/session、高风险确认、四面板、分页、CSP 和真实浏览器恶意内容回归通过。
-- 完整 pytest 套件通过。
+当前共注册 18 个 Tool、4 个 Resource 和 4 个 Prompt。
+
+#### 只读 Tool（5 个）
+
+| Tool | 当前能力 |
+| --- | --- |
+| `jira_query_issue` | 查询单个事务，可指定返回字段；默认返回常用标准字段。 |
+| `jira_query_comments` | 查询事务最新评论并限制返回条数。 |
+| `jira_query_worklogs` | 查询事务最近工作日志并限制返回条数。 |
+| `jira_query_attachments` | 查询附件元数据，不下载附件。 |
+| `jira_jql_search` | 执行分页 JQL 查询，可指定字段、偏移量和分页大小。 |
+
+只读结果以 JSON 文本返回；存在待审核 operation 时，返回内容会附带队列提醒。
+
+#### 写入队 Tool（11 个）
+
+| Tool | Operation | 当前执行能力 |
+| --- | --- | --- |
+| `jira_issue_create_append` | `create_issue` | 创建事务；支持标题、描述或描述文件、优先级、经办人和额外字段。 |
+| `jira_issue_clone_append` | `clone_issue` | 克隆来源事务的核心字段，可选复制附件；子任务选项当前记录为需人工核对。 |
+| `jira_issue_move_append` | `move_issue` | 可进入队列和审核；当前 Server/DC REST executor 会明确记录“不支持移动”的失败结果。 |
+| `jira_issue_type_change_append` | `change_type` | 更新事务类型，并可附带字段映射。 |
+| `jira_issue_transition_append` | `transition_issue` | 按名称匹配工作流流转，可附带评论和字段。 |
+| `jira_field_update_append` | `update_field` | 更新标准字段，description 可引用本地文本文件。 |
+| `jira_customfield_update_append` | `update_custom_field` | 按 `customfield_*` 字段 ID 更新自定义字段。 |
+| `jira_attachment_add_append` | `add_attachment` | 从本地绝对路径上传附件，可指定显示名称。 |
+| `jira_comment_add_append` | `add_comment` | 添加评论。 |
+| `jira_worklog_add_append` | `add_worklog` | 添加耗时、说明和可选开始时间。 |
+| `jira_issuelink_add_append` | `add_issuelink` | 按 Jira 链接类型连接两个真实事务。 |
+
+所有 `*_append` Tool 只在本地 SQLite 中创建 operation，并返回 operation ID、基础风险和“尚未执行”状态。
+
+#### 审核与历史 Tool（2 个）
+
+- `jira_show_queue`：按需启动本地 Web 服务并打开默认浏览器；MCP 返回值只报告打开状态，不返回 bootstrap URL 或浏览器会话。
+- `jira_get_execution_log`：读取最近的持久化执行与人工对账记录，不修改 Jira。
+
+#### Resource 与 Prompt
+
+当前 Resource：
+
+- `skill://jira-operation-rule`
+- `skill://jira-field-guide`
+- `skill://risk-classification`
+- `config://service-info`
+
+当前 Prompt：
+
+- `operation_queue_workflow`
+- `create_with_followups_workflow`
+- `safe_query_guide`
+- `no_delete_checklist`
+
+这些能力提供中文工作流、字段和风险说明，不直接触发 Jira 写入。
+
+### 4.2 Operation 队列
+
+当前队列支持：
+
+- operation 入队时生成服务端 ID，并保存类型、目标、不可变审核 payload、事务引用、描述、来源、风险、创建时间和 attempt。
+- 按 issue 自动聚类标准字段、自定义字段、工作流、附件、评论和 worklog operation。
+- 创建/克隆及引用它们的后续修改组成计划事务分组，生产者固定在首位；真实 Key 解析后，依赖项按普通分组规则重新分类。
+- 移动、类型变更和事务链接在目标已解析后以零散 operation 展示。
+- issue 分组按事务 key 自然排序；组内默认按操作类别、创建时间和 operation ID 排序。
+- 用户可在组内上下调整、把条目转为零散项，以及调整零散项顺序。
+- 人工顺序通过前驱锚点持久化；新增或移除组成员后，仍可解析的相对顺序会保留。
+- 队列修改使用 revision 乐观并发校验；过期页面会收到冲突响应并刷新。
+- 取消与提交均支持多选，并以事务方式保证整批成功或整批不变。
+- 提交选择必须包含仍在队列中的依赖生产者，服务端按依赖拓扑稳定生成 stage order；页面会可见地联动勾选生产者，但后端不会暗中扩大授权。
+- 取消创建/克隆 operation 时，页面明确展示并二次确认仍在队列中的级联依赖范围。
+
+当一次提交中同一事务包含 5 个或更多标准/自定义字段 operation 时，这些条目的提交风险会升级为高风险，并要求二次确认。
+
+### 4.3 本地审核页
+
+审核页目前包含四个区域：
+
+- 实时审核队列：查看 operation 详情、勾选、全选、排序、取消和提交。
+- 暂存与阻塞：展示 `staged`、`held` 和 `indeterminate` 状态及可用人工处置。
+- 执行中：展示当前 `executing` operation。
+- 执行历史：按本地日期筛选并分页查看结果。
+
+页面通过短时浏览器会话访问，定时轮询状态，并在刷新数据时保留仍然有效的选择和展开状态。高风险选择在提交前要求用户再次确认；依赖失败且尚未授权的队列项会保留展示、禁用提交并只允许取消。
+
+### 4.4 执行与恢复
+
+后台 worker 已实现：
+
+- 按持久化 `stage_order` 串行领取 operation。
+- 使用进程内锁、跨进程文件锁和 SQLite 原子 claim，避免并发 worker 重复领取。
+- 对成功和失败结果写入 execution record，包含 attempt、时间、耗时、摘要、错误和新建事务 key。
+- 创建/克隆成功时，在同一 SQLite 结果事务中把 queue/staging 引用绑定到真实 Key；执行依赖项时只向 Jira 传递完全解析的 concrete payload。
+- 生产者明确失败或被放弃时，已暂存依赖以 `dependency_failed` 终止并明确记录“未调用 Jira”，无关 operation 继续执行。
+- 普通失败作为终态记录，不在后台静默重复调用 Jira。
+- 若进程中断时 operation 处于 `executing`，启动恢复会将其标记为 `indeterminate`，并把后续条目标记为 `held`。
+- 用户可把 indeterminate 标记为“已生效”“未生效”或“放弃”；创建/克隆标记为“已生效”时必须补录真实 Key，“未生效”会复用原 operation ID、增加 attempt 并重新入队。
+- 用户可将 held 条目恢复到 staging、退回审核队列或放弃。
+
+### 4.5 持久化与可观测性
+
+当前运行数据位于 `data/`：
+
+- `operations.sqlite3`：队列、队列事件、staging、执行记录和 queue/execution/history revisions。
+- `mcp_logs.sqlite3`：Tool 调用、Resource 读取和 Prompt 获取的完整 MCP 业务请求/响应及时间信息。
+- `jira_execution.lock`：跨进程 Jira 写入互斥锁。
+
+queue、staging 和 history 中的 `payload_json` 始终保留 Agent 入队时的不可变原始快照；`issue_references_json` 单独记录字段名、生产者 operation ID 和可选的已解析 Jira Key。execution record 另存 worker 实际传给 Jira 的 concrete payload 和 issue key；`dependency_failed` 因未调用 Jira，这两项保持为空。
+
+SQLite 使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema version。业务队列事务与 MCP 日志相互独立，日志记录失败不会改变 MCP 业务结果。
+operations schema v2 不迁移 v1 开发库；检测到旧版本时拒绝启动并要求人工清除对应数据库，不会静默删除运行数据。
+
+### 4.6 配置与运行
+
+当前支持：
+
+- Python 3.10+。
+- Jira Server/Data Center。
+- Personal Access Token 或 Basic Auth。
+- 可配置 TLS 证书校验和 Jira 请求超时。
+- 可配置 Web 起始端口；端口占用时在后续 99 个端口内自动寻找可用项。
+- 可配置本地 `.txt` 描述文件大小上限，默认 256 KiB。
+- STDIO MCP 启动方式；Web 服务按需启动，无独立前端构建步骤。
+
+## 5. 当前产品范围说明
+
+以下内容用于说明 2.1.0 的实际行为，不代表永久产品边界：
+
+- 当前部署模型是同一台机器、同一用户、一个 MCP 服务连接一个 Jira 配置。
+- 当前 operation 只覆盖第 4.1 节列出的类型；服务端按现有 allowlist 接受操作。
+- 本地附件和 description 文件以路径进入 operation，并在实际执行时读取。
+- `move_issue` 目前保留完整的规划、审核和结果记录体验，但 Server/Data Center REST executor 不执行移动。
+- 克隆当前聚焦事务核心字段和可选附件；子任务不会自动创建。
+- 数据库已有 schema version 检查，但当前没有面向旧版 schema 的自动迁移流程。
+
+## 6. 后续产品规划
+
+以下为基于当前架构的演进方向，按产品价值排序，不表示已经交付，也不承诺具体版本日期。
+
+### 6.1 近期：补齐 Jira 操作闭环
+
+- 增加项目、事务类型、字段元数据、可用流转、链接类型和用户等只读发现能力，减少调用前的人工字段配置。
+- 完善克隆能力，包括可审阅的子任务克隆、附件复制结果和更完整的字段选择。
+- 为移动事务提供与目标 Jira 版本兼容的实现或明确的引导式替代流程。
+- 增加 operation 执行前的规范化 payload 预览，让审核内容更接近最终 Jira 请求。
+- 将附件和 description 文件保存为可核对的内容快照或哈希绑定，并在页面展示内容与大小信息。
+- 建立多版本 Jira Server/Data Center 集成测试矩阵，覆盖权限、工作流、字段配置和 Jira 自动化场景。
+
+### 6.2 中期：提升批量审核与日常效率
+
+- 队列搜索、筛选、按风险或 operation 类型聚合，以及更强的批量选择能力。
+- 保存和复用常见 JQL、字段映射、operation 模板与审核视图。
+- 提供提交前差异视图、影响范围摘要、执行进度与失败定位。
+- 扩展当前创建/克隆引用模型，支持更多显式、可审核的 operation 依赖类型。
+- 增加可配置的数据保留、历史导出、运行诊断和数据库升级工具。
+- 在具备明确幂等语义时，为可安全重试的 operation 设计可配置重试策略；未知结果仍进入可观察的人工对账流程。
+
+### 6.3 长期：扩展部署与协作模式
+
+- 支持多个 Jira 实例和 Jira Cloud 适配层。
+- 支持远程审核、多用户、角色权限、通知和多级审批。
+- 提供更适合长期运行的服务化部署、健康检查、备份恢复和运维界面。
+- 建立可扩展 operation/connector 机制，逐步纳入更多 Jira 管理动作；对影响更大的动作配套更细粒度预览与授权流程。
+- 在引入多用户或多租户模式时，扩展身份、租户隔离、审计导出和策略配置能力。
+
+## 7. 当前版本验收基线
+
+2.1.0 的功能验收以代码和自动化测试为准，至少应满足：
+
+- FastMCP 实际注册 18 个 Tool、4 个 Resource 和 4 个 Prompt，且能力描述完整、中文、可被 Agent 理解。
+- 5 个只读 Tool 只查询 Jira；11 个 `*_append` Tool 只创建本地 operation。
+- 审核页可以读取实时状态、调整顺序、取消或提交选择，并处理高风险二次确认。
+- 创建/克隆 operation ID 可被全部修改 Tool 引用；依赖闭包、拓扑执行、成功 Key 解析、部分提交和级联取消均符合契约。
+- queue revision、ETag、严格请求模型和原子队列变更均按接口契约工作。
+- worker 在单线程、多线程和多进程场景下不重复领取同一 operation。
+- 成功、失败、`dependency_failed`、中断恢复、indeterminate 对账和 held 处置均留下可查询记录；未解析 operation ID 不会进入 Jira executor。
+- MCP 业务交换日志与 operation 数据库独立工作。
+- 页面在真实 Chromium 中能安全、稳定地展示来自 Jira 和 operation 的任意业务文本。
+- `conda run -n jira-dev python -m pytest tests/ -q` 完整通过。
+
+## 8. 文档事实来源
+
+- 当前已实现行为：以代码与测试为准。
+- 产品定位和后续方向：以本 PRD 为准。
+- 安装、配置和 MCP Client 接入：以 `README.md` 与 `config.example.yaml` 为准。
+- Agent 开发约束与修改检查项：以 `AGENTS.md` 为准。

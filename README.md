@@ -16,6 +16,7 @@ Jira Local MCP 是面向 Jira Server/Data Center 的本地 STDIO MCP 安全网�
 
 ```text
 MCP append → queued → Web submit → staged → executing → success/failed history
+                              └→ dependency_failed（依赖生产者失败，未调用 Jira）
                                               └→ indeterminate → 人工对账
                                                     └→ 后序 held
 ```
@@ -23,9 +24,10 @@ MCP append → queued → Web submit → staged → executing → success/failed
 - `data/operations.sqlite3`：实时队列、队列事件、staging、执行记录和 revisions。
 - `data/mcp_logs.sqlite3`：Tool 调用、Resource 读取和 Prompt/Skill 获取的完整业务请求/响应；不记录能力列表等协议元数据。
 - SQLite 是唯一业务状态源；使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema version。完整 schema 初始化按进程和数据库路径执行一次，普通连接不重复获取 schema 写锁。
-- v1 不过期或裁剪 operation/history。旧 JSON 数据不迁移。本次锚点 schema 切换也不迁移早期 SQLite：仅在切换时清空 `operations.sqlite3`、`mcp_logs.sqlite3` 及其精确匹配的 WAL/SHM sidecar，正常启动不会自动清库。
+- `payload_json` 保留入队时的不可变原始参数，`issue_references_json` 单独记录待创建引用及解析结果；执行记录另存实际传给 Jira 的 concrete payload/key。
+- operations schema v2 不迁移 v1 开发库；升级时需人工清除 `operations.sqlite3` 及其精确匹配的 WAL/SHM sidecar，正常启动只会明确报错而不会自动清库。`mcp_logs.sqlite3` 仍使用独立 schema，无需随 operations DB 一并清除。
 
-队列在入队时按 issue 与六类操作自动聚类，同类默认按创建时间和 operation ID 排序。组内人工微调以“前驱 operation ID”锚点持久化；组成员变化时先排列自动条目，再插入仍可解析的人工锚点。缺失或成环锚点退化为自动排序。用户也可以调整零散顺序或将组内 operation 拉出为零散项；修改会通过 queue revision 做乐观并发校验。
+队列在入队时按 issue 与六类操作自动聚类；创建/克隆及尚未解析的依赖项显示为计划事务分组，生产者固定在首位。真实 Key 返回后，依赖项自动恢复为普通 issue 分组或零散项。同类默认按创建时间和 operation ID 排序，人工微调以“前驱 operation ID”锚点持久化；缺失或成环锚点退化为自动排序。所有布局修改使用 queue revision 做乐观并发校验。
 
 ## MCP 能力
 
@@ -35,7 +37,7 @@ MCP append → queued → Web submit → staged → executing → success/failed
 - `jira_get_execution_log`：读取实际执行和人工对账历史。
 - 4 个 Resources 和 4 个 Prompts。
 
-`move_issue` 仍可入队展示，但 Jira Server/DC REST 不支持时会明确记录失败。创建后修改必须先从 execution log 获取真实 issue key，再创建新的 operation；不支持 placeholder chaining。
+`move_issue` 仍可入队展示，但 Jira Server/DC REST 不支持时会明确记录失败。创建或克隆 Tool 返回的 operation ID 可直接作为后续修改的 `issue_key`，因此创建与修改可在同一审核页提交；服务端会在生产者成功后原子解析真实 issue key。克隆来源仍必须是真实 Jira Key，也不接受自定义 placeholder。
 
 ## 配置与运行
 

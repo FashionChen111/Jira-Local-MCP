@@ -2,13 +2,14 @@
 
 三项职责：
   1. classify_risk() —— 给不可编辑的基础 operation 快照分级。
-  2. validate_operation_target() —— 拒绝用占位 issue key 串联尚未执行的创建操作。
+  2. validate_operation_target() —— 只接受真实 issue key 或服务端创建/克隆 operation ID。
   3. assert_not_delete() —— 防御式拒绝白名单外类型和含删除语义的 payload。
 """
 from __future__ import annotations
 
 import re
 from typing import Any
+
 
 # —— 允许的操作类型白名单（永不含任何删除语义）——
 CREATE_OPS = {"create_issue", "clone_issue"}
@@ -42,9 +43,8 @@ _CLOSE_KEYWORDS = ["关闭", "解决", "完成", "close", "resolve", "done", "ca
 # 删除语义词（payload 深度扫描）
 _DELETE_PATTERN = re.compile(r"delete|remove|purge|删除|移除", re.IGNORECASE)
 
-# 合法 issue key 形态
 _ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
-
+_OPERATION_ID_RE = re.compile(r"^op-[0-9a-f]{32}$")
 
 class RiskError(Exception):
     """风险 / 安全校验拒绝异常，消息面向 LLM 引导。"""
@@ -75,26 +75,22 @@ def classify_risk(operation_type: str, payload: dict[str, Any]) -> tuple[str, st
 
 
 def validate_operation_target(operation_type: str, issue_key: str | None) -> None:
-    """Reject placeholder chaining; modifications require a real-looking Jira key."""
+    """Allow real Jira keys or server-issued create/clone operation IDs."""
     if operation_type not in MODIFY_OPS:
         return
 
     guide = (
-        "❌ 修改操作必须使用 Jira 已实际生成的 issue key，不能引用待创建事务或占位符。\n"
-        "正确流程：\n"
-        "  1) 先提交并执行创建 operation；\n"
-        "  2) 调用 jira_get_execution_log 取回真实 issue_key；\n"
-        "  3) 用真实 issue_key 新建修改 operation，再次审核。\n"
-        "提示：能在创建时一并设置的字段，请直接写在创建调用里，不要拆到第二阶段。"
+        "修改目标必须使用真实 Jira issue key，或本服务返回的 create_issue/"
+        "clone_issue operation ID；不接受自定义占位符。"
     )
 
     if not issue_key:
         raise RiskError(guide)
-    if "$" in issue_key or "{" in issue_key or "}" in issue_key:
-        raise RiskError(guide)
-    if not _ISSUE_KEY_RE.match(issue_key):
+    if not _ISSUE_KEY_RE.fullmatch(issue_key) and not _OPERATION_ID_RE.fullmatch(
+        issue_key
+    ):
         raise RiskError(
-            f"issue_key「{issue_key}」形态非法（应形如 PROJ-123）。\n" + guide
+            f"issue_key「{issue_key}」形态非法。\n" + guide
         )
 
 

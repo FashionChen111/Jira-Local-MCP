@@ -25,11 +25,17 @@ def _reminder() -> str:
 
 
 def _response(operation: Any) -> str:
-    return (
+    result = (
         f"Operation ID: {operation.operation_id}\n"
         f"基础风险: {operation.risk_level}\n"
         "该 operation 已进入本地审核队列，尚未执行。"
     )
+    if operation.operation_type in ("create_issue", "clone_issue"):
+        result += (
+            "\n在真实事务尚未生成时，可将此 Operation ID 直接作为后续修改 "
+            "Tool 的 issue_key/target_issue_key。"
+        )
+    return result
 
 
 def _serialize_issue(issue: Any, fields: list[str] | None) -> dict[str, Any]:
@@ -248,7 +254,8 @@ def jira_issue_create_append(
 
     返回：
         已入队的 operation ID、基础风险等级及“尚未执行”提示。只有用户在
-        本地 Web 审核页明确提交后，后台 worker 才可以写入 Jira。
+        本地 Web 审核页明确提交后，后台 worker 才可以写入 Jira；operation
+        ID 可立即作为后续修改 Tool 的待创建事务引用。
 
     副作用：
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
@@ -281,14 +288,15 @@ def jira_issue_clone_append(
     """将克隆 Jira 事务操作加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
-        issue_key: 源 Jira 事务 Key。
+        issue_key: 源 Jira 事务的真实 Key；克隆来源不接受待创建 operation ID。
         summary: 可选的新事务标题。
         clone_subtasks: 是否在经审核的操作中克隆子任务，默认为 ``False``。
         clone_attachments: 是否在经审核的操作中克隆附件，默认为 ``False``。
 
     返回：
         已入队的 operation ID、基础风险等级及“尚未执行”提示；执行前必须由
-        用户在本地 Web 审核页明确提交。
+        用户在本地 Web 审核页明确提交。该 operation ID 可立即作为后续修改
+        Tool 的待创建事务引用。
 
     副作用：
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
@@ -317,7 +325,7 @@ def jira_issue_move_append(
     该操作也会在执行阶段明确失败，不会被伪装成成功。
 
     参数：
-        issue_key: 源 Jira 事务 Key。
+        issue_key: 源 Jira 事务 Key，或创建/克隆 operation ID。
         target_project_key: 目标 Jira 项目 Key。
         target_issue_type: 可选的目标事务类型。
 
@@ -347,7 +355,7 @@ def jira_issue_type_change_append(
     """将 Jira 事务类型变更加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
-        issue_key: Jira 事务 Key。
+        issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         target_issue_type: 目标事务类型名称。
         fields_mapping: 可选的字段映射，用于适配不同事务类型的字段差异。
 
@@ -381,7 +389,7 @@ def jira_issue_transition_append(
     """将 Jira 工作流状态流转加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
-        issue_key: Jira 事务 Key。
+        issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         transition_name: Jira 工作流流转名称。
         comment: 可选的流转评论。
         fields: 可选的流转字段映射。
@@ -412,7 +420,7 @@ def jira_field_update_append(issue_key: str, fields: dict) -> str:
     """将 Jira 标准字段变更加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
-        issue_key: Jira 事务 Key。
+        issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         fields: 非空的标准字段映射。描述文件可写为
             ``{"description": {"file": "C:\\absolute\\path.txt"}}``。
 
@@ -437,7 +445,7 @@ def jira_customfield_update_append(issue_key: str, custom_fields: dict) -> str:
     """将 Jira 自定义字段变更加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
-        issue_key: Jira 事务 Key。
+        issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         custom_fields: 非空的自定义字段映射；键必须是 Jira 自定义字段 ID，
             例如 ``customfield_10001``。
 
@@ -464,7 +472,7 @@ def jira_attachment_add_append(
     """将 Jira 附件上传加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
-        issue_key: Jira 事务 Key。
+        issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         file_path: 已存在的本地文件绝对路径。
         file_name: 可选的附件显示名称；省略时使用本地文件名。
 
@@ -497,7 +505,7 @@ def jira_comment_add_append(issue_key: str, body: str) -> str:
     """将 Jira 评论添加操作加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
-        issue_key: Jira 事务 Key。
+        issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         body: 评论正文。
 
     返回：
@@ -526,7 +534,7 @@ def jira_worklog_add_append(
     """将 Jira 工作日志添加操作加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
-        issue_key: Jira 事务 Key。
+        issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         time_spent: Jira 耗时表达式，例如 ``2h`` 或 ``1d 4h``。
         comment: 可选的工作说明。
         started: 可选的 ISO 格式开始时间；省略时由 Jira 使用当前时间。
@@ -559,8 +567,8 @@ def jira_issuelink_add_append(
     """将 Jira 事务链接添加操作加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
-        issue_key: 源 Jira 事务 Key。
-        target_issue_key: 目标 Jira 事务 Key。
+        issue_key: 源 Jira 事务 Key，或创建/克隆 operation ID。
+        target_issue_key: 目标 Jira 事务 Key，或另一个创建/克隆 operation ID。
         link_type: Jira 链接类型，例如 ``Blocks`` 或 ``Relates``。
 
     返回：

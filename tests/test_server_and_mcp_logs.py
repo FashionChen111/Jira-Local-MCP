@@ -72,6 +72,9 @@ def test_all_mounted_resource_and_prompt_docstrings_are_complete_and_chinese(cfg
     assert len(resources) == 4
     assert not resource_templates
     assert len(prompts) == 4
+    prompt_names = {prompt.name for prompt in prompts}
+    assert "create_with_followups_workflow" in prompt_names
+    assert "create_then_modify_workflow" not in prompt_names
 
     for resource in resources + resource_templates:
         name = (
@@ -116,6 +119,14 @@ def test_append_response_exposes_only_operation_identity(queue):
     assert "尚未执行" in response
     assert "hello" not in response and "描述" not in response
     assert "批次" not in response and "task" not in response.lower() and "nonce" not in response.lower()
+
+
+def test_create_response_exposes_reference_contract_and_followup_accepts_id(queue):
+    created = server.jira_issue_create_append("PROJ", "Task", "new")
+    operation_id = re.search(r"op-[0-9a-f]{32}", created).group(0)
+    assert "issue_key/target_issue_key" in created
+    followup = server.jira_comment_add_append(operation_id, "follow up")
+    assert "Operation ID: op-" in followup and "尚未执行" in followup
 
 
 def test_show_queue_opens_even_when_empty(cfg, monkeypatch):

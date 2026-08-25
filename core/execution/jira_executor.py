@@ -5,6 +5,7 @@ import os
 from typing import Any
 
 from core import jira_client, risk_engine
+from core.operations.issue_references import is_issue_key, reference_fields
 from core.textfile_loader import TextFileError, read_text_file
 
 MOVE_UNSUPPORTED_MSG = (
@@ -174,6 +175,16 @@ _HANDLERS = {
 def execute_operation(task: Any) -> tuple[str, str | None]:
     """Execute one authorized operation after the mandatory second delete check."""
     risk_engine.assert_not_delete(task.operation_type, task.payload)
+    fields = (
+        ("issue_key",)
+        if task.operation_type == "clone_issue"
+        else reference_fields(task.operation_type)
+    )
+    for field_name in fields:
+        if not is_issue_key(task.payload.get(field_name)):
+            raise RuntimeError(
+                f"执行前引用字段 {field_name} 未解析为真实 Jira issue key"
+            )
     handler = _HANDLERS.get(task.operation_type)
     if handler is None:
         raise RuntimeError(f"不支持的操作类型: {task.operation_type}")

@@ -20,7 +20,7 @@ def _field(store, key="PROJ-1", name="summary"):
 def test_schema_pragmas_and_revisions_initialized(queue):
     connection = open_database("operations")
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -51,7 +51,7 @@ def test_natural_groups_category_insertion_and_standalone_last(queue):
     assert [group["issue_key"] for group in value["groups"]] == ["PROJ-2", "PROJ-10"]
     assert [item["operation_id"] for item in value["groups"][0]["operations"]] == [two_field.operation_id, two_comment.operation_id]
     assert value["groups"][1]["operations"][0]["operation_id"] == ten.operation_id
-    assert value["standalone"][0]["operation_id"] == create.operation_id
+    assert value["planned_groups"][0]["operations"][0]["operation_id"] == create.operation_id
 
 
 def test_all_six_categories_use_the_defined_default_order(queue):
@@ -162,7 +162,7 @@ def test_anchor_target_removal_and_detach_are_normalized(queue):
         [{"issue_key": "PROJ-1", "operation_ids": [first, third, second]}],
         [],
     )
-    queue.cancel([first])
+    queue.cancel(4, [first], False)
     remaining = _group_operations(queue)
     assert [item["operation_id"] for item in remaining] == [second, third]
     assert all(item["manual_after_operation_id"] is None for item in remaining)
@@ -199,9 +199,9 @@ def test_reorder_rejects_cross_issue_and_incomplete_layout(queue):
 def test_cancel_is_all_or_nothing(queue):
     operation = _comment(queue)
     with pytest.raises(StoreError):
-        queue.cancel([operation.operation_id, "op-" + "f" * 32])
+        queue.cancel(1, [operation.operation_id, "op-" + "f" * 32], False)
     assert queue.total_active() == 1
-    queue.cancel([operation.operation_id])
+    queue.cancel(1, [operation.operation_id], False)
     assert queue.total_active() == 0
 
 
