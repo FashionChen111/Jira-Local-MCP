@@ -1,61 +1,98 @@
 "use strict";
-const queueContent = document.getElementById("queue-content"),
-  stagingContent = document.getElementById("staging-content"),
-  executingContent = document.getElementById("executing-content"),
-  historyContent = document.getElementById("history-content");
-const selected = new Set(),
-  explicitSelected = new Set(),
-  heldSelected = new Set(),
-  expanded = new Set();
-let state = null,
-  etag = null,
-  pollTimer = null,
-  historyPage = 1,
-  historyPages = 1,
-  lastHistoryRevision = -1;
+
+const queueContent = document.getElementById("queue-content");
+const stagingContent = document.getElementById("staging-content");
+const executingContent = document.getElementById("executing-content");
+const historyContent = document.getElementById("history-content");
+const selected = new Set();
+const explicitSelected = new Set();
+const heldSelected = new Set();
+const expanded = new Set();
+
+let state = null;
+let etag = null;
+let pollTimer = null;
+let historyPage = 1;
+let historyPages = 1;
+let lastHistoryRevision = -1;
+let sessionExpired = false;
+
+const sessionExpiredMessage =
+  "审核会话已失效。页面已停止刷新并禁用审核操作，请重新调用 jira_show_queue。";
+
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text !== undefined) node.textContent = String(text);
   return node;
 }
+
 function button(text, handler, className) {
   const node = el("button", className, text);
   node.type = "button";
+  node.disabled = sessionExpired;
   node.addEventListener("click", handler);
   return node;
 }
+
 function message(text) {
-  document.getElementById("queue-message").textContent = text || "";
+  document.getElementById("queue-message").textContent = sessionExpired
+    ? sessionExpiredMessage
+    : text || "";
 }
+
+function expireSession() {
+  if (sessionExpired) return;
+  sessionExpired = true;
+  clearTimeout(pollTimer);
+  document.querySelectorAll("button,input,select").forEach((control) => {
+    control.disabled = true;
+  });
+  message(sessionExpiredMessage);
+}
+
+async function reviewFetch(url, options) {
+  const response = await fetch(url, options);
+  if (response.status === 403) expireSession();
+  return response;
+}
+
 function allQueueOperations() {
   if (!state) return [];
   return [
     ...state.queue.groups.flatMap((group) => group.operations),
-    ...(state.queue.planned_groups || []).flatMap((group) => group.operations),
     ...state.queue.standalone,
   ];
 }
+
 function queueOperationMap() {
   return new Map(allQueueOperations().map((item) => [item.operation_id, item]));
 }
+
 function dependencyIds(operation) {
-  return operation.unresolved_dependency_operation_ids || [];
+  return operation.dependency_operation_ids || [];
 }
+
 function recomputeSelected() {
   const byId = queueOperationMap();
   selected.clear();
   const stack = [...explicitSelected];
   while (stack.length) {
-    const id = stack.pop();
-    const operation = byId.get(id);
-    if (!operation || operation.submittable === false || selected.has(id)) continue;
-    selected.add(id);
+    const operationId = stack.pop();
+    const operation = byId.get(operationId);
+    if (
+      !operation ||
+      operation.submittable === false ||
+      selected.has(operationId)
+    )
+      continue;
+    selected.add(operationId);
     dependencyIds(operation).forEach((dependencyId) => {
       if (byId.has(dependencyId)) stack.push(dependencyId);
     });
   }
 }
+
 function setExplicitSelection(operationId, checked) {
   if (checked) {
     explicitSelected.add(operationId);
@@ -80,6 +117,7 @@ function setExplicitSelection(operationId, checked) {
   recomputeSelected();
   renderQueue();
 }
+
 function operationCard(operation, controls = []) {
   const card = el(
     "div",
@@ -88,45 +126,84 @@ function operationCard(operation, controls = []) {
   card.dataset.operationId = operation.operation_id;
   const head = el("div", "operation-head");
   const title = el("div");
+  const targets = [operation.issue_key || "无 issue key"];
+  if (operation.target_issue_key) targets.push(`目标 ${operation.target_issue_key}`);
   title.append(
     el("div", "operation-title", operation.description),
     el(
       "div",
       "meta",
-      `${operation.operation_type} · ${operation.operation_id} · ${operation.issue_key || "无 issue key"} · ${operation.submission_risk_level || operation.risk_level} risk`,
+      `${operation.operation_type} · ${operation.operation_id} · ${targets.join(" · ")} · ${operation.submission_risk_level || operation.risk_level} risk`,
     ),
   );
-  if (operation.issue_references && Object.keys(operation.issue_references).length) {
-    const refs = Object.entries(operation.issue_references)
-      .map(([field, ref]) =>
-        `${field}: ${ref.operation_id}${ref.resolved_issue_key ? ` → ${ref.resolved_issue_key}` : "（待解析）"}`,
-      )
-      .join("；");
-    title.append(el("div", "meta dependency", refs));
+  const dependencies = dependencyIds(operation);
+  if (dependencies.length) {
+    const labels = dependencies.map(
+      (id) => `${id}: ${operation.dependency_states?.[id] || "unknown"}`,
+    );
+    title.append(el("div", "meta dependency", `operation 依赖：${labels.join("；")}`));
   }
-  if (operation.submission_block_reason)
-    title.append(el("div", "meta dependency-error", operation.submission_block_reason));
+  if (operation.submission_block_reason) {
+    title.append(
+      el("div", "meta dependency-error", operation.submission_block_reason),
+    );
+  }
   head.append(title);
   if (controls.length) {
     const area = el("div", "operation-controls");
-    controls.forEach((item) => area.append(item));
+    controls.forEach((control) => area.append(control));
     head.append(area);
   }
   card.append(head);
+
   const details = el("details");
   details.open = expanded.has(operation.operation_id);
-  details.addEventListener("toggle", () =>
-    details.open
-      ? expanded.add(operation.operation_id)
-      : expanded.delete(operation.operation_id),
-  );
+  details.addEventListener("toggle", () => {
+    if (details.open) expanded.add(operation.operation_id);
+    else expanded.delete(operation.operation_id);
+  });
   details.append(el("summary", null, "完整参数"));
   const pre = el("pre");
-  pre.textContent = JSON.stringify(operation.payload, null, 2);
+  pre.textContent = JSON.stringify(
+    {
+      issue_key: operation.issue_key,
+      target_issue_key: operation.target_issue_key,
+      ...operation.payload,
+    },
+    null,
+    2,
+  );
   details.append(pre);
   card.append(details);
   return card;
 }
+
+function queueControls(operation) {
+  const check = el("input");
+  check.type = "checkbox";
+  check.checked = selected.has(operation.operation_id);
+  check.disabled = sessionExpired || operation.submittable === false;
+  check.title =
+    selected.has(operation.operation_id) &&
+    !explicitSelected.has(operation.operation_id)
+      ? "因依赖关系自动勾选"
+      : "";
+  check.addEventListener("change", () =>
+    setExplicitSelection(operation.operation_id, check.checked),
+  );
+  const controls = [check];
+  if (operation.submittable === false) {
+    controls.push(
+      button(
+        "取消此项",
+        () => cancelOperations([operation.operation_id], false),
+        "danger",
+      ),
+    );
+  }
+  return controls;
+}
+
 function renderQueue() {
   queueContent.replaceChildren();
   document.getElementById("queue-revision").textContent =
@@ -134,177 +211,53 @@ function renderQueue() {
   const available = new Set(
     allQueueOperations().map((item) => item.operation_id),
   );
-  for (const id of [...selected]) if (!available.has(id)) selected.delete(id);
-  for (const id of [...explicitSelected])
+  [...selected].forEach((id) => {
+    if (!available.has(id)) selected.delete(id);
+  });
+  [...explicitSelected].forEach((id) => {
     if (!available.has(id)) explicitSelected.delete(id);
+  });
   recomputeSelected();
-  state.queue.groups.forEach((group, groupIndex) => {
-    const box = el("div", "issue-group");
-    box.append(el("h3", null, group.issue_key));
-    group.operations.forEach((operation, index) => {
-      const check = el("input");
-      check.type = "checkbox";
-      check.checked = selected.has(operation.operation_id);
-      check.disabled = operation.submittable === false;
-      check.title =
-        selected.has(operation.operation_id) &&
-        !explicitSelected.has(operation.operation_id)
-          ? "因依赖关系自动勾选"
-          : "";
-      check.addEventListener("change", () =>
-        setExplicitSelection(operation.operation_id, check.checked),
-      );
-      const move = (delta) => {
-        const target = index + delta;
-        if (target < 0 || target >= group.operations.length) return;
-        [group.operations[index], group.operations[target]] = [
-          group.operations[target],
-          group.operations[index],
-        ];
-        saveLayout();
-      };
-      const detach = () => {
-        group.operations.splice(index, 1);
-        state.queue.standalone.push(operation);
-        saveLayout();
-      };
-      box.append(
-        operationCard(operation, [
-          check,
-          button("↑", () => move(-1)),
-          button("↓", () => move(1)),
-          button("转为零散", detach),
-        ]),
-      );
+
+  state.queue.groups.forEach((group) => {
+    const box = el(
+      "div",
+      group.kind === "pending_issue"
+        ? "issue-group planned-group"
+        : "issue-group",
+    );
+    const heading =
+      group.kind === "pending_issue"
+        ? `待创建事务 · ${group.group_key} · ${group.producer_state}`
+        : group.group_key;
+    box.append(el("h3", null, heading));
+    group.operations.forEach((operation) => {
+      box.append(operationCard(operation, queueControls(operation)));
     });
     queueContent.append(box);
   });
-  (state.queue.planned_groups || []).forEach((group) => {
-    const box = el("div", "issue-group planned-group");
-    box.append(
-      el(
-        "h3",
-        null,
-        `待创建事务 · ${group.producer_operation_id} · ${group.producer_state}`,
-      ),
-    );
-    const producerPresent = group.operations.some(
-      (item) => item.operation_id === group.producer_operation_id,
-    );
-    group.operations.forEach((operation, index) => {
-      const check = el("input");
-      check.type = "checkbox";
-      check.checked = selected.has(operation.operation_id);
-      check.disabled = operation.submittable === false;
-      check.title =
-        selected.has(operation.operation_id) &&
-        !explicitSelected.has(operation.operation_id)
-          ? "因依赖关系自动勾选"
-          : "";
-      check.addEventListener("change", () =>
-        setExplicitSelection(operation.operation_id, check.checked),
-      );
-      const controls = [check];
-      if (operation.submittable === false) {
-        controls.push(
-          button(
-            "取消此项",
-            () => cancelOperations([operation.operation_id], false),
-            "danger",
-          ),
-        );
-      }
-      if (operation.operation_id !== group.producer_operation_id) {
-        const move = (delta) => {
-          const target = index + delta;
-          const minimum = producerPresent ? 1 : 0;
-          if (target < minimum || target >= group.operations.length) return;
-          [group.operations[index], group.operations[target]] = [
-            group.operations[target],
-            group.operations[index],
-          ];
-          saveLayout();
-        };
-        controls.push(button("↑", () => move(-1)), button("↓", () => move(1)));
-      }
-      box.append(operationCard(operation, controls));
-    });
-    queueContent.append(box);
-  });
+
   if (state.queue.standalone.length) {
     const box = el("div", "standalone");
     box.append(el("h3", null, "零散 Operations"));
-    state.queue.standalone.forEach((operation, index) => {
-      const check = el("input");
-      check.type = "checkbox";
-      check.checked = selected.has(operation.operation_id);
-      check.disabled = operation.submittable === false;
-      check.addEventListener("change", () =>
-        setExplicitSelection(operation.operation_id, check.checked),
-      );
-      const controls = [check];
-      if (operation.submittable === false)
-        controls.push(
-          button(
-            "取消此项",
-            () => cancelOperations([operation.operation_id], false),
-            "danger",
-          ),
-        );
-      const move = (delta) => {
-        const target = index + delta;
-        if (target < 0 || target >= state.queue.standalone.length) return;
-        [state.queue.standalone[index], state.queue.standalone[target]] = [
-          state.queue.standalone[target],
-          state.queue.standalone[index],
-        ];
-        saveLayout();
-      };
-      controls.push(button("↑", () => move(-1)), button("↓", () => move(1)));
-      box.append(operationCard(operation, controls));
+    state.queue.standalone.forEach((operation) => {
+      box.append(operationCard(operation, queueControls(operation)));
     });
     queueContent.append(box);
   }
-  if (!allQueueOperations().length)
+  if (!allQueueOperations().length) {
     queueContent.append(el("div", "empty", "当前队列为空"));
-}
-async function saveLayout() {
-  const body = {
-    expected_queue_revision: state.revisions.queue,
-    groups: state.queue.groups.map((group) => ({
-      issue_key: group.issue_key,
-      operation_ids: group.operations.map((item) => item.operation_id),
-    })),
-    planned_groups: (state.queue.planned_groups || []).map((group) => ({
-      producer_operation_id: group.producer_operation_id,
-      operation_ids: group.operations.map((item) => item.operation_id),
-    })),
-    standalone_operation_ids: state.queue.standalone.map(
-      (item) => item.operation_id,
-    ),
-  };
-  const response = await fetch("/api/queue/reorder", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    message("后端状态已更新，正在刷新；请重新确认排序。");
-    etag = null;
-    await loadState(true);
-    return;
   }
-  message("排序已持久化");
-  etag = null;
-  await loadState(true);
 }
+
 function renderExecution() {
   stagingContent.replaceChildren();
   const heldIds = new Set(
     state.execution.held.map((item) => item.operation_id),
   );
-  for (const id of [...heldSelected])
+  [...heldSelected].forEach((id) => {
     if (!heldIds.has(id)) heldSelected.delete(id);
+  });
   if (state.execution.held.length) {
     const bulk = el("div", "actions");
     bulk.append(
@@ -339,17 +292,15 @@ function renderExecution() {
       const check = el("input");
       check.type = "checkbox";
       check.checked = heldSelected.has(operation.operation_id);
-      check.addEventListener("change", () =>
-        check.checked
-          ? heldSelected.add(operation.operation_id)
-          : heldSelected.delete(operation.operation_id),
-      );
+      check.disabled = sessionExpired;
+      check.addEventListener("change", () => {
+        if (check.checked) heldSelected.add(operation.operation_id);
+        else heldSelected.delete(operation.operation_id);
+      });
       controls.push(
         check,
         button("恢复", () => resolveHeld([operation.operation_id], "resume")),
-        button("退回队列", () =>
-          resolveHeld([operation.operation_id], "requeue"),
-        ),
+        button("退回队列", () => resolveHeld([operation.operation_id], "requeue")),
         button(
           "放弃",
           () => resolveHeld([operation.operation_id], "abandon"),
@@ -361,30 +312,34 @@ function renderExecution() {
     card.prepend(el("span", `status ${operation.state}`, operation.state));
     stagingContent.append(card);
   });
-  if (!staged.length)
+  if (!staged.length) {
     stagingContent.append(el("div", "empty", "暂无暂存或阻塞 operation"));
+  }
+
   executingContent.replaceChildren();
   state.execution.executing.forEach((operation) => {
     const card = operationCard(operation);
     card.prepend(el("span", "status", "executing"));
     executingContent.append(card);
   });
-  if (!state.execution.executing.length)
-    executingContent.append(el("div", "empty", "当前没有 Jira 写操作执行中"));
+  if (!state.execution.executing.length) {
+    executingContent.append(
+      el("div", "empty", "当前没有 Jira 写操作执行中"),
+    );
+  }
 }
+
 async function resolveIndeterminate(operation, resolution) {
-  let high = false;
+  let highRiskConfirmed = false;
   if (
     resolution === "not_applied" &&
     operation.submission_risk_level === "high"
-  )
-    high = confirm("这是高风险 operation，确认核实为未生效并重新入队？");
-  if (
-    resolution === "not_applied" &&
-    operation.submission_risk_level === "high" &&
-    !high
-  )
-    return;
+  ) {
+    highRiskConfirmed = confirm(
+      "这是高风险 operation，确认核实为未生效并重新入队？",
+    );
+    if (!highRiskConfirmed) return;
+  }
   let newIssueKey = null;
   if (
     resolution === "succeeded" &&
@@ -393,33 +348,38 @@ async function resolveIndeterminate(operation, resolution) {
     newIssueKey = prompt("请输入 Jira 实际生成的事务 Key（例如 PROJ-123）");
     if (newIssueKey === null) return;
     newIssueKey = newIssueKey.trim();
-    if (!/^[A-Z][A-Z0-9]+-\d+$/.test(newIssueKey)) {
-      message("事务 Key 格式无效");
+    if (!newIssueKey) {
+      message("事务 Key 不得为空");
       return;
     }
   }
   await mutate("/api/execution/indeterminate/resolve", {
     operation_id: operation.operation_id,
     resolution,
-    high_risk_confirmed: high,
+    high_risk_confirmed: highRiskConfirmed,
     new_issue_key: newIssueKey,
   });
 }
+
 async function resolveHeld(ids, action) {
   if (!ids.length) {
     message("请先勾选 held operation");
     return;
   }
-  if (action === "abandon" && !confirm("确认放弃选中的 held operation？"))
+  if (action === "abandon" && !confirm("确认放弃选中的 held operation？")) {
     return;
+  }
   await mutate("/api/execution/held/resolve", { operation_ids: ids, action });
 }
+
 async function mutate(url, body) {
-  const response = await fetch(url, {
+  if (sessionExpired) return;
+  const response = await reviewFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (sessionExpired) return;
   const data = await response.json();
   if (!response.ok) {
     message(data.error || "操作失败");
@@ -428,13 +388,15 @@ async function mutate(url, body) {
   etag = null;
   await loadState(true);
 }
+
 async function submitSelected(highRiskConfirmed = false) {
+  if (sessionExpired) return;
   const ids = [...selected];
   if (!ids.length) {
     message("请先勾选 operation");
     return;
   }
-  const response = await fetch("/api/queue/submit", {
+  const response = await reviewFetch("/api/queue/submit", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -443,14 +405,16 @@ async function submitSelected(highRiskConfirmed = false) {
       high_risk_confirmed: highRiskConfirmed,
     }),
   });
+  if (sessionExpired) return;
   const data = await response.json();
   if (
     response.status === 409 &&
     data.code === "confirmation_required" &&
     !highRiskConfirmed
   ) {
-    if (confirm("本次选择包含高风险操作，确认提交执行？"))
+    if (confirm("本次选择包含高风险操作，确认提交执行？")) {
       return submitSelected(true);
+    }
     return;
   }
   if (!response.ok) {
@@ -469,6 +433,7 @@ async function submitSelected(highRiskConfirmed = false) {
   etag = null;
   await loadState(true);
 }
+
 async function cancelSelected() {
   const ids = [...explicitSelected];
   if (!ids.length) {
@@ -478,8 +443,10 @@ async function cancelSelected() {
   if (!confirm("确认从队列取消选中的 operation？这不会写入 Jira。")) return;
   await cancelOperations(ids, false);
 }
+
 async function cancelOperations(ids, cascadeConfirmed) {
-  const response = await fetch("/api/queue/cancel", {
+  if (sessionExpired) return;
+  const response = await reviewFetch("/api/queue/cancel", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -488,6 +455,7 @@ async function cancelOperations(ids, cascadeConfirmed) {
       cascade_confirmed: cascadeConfirmed,
     }),
   });
+  if (sessionExpired) return;
   const data = await response.json();
   if (
     response.status === 409 &&
@@ -495,17 +463,15 @@ async function cancelOperations(ids, cascadeConfirmed) {
     !cascadeConfirmed
   ) {
     const requested = new Set(ids);
-    const dependentCount = (data.affected_operation_ids || []).filter(
-      (id) => !requested.has(id),
-    ).length;
-    const totalCount = (data.affected_operation_ids || []).length;
+    const affected = data.affected_operation_ids || [];
+    const dependentCount = affected.filter((id) => !requested.has(id)).length;
     if (
       confirm(
-        `所选创建/克隆项仍有 ${dependentCount} 个队列依赖，`
-          + `将原子取消共 ${totalCount} 个 operation。确认继续？`,
+        `所选创建/克隆项仍有 ${dependentCount} 个队列依赖，将原子取消共 ${affected.length} 个 operation。确认继续？`,
       )
-    )
+    ) {
       return cancelOperations(ids, true);
+    }
     return;
   }
   if (!response.ok) {
@@ -524,19 +490,20 @@ async function cancelOperations(ids, cascadeConfirmed) {
   etag = null;
   await loadState(true);
 }
+
 async function loadHistory(force = false) {
-  if (!state) return;
+  if (!state || sessionExpired) return;
   if (!force && lastHistoryRevision === state.revisions.history) return;
   const date = document.getElementById("history-date").value;
   let query = `page=${historyPage}&page_size=50`;
   if (date) {
-    const start = new Date(`${date}T00:00:00`),
-      end = new Date(start);
+    const start = new Date(`${date}T00:00:00`);
+    const end = new Date(start);
     end.setDate(end.getDate() + 1);
     query += `&start_at=${start.getTime()}&end_at=${end.getTime()}`;
   }
-  const response = await fetch(`/api/execution-history?${query}`);
-  if (!response.ok) return;
+  const response = await reviewFetch(`/api/execution-history?${query}`);
+  if (sessionExpired || !response.ok) return;
   const data = await response.json();
   lastHistoryRevision = state.revisions.history;
   historyPages = Math.max(1, Math.ceil(data.total / data.page_size));
@@ -561,20 +528,23 @@ async function loadHistory(force = false) {
     if (item.error) card.append(el("div", "meta", item.error));
     historyContent.append(card);
   });
-  if (!data.items.length)
+  if (!data.items.length) {
     historyContent.append(el("div", "empty", "该日期没有执行记录"));
+  }
   document.getElementById("history-page").textContent =
     `${historyPage} / ${historyPages}`;
   document.getElementById("history-prev").disabled = historyPage <= 1;
-  document.getElementById("history-next").disabled =
-    historyPage >= historyPages;
+  document.getElementById("history-next").disabled = historyPage >= historyPages;
 }
+
 async function loadState(force = false) {
+  if (sessionExpired) return;
   clearTimeout(pollTimer);
   const headers = {};
   if (etag && !force) headers["If-None-Match"] = etag;
   try {
-    const response = await fetch("/api/state", { headers });
+    const response = await reviewFetch("/api/state", { headers });
+    if (sessionExpired) return;
     if (response.status !== 304) {
       if (!response.ok) throw new Error("state");
       etag = response.headers.get("ETag");
@@ -583,10 +553,8 @@ async function loadState(force = false) {
       );
       state = await response.json();
       allQueueOperations().forEach((item) => {
-        if (!previous.has(item.operation_id)) {
-          item.__new = true;
-          if (item.submittable !== false)
-            explicitSelected.add(item.operation_id);
+        if (!previous.has(item.operation_id) && item.submittable !== false) {
+          explicitSelected.add(item.operation_id);
         }
       });
       recomputeSelected();
@@ -595,13 +563,15 @@ async function loadState(force = false) {
       await loadHistory(false);
     }
   } catch (_error) {
-    message("状态刷新失败，将自动重试");
+    if (!sessionExpired) message("状态刷新失败，将自动重试");
   }
+  if (sessionExpired) return;
   const active =
     state &&
     (state.execution.staged.length || state.execution.executing.length);
   pollTimer = setTimeout(() => loadState(false), active ? 1000 : 5000);
 }
+
 document.getElementById("select-all").addEventListener("click", () => {
   allQueueOperations().forEach((item) => {
     if (item.submittable !== false) explicitSelected.add(item.operation_id);
@@ -622,14 +592,14 @@ document.getElementById("history-refresh").addEventListener("click", () => {
 });
 document.getElementById("history-prev").addEventListener("click", () => {
   if (historyPage > 1) {
-    historyPage--;
+    historyPage -= 1;
     lastHistoryRevision = -1;
     loadHistory(true);
   }
 });
 document.getElementById("history-next").addEventListener("click", () => {
   if (historyPage < historyPages) {
-    historyPage++;
+    historyPage += 1;
     lastHistoryRevision = -1;
     loadHistory(true);
   }

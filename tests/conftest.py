@@ -29,14 +29,16 @@ def cfg(tmp_path):
     config_mod.set_config(value)
     from core.runtime_logger import reset_logger
     from core.storage.database import reset_database_initialization
-    from core.operations import reset_store
+    from core.operations import reset_services
+    from web.review_sessions import default_manager
     reset_database_initialization()
     reset_logger()
-    reset_store()
+    reset_services()
+    default_manager.clear()
     yield value
-    from core.execution import worker as execution_worker
+    from core.executing import worker as execution_worker
     execution_worker.stop_worker(timeout=2)
-    reset_store()
+    reset_services()
     reset_database_initialization()
     reset_logger()
     config_mod.set_config(None)
@@ -44,16 +46,16 @@ def cfg(tmp_path):
 
 @pytest.fixture
 def queue(cfg):
-    from core.operations import get_store
-    return get_store()
+    from core.operations import get_services
+    return get_services()
 
 
 @pytest.fixture
 def web_client(cfg):
     from fastapi.testclient import TestClient
     from web import app as web_app
-    web_app._bootstrap_tokens.clear()
-    web_app._sessions.clear()
+    from web.review_sessions import default_manager
+    default_manager.clear()
     client = TestClient(web_app.create_app())
     bootstrap_url = web_app.create_confirmation_url("http://testserver")
     response = client.get(bootstrap_url, follow_redirects=False)

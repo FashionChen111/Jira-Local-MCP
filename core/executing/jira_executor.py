@@ -4,8 +4,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from core import jira_client, risk_engine
-from core.operations.issue_references import is_issue_key, reference_fields
+from core import jira_client
+from core.operations import assert_safe_to_execute
 from core.textfile_loader import TextFileError, read_text_file
 
 MOVE_UNSUPPORTED_MSG = (
@@ -61,7 +61,7 @@ def _create(client: Any, task: Any) -> tuple[str, str | None]:
 
 def _clone(client: Any, task: Any) -> tuple[str, str | None]:
     payload = task.payload
-    source = client.issue(payload["issue_key"])
+    source = client.issue(task.issue_key)
     fields: dict[str, Any] = {
         "project": {"key": source.fields.project.key},
         "issuetype": {"name": source.fields.issuetype.name},
@@ -83,7 +83,7 @@ def _clone(client: Any, task: Any) -> tuple[str, str | None]:
     if payload.get("clone_subtasks"):
         notes.append("子任务克隆需人工核对（未自动执行）")
     suffix = "；" + "，".join(notes) if notes else ""
-    return f"已克隆 {payload['issue_key']} → {issue.key}{suffix}", issue.key
+    return f"已克隆 {task.issue_key} → {issue.key}{suffix}", issue.key
 
 
 def _move(_client: Any, _task: Any) -> tuple[str, str | None]:
@@ -95,15 +95,15 @@ def _change_type(client: Any, task: Any) -> tuple[str, str | None]:
     fields = {"issuetype": {"name": payload["target_issue_type"]}}
     fields.update(payload.get("fields_mapping") or {})
     try:
-        client.issue(payload["issue_key"]).update(fields=fields)
+        client.issue(task.issue_key).update(fields=fields)
     except Exception as exc:
         raise RuntimeError(f"变更事务类型失败: {type(exc).__name__}") from exc
-    return f"{payload['issue_key']} 类型已变更为 {payload['target_issue_type']}", None
+    return f"{task.issue_key} 类型已变更为 {payload['target_issue_type']}", None
 
 
 def _transition(client: Any, task: Any) -> tuple[str, str | None]:
     payload = task.payload
-    issue = client.issue(payload["issue_key"])
+    issue = client.issue(task.issue_key)
     wanted = str(payload["transition_name"]).strip().lower()
     transition_id = next((item["id"] for item in client.transitions(issue) if item["name"].strip().lower() == wanted), None)
     if transition_id is None:
@@ -114,21 +114,21 @@ def _transition(client: Any, task: Any) -> tuple[str, str | None]:
     if payload.get("comment"):
         kwargs["comment"] = payload["comment"]
     client.transition_issue(issue, transition_id, **kwargs)
-    return f"{payload['issue_key']} 状态已流转：{payload['transition_name']}", None
+    return f"{task.issue_key} 状态已流转：{payload['transition_name']}", None
 
 
 def _update_field(client: Any, task: Any) -> tuple[str, str | None]:
     payload = task.payload
     fields = _resolve_fields(payload["fields"])
-    client.issue(payload["issue_key"]).update(fields=fields)
-    return f"{payload['issue_key']} 已更新字段：{', '.join(fields)}", None
+    client.issue(task.issue_key).update(fields=fields)
+    return f"{task.issue_key} 已更新字段：{', '.join(fields)}", None
 
 
 def _update_custom_field(client: Any, task: Any) -> tuple[str, str | None]:
     payload = task.payload
     fields = _resolve_fields(payload["custom_fields"])
-    client.issue(payload["issue_key"]).update(fields=fields)
-    return f"{payload['issue_key']} 已更新自定义字段：{', '.join(fields)}", None
+    client.issue(task.issue_key).update(fields=fields)
+    return f"{task.issue_key} 已更新自定义字段：{', '.join(fields)}", None
 
 
 def _attachment(client: Any, task: Any) -> tuple[str, str | None]:
@@ -137,13 +137,13 @@ def _attachment(client: Any, task: Any) -> tuple[str, str | None]:
     if not os.path.isabs(path) or not os.path.isfile(path):
         raise RuntimeError(f"附件文件不存在或非绝对路径: {path}")
     with open(path, "rb") as handle:
-        client.add_attachment(issue=payload["issue_key"], attachment=handle, filename=payload.get("file_name"))
-    return f"{payload['issue_key']} 已添加附件 {payload.get('file_name') or os.path.basename(path)}", None
+        client.add_attachment(issue=task.issue_key, attachment=handle, filename=payload.get("file_name"))
+    return f"{task.issue_key} 已添加附件 {payload.get('file_name') or os.path.basename(path)}", None
 
 
 def _comment(client: Any, task: Any) -> tuple[str, str | None]:
-    client.add_comment(task.payload["issue_key"], task.payload["body"])
-    return f"{task.payload['issue_key']} 已添加评论", None
+    client.add_comment(task.issue_key, task.payload["body"])
+    return f"{task.issue_key} 已添加评论", None
 
 
 def _worklog(client: Any, task: Any) -> tuple[str, str | None]:
@@ -153,14 +153,14 @@ def _worklog(client: Any, task: Any) -> tuple[str, str | None]:
         kwargs["comment"] = payload["comment"]
     if payload.get("started"):
         kwargs["started"] = payload["started"]
-    client.add_worklog(issue=payload["issue_key"], **kwargs)
-    return f"{payload['issue_key']} 已添加工作日志 {payload['time_spent']}", None
+    client.add_worklog(issue=task.issue_key, **kwargs)
+    return f"{task.issue_key} 已添加工作日志 {payload['time_spent']}", None
 
 
 def _link(client: Any, task: Any) -> tuple[str, str | None]:
     payload = task.payload
-    client.create_issue_link(type=payload["link_type"], inwardIssue=payload["issue_key"], outwardIssue=payload["target_issue_key"])
-    return f"已链接 {payload['issue_key']} --[{payload['link_type']}]--> {payload['target_issue_key']}", None
+    client.create_issue_link(type=payload["link_type"], inwardIssue=task.issue_key, outwardIssue=task.target_issue_key)
+    return f"已链接 {task.issue_key} --[{payload['link_type']}]--> {task.target_issue_key}", None
 
 
 _HANDLERS = {
@@ -173,18 +173,8 @@ _HANDLERS = {
 
 
 def execute_operation(task: Any) -> tuple[str, str | None]:
-    """Execute one authorized operation after the mandatory second delete check."""
-    risk_engine.assert_not_delete(task.operation_type, task.payload)
-    fields = (
-        ("issue_key",)
-        if task.operation_type == "clone_issue"
-        else reference_fields(task.operation_type)
-    )
-    for field_name in fields:
-        if not is_issue_key(task.payload.get(field_name)):
-            raise RuntimeError(
-                f"执行前引用字段 {field_name} 未解析为真实 Jira issue key"
-            )
+    """Execute one authorized operation after the mandatory final safety gate."""
+    assert_safe_to_execute(task)
     handler = _HANDLERS.get(task.operation_type)
     if handler is None:
         raise RuntimeError(f"不支持的操作类型: {task.operation_type}")

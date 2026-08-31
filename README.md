@@ -6,7 +6,7 @@ Jira Local MCP 是面向 Jira Server/Data Center 的本地 STDIO MCP 安全网�
 
 - MCP 不暴露提交、取消、执行、人工对账或删除能力。
 - `POST /api/queue/submit` 是唯一人工授权入口；worker 只消费由该接口原子写入 staging 的 operation。
-- 审核页使用一次性 bootstrap 和短时 HttpOnly、SameSite=Strict 会话；高风险选择必须二次确认。
+- 审核页使用一次性 bootstrap 和 HttpOnly、SameSite=Strict 会话。单个会话凭据有效 15 分钟；活动页面在凭据剩余不超过 60 秒时通过受保护请求滚动换发，高风险选择仍必须二次确认。
 - 操作在入队和 Jira 调用前均经过 allowlist 与删除语义检查。
 - Jira 写调用由进程内及跨进程全局锁串行化。
 - 重启遗留的 `executing` 转为 `indeterminate`，不会自动重试；后续 operation 转为 `held`，等待人工处置。
@@ -24,10 +24,10 @@ MCP append → queued → Web submit → staged → executing → success/failed
 - `data/operations.sqlite3`：实时队列、队列事件、staging、执行记录和 revisions。
 - `data/mcp_logs.sqlite3`：Tool 调用、Resource 读取和 Prompt/Skill 获取的完整业务请求/响应；不记录能力列表等协议元数据。
 - SQLite 是唯一业务状态源；使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema version。完整 schema 初始化按进程和数据库路径执行一次，普通连接不重复获取 schema 写锁。
-- `payload_json` 保留入队时的不可变原始参数，`issue_references_json` 单独记录待创建引用及解析结果；执行记录另存实际传给 Jira 的 concrete payload/key。
-- operations schema v2 不迁移 v1 开发库；升级时需人工清除 `operations.sqlite3` 及其精确匹配的 WAL/SHM sidecar，正常启动只会明确报错而不会自动清库。`mcp_logs.sqlite3` 仍使用独立 schema，无需随 operations DB 一并清除。
+- queue、staging 和 history 都保存自包含的 operation 快照。主目标保存在顶层 `issue_key`，仅 `add_issuelink` 使用可空的顶层 `target_issue_key`；`payload_json` 只保存 operation 专属参数，不重复保存这两个 Key。
+- 2.2.0 将 operations schema 重新定义为带结构身份标识的新 v1 开发基线，不兼容任何旧 operations 数据。升级时必须先停止 Web/worker，再仅清除配置指向的 `operations.sqlite3` 及其精确匹配的 `-wal`、`-shm` sidecar；启动检测到旧 v1/v2 或身份不符时会明确拒绝，不会自动清库。`mcp_logs.sqlite3` 使用独立 schema，不得随 operations DB 一并清除。
 
-队列在入队时按 issue 与六类操作自动聚类；创建/克隆及尚未解析的依赖项显示为计划事务分组，生产者固定在首位。真实 Key 返回后，依赖项自动恢复为普通 issue 分组或零散项。同类默认按创建时间和 operation ID 排序，人工微调以“前驱 operation ID”锚点持久化；缺失或成环锚点退化为自动排序。所有布局修改使用 queue revision 做乐观并发校验。
+队列不保存布局或位置。每次读取时都会按确定性规则自动分组和排序：真实 Jira 组按 Key 自然排序，待创建事务组随后按生产者创建时间排序，组内按生产者、标准字段、自定义字段、工作流、附件、评论、worklog、其他类别以及创建时间和 operation ID 排序，零散项最后展示。生产者返回真实 Key 后，下一次读取会自动重新分组；待审队列不提供任何人工排序或锚点。提交后持久化的 `stage_order` 仍代表用户已授权的执行顺序。
 
 ## MCP 能力
 
@@ -37,7 +37,7 @@ MCP append → queued → Web submit → staged → executing → success/failed
 - `jira_get_execution_log`：读取实际执行和人工对账历史。
 - 4 个 Resources 和 4 个 Prompts。
 
-`move_issue` 仍可入队展示，但 Jira Server/DC REST 不支持时会明确记录失败。创建或克隆 Tool 返回的 operation ID 可直接作为后续修改的 `issue_key`，因此创建与修改可在同一审核页提交；服务端会在生产者成功后原子解析真实 issue key。克隆来源仍必须是真实 Jira Key，也不接受自定义 placeholder。
+`move_issue` 仍可入队展示，但 Jira Server/DC REST 不支持时会明确记录失败。创建或克隆 Tool 返回的 operation ID 可直接作为后续修改的 `issue_key`，`add_issuelink.target_issue_key` 也支持相同引用；服务端会在生产者成功后原子物化两个顶层 Key。克隆来源仍必须是真实 Jira Key，也不接受自定义 placeholder。公共输出使用 `target_issue_key`、`dependency_operation_ids` 与 `dependency_states` 明确表达这一有限依赖模型。
 
 ## 配置与运行
 
@@ -69,10 +69,10 @@ python server.py
 
 ## Web API
 
-所有 API 仅接受有效浏览器会话：
+所有 API 仅接受有效浏览器会话。页面、API 和 ETag `304` 都参与滚动续期；旧会话 ID 不延长，只在自身原到期时间前继续容忍并发在途请求。停止请求后，最后一个有效凭据最多再存活 15 分钟；首次收到 `403` 后，页面会停止轮询、禁用审核控件并提示重新调用 `jira_show_queue`：
 
 - `GET /api/state`：队列、执行区和 revisions，支持 ETag/304。
-- `POST /api/queue/reorder`、`/cancel`、`/submit`。
+- `POST /api/queue/cancel`、`POST /api/queue/submit`；待审队列完全自动排序，不提供 reorder API。
 - `POST /api/execution/indeterminate/resolve`、`/held/resolve`。
 - `GET /api/execution-history`：UTC 时间范围和分页。
 

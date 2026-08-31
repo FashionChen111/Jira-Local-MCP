@@ -4,16 +4,22 @@ from __future__ import annotations
 import inspect
 import json
 import re
-from types import SimpleNamespace
+from collections.abc import Awaitable, Callable
 
 import anyio
 import mcp.types as mcp_types
 import pytest
+from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.resources.types import FunctionResource
 
 import server
+from core import mcp_tools
 from core.storage import mcp_logs
 from core.storage.database import open_database
 from core.storage.mcp_logs import record_exchange
+
+
+RequestHandler = Callable[..., Awaitable[mcp_types.ServerResult]]
 
 
 def _tool_names():
@@ -76,17 +82,24 @@ def test_all_mounted_resource_and_prompt_docstrings_are_complete_and_chinese(cfg
     assert "create_with_followups_workflow" in prompt_names
     assert "create_then_modify_workflow" not in prompt_names
 
-    for resource in resources + resource_templates:
-        name = (
-            str(resource.uri)
-            if hasattr(resource, "uri")
-            else resource.uri_template
-        )
+    for resource in resources:
+        assert isinstance(resource, FunctionResource)
+        name = str(resource.uri)
         parameters = inspect.signature(resource.fn).parameters
         assert resource.fn.__doc__ == resource.description, name
         _assert_complete_chinese_description(
             name,
             resource.description,
+            parameters,
+            required_sections=("边界",),
+        )
+    for resource_template in resource_templates:
+        name = resource_template.uri_template
+        parameters = inspect.signature(resource_template.fn).parameters
+        assert resource_template.fn.__doc__ == resource_template.description, name
+        _assert_complete_chinese_description(
+            name,
+            resource_template.description,
             parameters,
             required_sections=("边界",),
         )
@@ -102,19 +115,23 @@ def test_all_mounted_resource_and_prompt_docstrings_are_complete_and_chinese(cfg
 
 
 def test_all_mounted_resource_and_prompt_content_is_nonempty_chinese(cfg):
-    capabilities = (
-        server.mcp._resource_manager.list_resources()
-        + server.mcp._prompt_manager.list_prompts()
-    )
-    for capability in capabilities:
-        assert not inspect.signature(capability.fn).parameters
-        content = capability.fn()
+    resources = server.mcp._resource_manager.list_resources()
+    prompts = server.mcp._prompt_manager.list_prompts()
+    for resource in resources:
+        assert isinstance(resource, FunctionResource)
+        assert not inspect.signature(resource.fn).parameters
+        content = resource.fn()
+        assert isinstance(content, str) and content.strip()
+        assert re.search(r"[\u4e00-\u9fff]", content)
+    for prompt in prompts:
+        assert not inspect.signature(prompt.fn).parameters
+        content = prompt.fn()
         assert isinstance(content, str) and content.strip()
         assert re.search(r"[\u4e00-\u9fff]", content)
 
 
 def test_append_response_exposes_only_operation_identity(queue):
-    response = server.jira_comment_add_append("PROJ-1", "hello")
+    response = mcp_tools.jira_comment_add_append("PROJ-1", "hello")
     assert "Operation ID: op-" in response
     assert "尚未执行" in response
     assert "hello" not in response and "描述" not in response
@@ -122,10 +139,12 @@ def test_append_response_exposes_only_operation_identity(queue):
 
 
 def test_create_response_exposes_reference_contract_and_followup_accepts_id(queue):
-    created = server.jira_issue_create_append("PROJ", "Task", "new")
-    operation_id = re.search(r"op-[0-9a-f]{32}", created).group(0)
+    created = mcp_tools.jira_issue_create_append("PROJ", "Task", "new")
+    operation_id_match = re.search(r"op-[0-9a-f]{32}", created)
+    assert operation_id_match is not None
+    operation_id = operation_id_match.group(0)
     assert "issue_key/target_issue_key" in created
-    followup = server.jira_comment_add_append(operation_id, "follow up")
+    followup = mcp_tools.jira_comment_add_append(operation_id, "follow up")
     assert "Operation ID: op-" in followup and "尚未执行" in followup
 
 
@@ -140,12 +159,19 @@ def test_show_queue_opens_even_when_empty(cfg, monkeypatch):
 
 
 def test_execution_log_reads_terminal_records(queue):
-    operation = queue.enqueue("add_comment", "PROJ-1", {"issue_key": "PROJ-1", "body": "x"}, "comment", "test")
-    queue.submit(1, [operation.operation_id], False)
-    claim = queue.claim_next()
-    queue.complete_execution(claim.execution_id, "success", "done", None, None, 1)
+    operation = queue.queue.enqueue(
+        "add_comment", "PROJ-1", {"body": "x"}, "comment", "test"
+    )
+    queue.submission.submit(1, [operation.operation_id], False)
+    claim = queue.execution.claim_next()
+    queue.execution.complete_execution(
+        claim.execution_id, "success", "done", None, None, 1
+    )
     response = server.jira_get_execution_log(10)
     assert operation.operation_id in response and '"outcome": "success"' in response
+    assert '"target_issue_key": null' in response
+    assert '"dependency_operation_ids": []' in response
+    assert "field_references" not in response
 
 
 def test_business_exchange_keeps_business_content_exact(cfg):
@@ -188,7 +214,7 @@ def test_only_business_handlers_record_exact_sdk_content(cfg):
         mcp_types.ReadResourceRequest,
         mcp_types.GetPromptRequest,
     )
-    list_handler_calls = []
+    list_handler_calls: list[object] = []
 
     async def business_handler(_request):
         return mcp_types.ServerResult(
@@ -201,11 +227,12 @@ def test_only_business_handlers_record_exact_sdk_content(cfg):
         list_handler_calls.append(request)
         return mcp_types.ServerResult(mcp_types.ListToolsResult(tools=[]))
 
-    handlers = {request_type: business_handler for request_type in request_types}
+    handlers: dict[type, RequestHandler] = {
+        request_type: business_handler for request_type in request_types
+    }
     handlers[mcp_types.ListToolsRequest] = list_handler
-    fake_server = SimpleNamespace(
-        _mcp_server=SimpleNamespace(request_handlers=handlers)
-    )
+    fake_server = FastMCP("business-handler-logging-test")
+    fake_server._mcp_server.request_handlers = handlers
     server._install_business_exchange_logging(fake_server)
 
     requests = (
@@ -251,14 +278,13 @@ def test_business_handler_records_the_error_returned_by_sdk(cfg):
     async def failing_handler(_request):
         raise ValueError("原始业务错误")
 
-    handlers = {
+    handlers: dict[type, RequestHandler] = {
         mcp_types.GetPromptRequest: failing_handler,
         mcp_types.CallToolRequest: failing_handler,
         mcp_types.ReadResourceRequest: failing_handler,
     }
-    fake_server = SimpleNamespace(
-        _mcp_server=SimpleNamespace(request_handlers=handlers)
-    )
+    fake_server = FastMCP("business-handler-error-logging-test")
+    fake_server._mcp_server.request_handlers = handlers
     server._install_business_exchange_logging(fake_server)
     request = mcp_types.GetPromptRequest.model_validate(
         {"method": "prompts/get", "params": {"name": "missing"}}

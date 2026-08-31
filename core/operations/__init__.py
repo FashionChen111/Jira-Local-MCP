@@ -1,5 +1,6 @@
-"""Operation queue, submission, and execution-journal domain package."""
+"""Operations domain, application services, and stable adapter-facing errors."""
 
+from core.operations.container import OperationServices, get_services, reset_services
 from core.operations.errors import (
     ConfirmationRequired,
     DependencyConfirmationRequired,
@@ -8,7 +9,8 @@ from core.operations.errors import (
     StoreError,
 )
 from core.operations.models import ExecutionClaim, OperationRecord
-from core.operations.store import OperationStore, get_store, reset_store
+from core.operations.rules.dependencies import is_jira_issue_key, is_operation_id
+from core.operations.rules.safety import assert_safe_to_execute
 
 __all__ = [
     "ConfirmationRequired",
@@ -16,9 +18,12 @@ __all__ = [
     "ExecutionBlocked",
     "ExecutionClaim",
     "OperationRecord",
-    "OperationStore",
+    "OperationServices",
     "RevisionConflict",
     "StoreError",
-    "get_store",
-    "reset_store",
+    "assert_safe_to_execute",
+    "get_services",
+    "is_jira_issue_key",
+    "is_operation_id",
+    "reset_services",
 ]

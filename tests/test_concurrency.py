@@ -7,8 +7,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import config as config_mod
-from core.execution import lock as execution_lock
-from core.execution import worker as execution_worker
+from core.executing import lock as execution_lock
+from core.executing import worker as execution_worker
 
 
 def _hold_slot(cfg, entered, release):
@@ -20,22 +20,24 @@ def _hold_slot(cfg, entered, release):
 
 def _enqueue_process(cfg, suffix):
     config_mod.set_config(cfg)
-    from core.operations import get_store, reset_store
-    reset_store()
-    get_store().enqueue(
+    from core.operations import get_services, reset_services
+    from core.storage.database import reset_database_initialization
+    reset_database_initialization()
+    reset_services()
+    get_services().queue.enqueue(
         "add_comment", f"PROJ-{suffix}",
-        {"issue_key": f"PROJ-{suffix}", "body": str(suffix)}, str(suffix), "process",
+        {"body": str(suffix)}, str(suffix), "process",
     )
 
 
 def _worker_process(cfg, start, calls):
     config_mod.set_config(cfg)
-    from core.execution import worker
+    from core.executing import worker
     from core.storage.database import reset_database_initialization
-    from core.operations import reset_store
+    from core.operations import reset_services
 
     reset_database_initialization()
-    reset_store()
+    reset_services()
 
     def handler(_operation):
         with calls.get_lock():
@@ -75,14 +77,15 @@ def test_concurrent_process_enqueues_are_not_lost(cfg, queue):
     for process in processes:
         process.join(15)
         assert process.exitcode == 0
-    assert sum(len(group["operations"]) for group in queue.get_state()["queue"]["groups"]) == 4
-    assert queue.get_revisions()["queue"] == 4
+    state = queue.query.get_state()
+    assert sum(len(group.operations) for group in state.queue.groups) == 4
+    assert state.revisions["queue"] == 4
 
 
 def test_threaded_workers_never_overlap_jira_writes(queue, monkeypatch):
-    first = queue.enqueue("add_comment", "PROJ-1", {"issue_key": "PROJ-1", "body": "1"}, "1", "test")
-    second = queue.enqueue("add_comment", "PROJ-2", {"issue_key": "PROJ-2", "body": "2"}, "2", "test")
-    queue.submit(2, [first.operation_id, second.operation_id], False)
+    first = queue.queue.enqueue("add_comment", "PROJ-1", {"body": "1"}, "1", "test")
+    second = queue.queue.enqueue("add_comment", "PROJ-2", {"body": "2"}, "2", "test")
+    queue.submission.submit(2, [first.operation_id, second.operation_id], False)
     active = 0
     maximum = 0
     lock = threading.Lock()
@@ -101,14 +104,14 @@ def test_threaded_workers_never_overlap_jira_writes(queue, monkeypatch):
     while execution_worker.process_once():
         pass
     assert maximum == 1
-    assert len(queue.read_execution_log(10)) == 2
+    assert len(queue.query.read_execution_log(10)) == 2
 
 
 def test_spawned_workers_do_not_claim_the_same_operation(cfg, queue):
-    operation = queue.enqueue(
-        "add_comment", "PROJ-1", {"issue_key": "PROJ-1", "body": "one"}, "one", "test"
+    operation = queue.queue.enqueue(
+        "add_comment", "PROJ-1", {"body": "one"}, "one", "test"
     )
-    queue.submit(1, [operation.operation_id], False)
+    queue.submission.submit(1, [operation.operation_id], False)
     context = multiprocessing.get_context("spawn")
     start = context.Event()
     calls = context.Value("i", 0)
@@ -120,14 +123,14 @@ def test_spawned_workers_do_not_claim_the_same_operation(cfg, queue):
         process.join(15)
         assert process.exitcode == 0
     assert calls.value == 1
-    assert len(queue.read_execution_log(10)) == 1
+    assert len(queue.query.read_execution_log(10)) == 1
 
 
 def test_submit_can_continue_while_an_operation_is_executing(queue, monkeypatch):
-    first = queue.enqueue(
-        "add_comment", "PROJ-1", {"issue_key": "PROJ-1", "body": "one"}, "one", "test"
+    first = queue.queue.enqueue(
+        "add_comment", "PROJ-1", {"body": "one"}, "one", "test"
     )
-    queue.submit(1, [first.operation_id], False)
+    queue.submission.submit(1, [first.operation_id], False)
     entered = threading.Event()
     release = threading.Event()
 
@@ -140,23 +143,23 @@ def test_submit_can_continue_while_an_operation_is_executing(queue, monkeypatch)
     thread = threading.Thread(target=execution_worker.process_once)
     thread.start()
     assert entered.wait(10)
-    second = queue.enqueue(
-        "add_comment", "PROJ-2", {"issue_key": "PROJ-2", "body": "two"}, "two", "test"
+    second = queue.queue.enqueue(
+        "add_comment", "PROJ-2", {"body": "two"}, "two", "test"
     )
-    queue.submit(3, [second.operation_id], False)
+    queue.submission.submit(3, [second.operation_id], False)
     release.set()
     thread.join(10)
     assert not thread.is_alive()
     monkeypatch.setattr(execution_worker.jira_executor, "execute_operation", lambda _operation: ("ok", None))
     assert execution_worker.process_once() is True
-    assert len(queue.read_execution_log(10)) == 2
+    assert len(queue.query.read_execution_log(10)) == 2
 
 
 def test_staged_operation_continues_in_a_fresh_process(cfg, queue):
-    operation = queue.enqueue(
-        "add_comment", "PROJ-1", {"issue_key": "PROJ-1", "body": "restart"}, "restart", "test"
+    operation = queue.queue.enqueue(
+        "add_comment", "PROJ-1", {"body": "restart"}, "restart", "test"
     )
-    queue.submit(1, [operation.operation_id], False)
+    queue.submission.submit(1, [operation.operation_id], False)
     context = multiprocessing.get_context("spawn")
     start = context.Event()
     calls = context.Value("i", 0)
@@ -166,4 +169,4 @@ def test_staged_operation_continues_in_a_fresh_process(cfg, queue):
     process.join(15)
     assert process.exitcode == 0
     assert calls.value == 1
-    assert queue.read_execution_log(1)[0]["operation_id"] == operation.operation_id
+    assert queue.query.read_execution_log(1)[0]["operation_id"] == operation.operation_id

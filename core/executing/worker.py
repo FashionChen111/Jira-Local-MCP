@@ -5,9 +5,9 @@ import threading
 import time
 import traceback
 
-from core.execution import jira_executor, lock as execution_lock
+from core.executing import jira_executor, lock as execution_lock
+from core.operations import get_services
 from core.runtime_logger import get_logger, redact
-from core.operations import get_store
 
 _POLL_SECONDS = 1.0
 _lifecycle_lock = threading.Lock()
@@ -19,7 +19,7 @@ def recover_interrupted() -> int:
     """Conservatively reconcile abandoned executing rows while holding the Jira lock."""
     try:
         with execution_lock.execution_slot():
-            return get_store().recover_interrupted()
+            return get_services().execution.recover_interrupted()
     except execution_lock.ExecutionBusyError:
         return 0
 
@@ -28,12 +28,14 @@ def process_once() -> bool:
     """Claim and execute at most one operation; return whether work was claimed."""
     try:
         with execution_lock.execution_slot():
-            claim = get_store().claim_next()
+            claim = get_services().execution.claim_next()
             if claim is None:
                 return False
             execution_id = claim.execution_id
             started = time.monotonic_ns()
             try:
+                if claim.preflight_error is not None:
+                    raise RuntimeError(claim.preflight_error)
                 summary, new_issue_key = jira_executor.execute_operation(claim.operation)
                 outcome = "success"
                 error = None
@@ -48,7 +50,7 @@ def process_once() -> bool:
                 )
             elapsed_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
             try:
-                get_store().complete_execution(
+                get_services().execution.complete_execution(
                     execution_id, outcome, summary, error, new_issue_key, int(elapsed_ms)
                 )
             except Exception as exc:
@@ -80,7 +82,7 @@ def start_worker() -> None:
     with _lifecycle_lock:
         if _worker_thread is not None and _worker_thread.is_alive():
             return
-        get_store().initialize()
+        get_services()
         _stop_event.clear()
         _wake_event.clear()
         _worker_thread = threading.Thread(target=_run, daemon=True, name="jira-execution-worker")

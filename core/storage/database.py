@@ -13,8 +13,9 @@ from typing import Generator, Literal
 
 from config import get_config
 
-OPERATIONS_SCHEMA_VERSION = 2
+OPERATIONS_SCHEMA_VERSION = 1
 MCP_LOG_SCHEMA_VERSION = 1
+OPERATIONS_SCHEMA_IDENTITY = "jira-local-mcp-operations-direct-keys-v1"
 BUSY_TIMEOUT_MS = 10_000
 _INITIALIZATION_LOCK = threading.Lock()
 _INITIALIZED_DATABASES: set[tuple[str, str]] = set()
@@ -57,7 +58,13 @@ _OPERATIONS_SCHEMA = _load_schema(f"operations_v{OPERATIONS_SCHEMA_VERSION}.sql"
 _MCP_SCHEMA = _load_schema(f"mcp_logs_v{MCP_LOG_SCHEMA_VERSION}.sql")
 
 
-def _ensure_schema(connection: sqlite3.Connection, version: int, schema: str, label: str) -> None:
+def _ensure_schema(
+    connection: sqlite3.Connection,
+    version: int,
+    schema: str,
+    label: str,
+    schema_identity: str | None = None,
+) -> None:
     connection.execute("BEGIN IMMEDIATE")
     try:
         current = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -68,21 +75,42 @@ def _ensure_schema(connection: sqlite3.Connection, version: int, schema: str, la
         if current == 0:
             connection.executescript(schema)
             connection.execute(f"PRAGMA user_version={version}")
+        if schema_identity is not None:
+            try:
+                row = connection.execute(
+                    "SELECT value FROM schema_metadata WHERE name='schema_identity'"
+                ).fetchone()
+            except sqlite3.DatabaseError as exc:
+                raise RuntimeError(
+                    f"{label} schema 缺少当前结构标识；请清理对应 SQLite 文件"
+                ) from exc
+            if row is None or row[0] != schema_identity:
+                raise RuntimeError(
+                    f"{label} schema 结构标识不兼容；请清理对应 SQLite 文件"
+                )
         connection.commit()
     except Exception:
         connection.rollback()
         raise
 
 
-def _database_details(kind: Literal["operations", "mcp_logs"]) -> tuple[str, int, str, str]:
+def _database_details(
+    kind: Literal["operations", "mcp_logs"],
+) -> tuple[str, int, str, str, str | None]:
     cfg = get_config()
     if kind == "operations":
-        return cfg.operations_db_file, OPERATIONS_SCHEMA_VERSION, _OPERATIONS_SCHEMA, "operations"
-    return cfg.mcp_logs_db_file, MCP_LOG_SCHEMA_VERSION, _MCP_SCHEMA, "mcp_logs"
+        return (
+            cfg.operations_db_file,
+            OPERATIONS_SCHEMA_VERSION,
+            _OPERATIONS_SCHEMA,
+            "operations",
+            OPERATIONS_SCHEMA_IDENTITY,
+        )
+    return cfg.mcp_logs_db_file, MCP_LOG_SCHEMA_VERSION, _MCP_SCHEMA, "mcp_logs", None
 
 
 def _initialize_database(kind: Literal["operations", "mcp_logs"]) -> str:
-    path, version, schema, label = _database_details(kind)
+    path, version, schema, label, schema_identity = _database_details(kind)
     resolved = os.path.normcase(os.path.abspath(path))
     key = (kind, resolved)
     if key in _INITIALIZED_DATABASES:
@@ -92,7 +120,7 @@ def _initialize_database(kind: Literal["operations", "mcp_logs"]) -> str:
             return path
         connection = _connect(path, initialize_journal=True)
         try:
-            _ensure_schema(connection, version, schema, label)
+            _ensure_schema(connection, version, schema, label, schema_identity)
         finally:
             connection.close()
         _INITIALIZED_DATABASES.add(key)

@@ -1,18 +1,19 @@
 """Authenticated strict Web API and HTTP security behavior."""
 from __future__ import annotations
 
-from core.operations import get_store
 from web import app as web_app
 
 
 def _comment(store, risk="low"):
     if risk == "high":
-        return store.enqueue(
+        return store.queue.enqueue(
             "transition_issue", "PROJ-1",
-            {"issue_key": "PROJ-1", "transition_name": "Close", "fields": {}},
+            {"transition_name": "Close", "fields": {}, "comment": None},
             "close", "test",
         )
-    return store.enqueue("add_comment", "PROJ-1", {"issue_key": "PROJ-1", "body": "x"}, "comment", "test")
+    return store.queue.enqueue(
+        "add_comment", "PROJ-1", {"body": "x"}, "comment", "test"
+    )
 
 
 def test_api_requires_browser_session(cfg):
@@ -31,7 +32,8 @@ def test_api_requires_browser_session(cfg):
 
 def test_bootstrap_is_single_use_and_cookie_is_hardened(cfg):
     from fastapi.testclient import TestClient
-    web_app._bootstrap_tokens.clear()
+    from web.review_sessions import default_manager
+    default_manager.clear()
     client = TestClient(web_app.create_app())
     url = web_app.create_confirmation_url("http://testserver")
     first = client.get(url, follow_redirects=False)
@@ -93,16 +95,16 @@ def test_ping_failure_keeps_queue(web_client, queue, monkeypatch):
         json={"expected_queue_revision": 1, "operation_ids": [operation.operation_id], "high_risk_confirmed": False},
     )
     assert response.status_code == 503
-    assert queue.get_state()["queue"]["groups"]
-    assert not queue.get_state()["execution"]["staged"]
+    assert queue.query.get_state().queue.groups
+    assert not queue.query.get_state().execution.staged
 
 
 def test_submit_revalidates_revision_after_ping(web_client, queue, monkeypatch):
     operation = _comment(queue)
 
     def ping():
-        queue.enqueue(
-            "add_comment", "PROJ-2", {"issue_key": "PROJ-2", "body": "concurrent"},
+        queue.queue.enqueue(
+            "add_comment", "PROJ-2", {"body": "concurrent"},
             "concurrent", "test",
         )
         return True
@@ -118,7 +120,7 @@ def test_submit_revalidates_revision_after_ping(web_client, queue, monkeypatch):
     )
     assert response.status_code == 409
     assert response.json()["code"] == "revision_conflict"
-    assert queue.total_active() == 2
+    assert queue.query.total_active() == 2
 
 
 def test_high_risk_requires_confirmation_then_returns_accepted(web_client, queue, monkeypatch):
@@ -135,14 +137,14 @@ def test_high_risk_requires_confirmation_then_returns_accepted(web_client, queue
     assert accepted.json()["accepted_operation_ids"] == [operation.operation_id]
 
 
-def test_revision_conflict_refresh_contract(web_client, queue):
-    operation = _comment(queue)
+def test_reorder_endpoint_is_not_registered(web_client, queue):
+    _comment(queue)
     response = web_client.post(
         "/api/queue/reorder",
-        json={"expected_queue_revision": 0, "groups": [], "standalone_operation_ids": [operation.operation_id]},
+        json={"expected_queue_revision": 1, "groups": []},
     )
-    assert response.status_code == 409
-    assert response.json()["code"] == "revision_conflict"
+    assert response.status_code == 404
+    assert "/api/queue/reorder" not in web_client.get("/openapi.json").json()["paths"]
 
 
 def test_cancel_and_history_pagination(web_client, queue):
@@ -163,17 +165,17 @@ def test_cancel_and_history_pagination(web_client, queue):
 
 
 def test_cancel_producer_requires_visible_cascade_confirmation(web_client, queue):
-    create = queue.enqueue(
+    create = queue.queue.enqueue(
         "create_issue",
         None,
         {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
         "create",
         "test",
     )
-    child = queue.enqueue(
+    child = queue.queue.enqueue(
         "add_comment",
         create.operation_id,
-        {"issue_key": create.operation_id, "body": "x"},
+        {"body": "x"},
         "child",
         "test",
     )
@@ -199,16 +201,16 @@ def test_cancel_producer_requires_visible_cascade_confirmation(web_client, queue
 
 
 def test_indeterminate_create_resolution_requires_real_key(web_client, queue):
-    create = queue.enqueue(
+    create = queue.queue.enqueue(
         "create_issue",
         None,
         {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
         "create",
         "test",
     )
-    queue.submit(1, [create.operation_id], False)
-    queue.claim_next()
-    queue.recover_interrupted()
+    queue.submission.submit(1, [create.operation_id], False)
+    queue.execution.claim_next()
+    queue.execution.recover_interrupted()
     body = {
         "operation_id": create.operation_id,
         "resolution": "succeeded",
@@ -230,3 +232,6 @@ def test_template_has_only_local_assets_and_no_html_sink(web_client):
     assert '/static/confirm.js' in page.text
     script = open("web/static/confirm.js", encoding="utf-8").read()
     assert "innerHTML" not in script
+    assert "/api/queue/reorder" not in script
+    assert "saveLayout" not in script
+    assert "转为零散" not in script

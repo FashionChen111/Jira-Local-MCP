@@ -26,7 +26,7 @@ def test_schema_initialization_runs_once_per_process_and_path(cfg, monkeypatch):
     assert calls == 1
 
 
-def test_operations_v2_schema_contains_references_and_concrete_execution(cfg):
+def test_clean_operations_v1_schema_contains_direct_targets_without_layout(cfg):
     connection = open_database("operations")
     queue_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(queue_items)").fetchall()
@@ -36,21 +36,29 @@ def test_operations_v2_schema_contains_references_and_concrete_execution(cfg):
         for row in connection.execute("PRAGMA table_info(execution_records)").fetchall()
     }
     version = connection.execute("PRAGMA user_version").fetchone()[0]
+    identity = connection.execute(
+        "SELECT value FROM schema_metadata WHERE name='schema_identity'"
+    ).fetchone()[0]
     connection.close()
-    assert version == 2
-    assert {"manual_after_operation_id", "issue_references_json"} <= queue_columns
-    assert {
-        "issue_references_json",
+    assert version == 1
+    assert identity == database_mod.OPERATIONS_SCHEMA_IDENTITY
+    assert {"issue_key", "target_issue_key", "payload_json"} <= queue_columns
+    assert {"issue_key", "target_issue_key", "payload_json"} <= execution_columns
+    assert not {
+        "manual_after_operation_id",
+        "layout_kind",
+        "position",
+        "field_references_json",
         "executed_issue_key",
         "executed_payload_json",
-    } <= execution_columns
+    } & (queue_columns | execution_columns)
 
 
-def test_incompatible_operations_schema_requires_manual_clear(cfg):
+def test_incompatible_operations_schema_identity_requires_manual_clear(cfg):
     connection = sqlite3.connect(cfg.operations_db_file)
     connection.execute("PRAGMA user_version=1")
     connection.close()
-    with pytest.raises(RuntimeError, match="不兼容"):
+    with pytest.raises(RuntimeError, match="清理"):
         open_database("operations")
 
 
@@ -58,11 +66,9 @@ def test_incompatible_mcp_log_schema_does_not_block_operation_store(cfg):
     connection = sqlite3.connect(cfg.mcp_logs_db_file)
     connection.execute("PRAGMA user_version=99")
     connection.close()
-    from core.operations import OperationStore
+    from core.operations import get_services
 
-    store = OperationStore()
-    store.initialize()
-    operation = store.enqueue(
-        "add_comment", "PROJ-1", {"issue_key": "PROJ-1", "body": "x"}, "comment", "test"
+    operation = get_services().queue.enqueue(
+        "add_comment", "PROJ-1", {"body": "x"}, "comment", "test"
     )
     assert operation.operation_id.startswith("op-")

@@ -14,11 +14,11 @@ from mcp.shared.exceptions import McpError
 from pydantic import Field
 
 from config import SERVICE_VERSION, get_config
-from core.execution import worker as execution_worker
+from core.executing import worker as execution_worker
 from core.runtime_logger import get_logger, redact
 from core.storage.database import utc_ms
 from core.storage.mcp_logs import record_exchange
-from core.operations import get_store
+from core.operations import get_services
 from knowledge.prompts import PROMPTS
 
 _KNOWLEDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge")
@@ -94,8 +94,8 @@ def jira_show_queue() -> str:
 
     返回：
         仅返回浏览器启动状态，不会通过 MCP 返回一次性 bootstrap 地址或会话
-        凭据。打开页面不代表已经授权或执行；只有持久化的终态执行记录才证明
-        操作结果。
+        凭据。单个页面凭据有效 15 分钟，活动页面通过受保护请求滚动换发；
+        打开页面不代表已经授权或执行，只有持久化的终态执行记录才证明操作结果。
 
     副作用：
         会启动本地审核服务并尝试打开默认浏览器，但不会提交或执行 Jira 写入。
@@ -111,11 +111,12 @@ def jira_show_queue() -> str:
             opened = False
         if opened is False:
             return "打开审核页面失败：默认浏览器未接受打开请求，请重试。"
-        count = get_store().total_active()
-        minutes = web_app.confirmation_session_ttl_minutes()
+        count = get_services().query.total_active()
+        minutes = web_app.confirmation_credential_ttl_minutes()
         return (
             f"已在默认浏览器打开 Jira Operation 审核页面（当前活动 operation 共 {count} 条）。\n"
-            f"页面会话有效期约 {minutes} 分钟；地址和一次性凭据不会通过 MCP 返回。\n"
+            f"单个页面凭据有效期约 {minutes} 分钟；活动页面会通过有效请求滚动续期。\n"
+            "地址、bootstrap token 和浏览器凭据均不会通过 MCP 返回。\n"
             "打开页面不代表已执行，只有页面提交后的执行历史才构成结果。"
         )
     except Exception as exc:
@@ -139,7 +140,7 @@ def jira_get_execution_log(limit: ExecutionLogLimit = 10) -> str:
     try:
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError("limit 必须是大于等于 1 的整数")
-        records = get_store().read_execution_log(limit)
+        records = get_services().query.read_execution_log(limit)
         return (
             "暂无执行记录。"
             if not records
@@ -278,7 +279,7 @@ def no_delete_checklist() -> str:
 
 
 def run() -> None:
-    get_store().initialize()
+    get_services()
     execution_worker.start_worker()
     get_logger().info(f"jira-local-mcp v{SERVICE_VERSION} 启动（STDIO）")
     try:

@@ -8,7 +8,7 @@ from typing import Any
 
 from core import jira_client
 from core.runtime_logger import redact
-from core.operations import get_store
+from core.operations import get_services
 
 
 def _error(prefix: str, exc: Exception) -> str:
@@ -16,7 +16,7 @@ def _error(prefix: str, exc: Exception) -> str:
 
 
 def _reminder() -> str:
-    count = get_store().total_active()
+    count = get_services().query.total_active()
     return (
         ""
         if count == 0
@@ -220,10 +220,18 @@ def _enqueue(
     payload: dict[str, Any],
     description: str,
     source: str,
+    target_issue_key: str | None = None,
 ) -> str:
     try:
         return _response(
-            get_store().enqueue(operation_type, issue_key, payload, description, source)
+            get_services().queue.enqueue(
+                operation_type,
+                issue_key,
+                payload,
+                description,
+                source,
+                target_issue_key,
+            )
         )
     except Exception as exc:
         return _error("入队失败", exc)
@@ -302,7 +310,6 @@ def jira_issue_clone_append(
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
     """
     payload = {
-        "issue_key": issue_key,
         "summary": summary,
         "clone_subtasks": clone_subtasks,
         "clone_attachments": clone_attachments,
@@ -336,7 +343,6 @@ def jira_issue_move_append(
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
     """
     payload = {
-        "issue_key": issue_key,
         "target_project_key": target_project_key,
         "target_issue_type": target_issue_type,
     }
@@ -367,7 +373,6 @@ def jira_issue_type_change_append(
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
     """
     payload = {
-        "issue_key": issue_key,
         "target_issue_type": target_issue_type,
         "fields_mapping": fields_mapping or {},
     }
@@ -402,7 +407,6 @@ def jira_issue_transition_append(
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
     """
     payload = {
-        "issue_key": issue_key,
         "transition_name": transition_name,
         "comment": comment,
         "fields": fields or {},
@@ -431,7 +435,7 @@ def jira_field_update_append(issue_key: str, fields: dict) -> str:
     副作用：
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
     """
-    payload = {"issue_key": issue_key, "fields": fields}
+    payload = {"fields": fields}
     return _enqueue(
         "update_field",
         issue_key,
@@ -456,7 +460,7 @@ def jira_customfield_update_append(issue_key: str, custom_fields: dict) -> str:
     副作用：
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
     """
-    payload = {"issue_key": issue_key, "custom_fields": custom_fields}
+    payload = {"custom_fields": custom_fields}
     return _enqueue(
         "update_custom_field",
         issue_key,
@@ -491,7 +495,7 @@ def jira_attachment_add_append(
         return f"附件路径必须为绝对路径: {file_path}"
     if not os.path.isfile(file_path):
         return f"附件文件不存在: {file_path}"
-    payload = {"issue_key": issue_key, "file_path": file_path, "file_name": file_name}
+    payload = {"file_path": file_path, "file_name": file_name}
     return _enqueue(
         "add_attachment",
         issue_key,
@@ -519,7 +523,7 @@ def jira_comment_add_append(issue_key: str, body: str) -> str:
     return _enqueue(
         "add_comment",
         issue_key,
-        {"issue_key": issue_key, "body": body},
+        {"body": body},
         f"为 {issue_key} 添加评论：{preview}",
         "jira_comment_add_append",
     )
@@ -547,7 +551,6 @@ def jira_worklog_add_append(
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
     """
     payload = {
-        "issue_key": issue_key,
         "time_spent": time_spent,
         "comment": comment,
         "started": started,
@@ -579,8 +582,6 @@ def jira_issuelink_add_append(
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
     """
     payload = {
-        "issue_key": issue_key,
-        "target_issue_key": target_issue_key,
         "link_type": link_type,
     }
     return _enqueue(
@@ -589,6 +590,7 @@ def jira_issuelink_add_append(
         payload,
         f"链接 {issue_key} --[{link_type}]--> {target_issue_key}",
         "jira_issuelink_add_append",
+        target_issue_key=target_issue_key,
     )
 
 
