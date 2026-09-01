@@ -341,6 +341,7 @@ async function resolveIndeterminate(operation, resolution) {
     if (!highRiskConfirmed) return;
   }
   let newIssueKey = null;
+  let attachmentResult = null;
   if (
     resolution === "succeeded" &&
     ["create_issue", "clone_issue"].includes(operation.operation_type)
@@ -353,11 +354,28 @@ async function resolveIndeterminate(operation, resolution) {
       return;
     }
   }
+  if (
+    resolution === "succeeded" &&
+    operation.operation_type === "add_attachment"
+  ) {
+    let attachmentId = prompt("请输入 Jira 实际生成的附件 ID");
+    if (attachmentId === null) return;
+    attachmentId = attachmentId.trim();
+    let filename = prompt("请输入 Jira 实际保存的最终附件文件名");
+    if (filename === null) return;
+    filename = filename.trim();
+    if (!attachmentId || !filename) {
+      message("附件 ID 和最终文件名均不得为空");
+      return;
+    }
+    attachmentResult = { id: attachmentId, filename };
+  }
   await mutate("/api/execution/indeterminate/resolve", {
     operation_id: operation.operation_id,
     resolution,
     high_risk_confirmed: highRiskConfirmed,
     new_issue_key: newIssueKey,
+    attachment_result: attachmentResult,
   });
 }
 
@@ -525,6 +543,15 @@ async function loadHistory(force = false) {
     );
     card.append(el("div", "meta", new Date(item.started_at).toLocaleString()));
     if (item.summary) card.append(el("div", "meta", item.summary));
+    if (item.attachment_result) {
+      card.append(
+        el(
+          "div",
+          "meta",
+          `附件结果：${item.attachment_result.filename}（ID ${item.attachment_result.id}）`,
+        ),
+      );
+    }
     if (item.error) card.append(el("div", "meta", item.error));
     historyContent.append(card);
   });

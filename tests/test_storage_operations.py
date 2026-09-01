@@ -34,7 +34,7 @@ def test_schema_pragmas_and_revisions_initialized(queue) -> None:
         ).fetchone()[0]
     finally:
         connection.close()
-    assert identity == "jira-local-mcp-operations-direct-keys-v1"
+    assert identity == "jira-local-mcp-operations-attachment-dependencies-v1"
     assert state(queue)["revisions"] == {"queue": 0, "execution": 0, "history": 0}
 
 

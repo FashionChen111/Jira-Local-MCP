@@ -7,13 +7,10 @@ import re
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 
-from core.operations.models import OperationRecord, ProducerState, QueueGroupKind
-from core.operations.rules.dependencies import (
-    PRODUCER_OPERATION_TYPES,
-    dependency_operation_ids,
-    is_jira_issue_key,
-    is_operation_id,
-)
+from core.operations.models import DependencyState, OperationRecord, QueueGroupKind
+from core.operations.rules.dependencies import dependency_operation_ids
+from core.operations.rules.identifiers import is_jira_issue_key, is_operation_id
+from core.operations.rules.issue_dependencies import ISSUE_PRODUCER_OPERATION_TYPES
 
 
 CATEGORY_BY_OPERATION = {
@@ -82,11 +79,11 @@ def operation_category(operation: OperationRecord) -> str:
     """Return the fixed in-group category for an operation."""
 
     if (
-        operation.operation_type in PRODUCER_OPERATION_TYPES
+        operation.operation_type in ISSUE_PRODUCER_OPERATION_TYPES
         and operation.operation_id == operation.issue_key
     ):
         return "producer"
-    if operation.operation_type in PRODUCER_OPERATION_TYPES:
+    if operation.operation_type in ISSUE_PRODUCER_OPERATION_TYPES:
         return "producer"
     return CATEGORY_BY_OPERATION.get(operation.operation_type, "other")
 
@@ -103,7 +100,7 @@ def operation_order_key(operation: OperationRecord) -> tuple[int, int, str]:
 
 def automatic_queue(
     operations: list[OperationRecord] | tuple[OperationRecord, ...],
-    producer_states: dict[str, ProducerState] | None = None,
+    producer_states: dict[str, DependencyState] | None = None,
 ) -> AutomaticQueue:
     """Derive all groups and ordering from immutable operation snapshots."""
 
@@ -114,7 +111,7 @@ def automatic_queue(
     standalone: list[OperationRecord] = []
 
     for operation in operations:
-        if operation.operation_type in PRODUCER_OPERATION_TYPES:
+        if operation.operation_type in ISSUE_PRODUCER_OPERATION_TYPES:
             pending_groups.setdefault(operation.operation_id, []).append(operation)
         elif is_operation_id(operation.issue_key):
             pending_groups.setdefault(operation.issue_key, []).append(operation)

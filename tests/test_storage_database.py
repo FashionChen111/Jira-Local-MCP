@@ -26,7 +26,7 @@ def test_schema_initialization_runs_once_per_process_and_path(cfg, monkeypatch):
     assert calls == 1
 
 
-def test_clean_operations_v1_schema_contains_direct_targets_without_layout(cfg):
+def test_clean_operations_v1_schema_contains_typed_attachment_result(cfg):
     connection = open_database("operations")
     queue_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(queue_items)").fetchall()
@@ -44,6 +44,7 @@ def test_clean_operations_v1_schema_contains_direct_targets_without_layout(cfg):
     assert identity == database_mod.OPERATIONS_SCHEMA_IDENTITY
     assert {"issue_key", "target_issue_key", "payload_json"} <= queue_columns
     assert {"issue_key", "target_issue_key", "payload_json"} <= execution_columns
+    assert "attachment_result_json" in execution_columns
     assert not {
         "manual_after_operation_id",
         "layout_kind",

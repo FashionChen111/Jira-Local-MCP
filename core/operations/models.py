@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 
 OperationType = Literal[
@@ -49,6 +49,30 @@ class StrictFrozenModel(BaseModel):
         frozen=True,
         allow_inf_nan=False,
     )
+
+
+class AttachmentResult(StrictFrozenModel):
+    """Stable identity returned by Jira after one attachment upload."""
+
+    id: str = Field(min_length=1, max_length=255)
+    filename: str = Field(min_length=1, max_length=1024)
+
+    @field_validator("id", "filename")
+    @classmethod
+    def nonblank_without_nul(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("附件 ID 和文件名不得为空")
+        if "\x00" in value:
+            raise ValueError("附件 ID 和文件名不得包含 NUL")
+        return value
+
+
+class OperationExecutionResult(StrictFrozenModel):
+    """Typed Jira handler result persisted by the execution service."""
+
+    summary: str
+    new_issue_key: str | None = None
+    attachment_result: AttachmentResult | None = None
 
 
 class OperationDraft(StrictFrozenModel):
@@ -129,6 +153,7 @@ class ExecutionRecord(OperationRecord):
     summary: str | None = None
     error: str | None = None
     new_issue_key: str | None = None
+    attachment_result: AttachmentResult | None = None
     elapsed_ms: int | None = Field(default=None, ge=0)
     resolution: Resolution | None = None
     resolved_at: int | None = Field(default=None, ge=0)
@@ -146,13 +171,25 @@ class ExecutionClaim(StrictFrozenModel):
     preflight_error: str | None = None
 
 
-class ProducerState(StrictFrozenModel):
-    """Current lifecycle fact for a referenced create/clone operation."""
+class DependencyState(StrictFrozenModel):
+    """Current lifecycle fact and typed result for a referenced operation."""
 
     operation_id: str
     operation_type: OperationType | None
     state: ProducerLifecycleState
+    issue_key: str | None = None
     new_issue_key: str | None = None
+    attachment_result: AttachmentResult | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.state in {
+            "queued",
+            "staged",
+            "executing",
+            "held",
+            "retry_pending",
+        }
 
     @property
     def terminal_failure(self) -> bool:
@@ -162,6 +199,10 @@ class ProducerState(StrictFrozenModel):
             "abandoned",
             "dependency_failed",
         }
+
+
+# Kept as a source-compatible alias for integrations importing the old name.
+ProducerState = DependencyState
 
 
 class DependencyBindingResult(StrictFrozenModel):
@@ -227,6 +268,7 @@ class ExecutionRecordPublic(OperationPublic):
     summary: str | None
     error: str | None
     new_issue_key: str | None
+    attachment_result: AttachmentResult | None
     elapsed_ms: int | None
     resolution: Resolution | None
     resolved_at: int | None

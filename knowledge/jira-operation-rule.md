@@ -44,6 +44,13 @@
 - 创建和后续修改可以集中入队并在同一审核页提交。服务端会强制依赖闭包和执行顺序，创建成功后再把引用解析为真实 Key。
 - operation ID 引用只表达目标依赖，不构成执行授权；所有条目仍必须在本地 Web 页面明确提交。
 
+## 附件引用
+- `jira_attachment_add_append` 返回的 operation ID 可被同一事务的 description、comment 或 worklog 引用：附件链接写作 `[^{{attachment:op-…}}]`，内嵌图片写作 `!{{attachment:op-…}}!`。
+- 必须使用服务端实际返回的附件上传 operation ID，不得根据请求文件名猜测 Jira 最终文件名。服务端会强制同事务校验、依赖闭包和“上传先于正文”的执行顺序。
+- Jira 可能对重名附件自动改名。上传完成后，服务端以该次上传返回的附件 ID 确认身份，并把占位符替换成其最终文件名；已有的普通 `[^filename]` 或 `!filename!` 不会被重新解释。
+- 创建事务的初始 description 禁止附件引用。需要为新事务写入附件引用时，必须依次入队：创建事务 → 上传附件（`issue_key` 使用创建 operation ID）→ 更新 description（引用附件 operation ID）。
+- description 文件会在 `_append` 入队时读取为字符串快照；附件文件仍在实际执行时读取，审核期间不得移动或修改附件源文件。
+
 ## 批量聚合
 - 同类多条操作应合并为尽量少的 `_append` 调用，不要过度拆分。
 - 页面支持勾选多个 operation 一次提交，降低用户交互成本。

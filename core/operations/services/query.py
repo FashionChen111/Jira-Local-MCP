@@ -9,9 +9,9 @@ from core.operations.models import (
     ExecutionRecord,
     ExecutionRecordPublic,
     ExecutionStatePublic,
+    DependencyState,
     OperationRecord,
     OperationsStatePublic,
-    ProducerState,
     QueueGroupPublic,
     QueueOperationPublic,
     QueueStatePublic,
@@ -31,23 +31,23 @@ from core.storage.database import open_database
 
 def _operation_data(
     operation: OperationRecord,
-    producer_states: Mapping[str, ProducerState],
+    dependency_states: Mapping[str, DependencyState],
 ) -> dict[str, object]:
     return {
         **operation.model_dump(mode="python"),
         "dependency_operation_ids": dependency_operation_ids(operation),
-        "dependency_states": dependency_state_map(operation, producer_states),
+        "dependency_states": dependency_state_map(operation, dependency_states),
     }
 
 
 def _queue_operation_public(
     operation: OperationRecord,
-    producer_states: Mapping[str, ProducerState],
+    dependency_states: Mapping[str, DependencyState],
 ) -> QueueOperationPublic:
-    reason = submission_block_reason(operation, producer_states)
+    reason = submission_block_reason(operation, dependency_states)
     return QueueOperationPublic.model_validate(
         {
-            **_operation_data(operation, producer_states),
+            **_operation_data(operation, dependency_states),
             "submittable": reason is None,
             "submission_block_reason": reason,
         }
@@ -56,9 +56,9 @@ def _queue_operation_public(
 
 def _staging_operation_public(
     staging: StagingRecord,
-    producer_states: Mapping[str, ProducerState],
+    dependency_states: Mapping[str, DependencyState],
 ) -> StagingOperationPublic:
-    data = _operation_data(staging.as_operation(), producer_states)
+    data = _operation_data(staging.as_operation(), dependency_states)
     for key in (
         "stage_order",
         "state",
@@ -75,9 +75,9 @@ def _staging_operation_public(
 
 def _execution_record_public(
     record: ExecutionRecord,
-    producer_states: Mapping[str, ProducerState],
+    dependency_states: Mapping[str, DependencyState],
 ) -> ExecutionRecordPublic:
-    data = _operation_data(record.as_operation(), producer_states)
+    data = _operation_data(record.as_operation(), dependency_states)
     for key in (
         "execution_id",
         "submission_risk_level",
@@ -87,6 +87,7 @@ def _execution_record_public(
         "summary",
         "error",
         "new_issue_key",
+        "attachment_result",
         "elapsed_ms",
         "resolution",
         "resolved_at",
@@ -123,19 +124,19 @@ class QueryService:
                 for operation in queue_records
                 if operation.operation_type in {"create_issue", "clone_issue"}
             )
-            producer_states = self._repository.producer_states(
+            dependency_states = self._repository.dependency_states(
                 connection, producer_ids
             )
-            layout = automatic_queue(queue_records, producer_states)
+            layout = automatic_queue(queue_records, dependency_states)
             queue = QueueStatePublic(
                 groups=tuple(
                     QueueGroupPublic(
                         group_key=group.group_key,
                         kind=group.kind,
                         producer_state=(
-                            producer_states.get(
+                            dependency_states.get(
                                 group.group_key,
-                                ProducerState(
+                                DependencyState(
                                     operation_id=group.group_key,
                                     operation_type=None,
                                     state="unknown",
@@ -145,14 +146,14 @@ class QueryService:
                             else None
                         ),
                         operations=tuple(
-                            _queue_operation_public(operation, producer_states)
+                            _queue_operation_public(operation, dependency_states)
                             for operation in group.operations
                         ),
                     )
                     for group in layout.groups
                 ),
                 standalone=tuple(
-                    _queue_operation_public(operation, producer_states)
+                    _queue_operation_public(operation, dependency_states)
                     for operation in layout.standalone
                 ),
             )
@@ -164,7 +165,7 @@ class QueryService:
             }
             for staging in staging_records:
                 execution_parts[staging.state].append(
-                    _staging_operation_public(staging, producer_states)
+                    _staging_operation_public(staging, dependency_states)
                 )
             execution = ExecutionStatePublic(
                 staged=tuple(execution_parts["staged"]),
@@ -200,7 +201,7 @@ class QueryService:
                 page=page,
                 page_size=page_size,
             )
-            states = self._repository.producer_states(
+            states = self._repository.dependency_states(
                 connection, self._dependency_ids(records)
             )
             return ExecutionHistoryPage(
@@ -222,7 +223,7 @@ class QueryService:
         connection = open_database("operations")
         try:
             records = self._repository.execution_log(connection, limit)
-            states = self._repository.producer_states(
+            states = self._repository.dependency_states(
                 connection, self._dependency_ids(records)
             )
             return [

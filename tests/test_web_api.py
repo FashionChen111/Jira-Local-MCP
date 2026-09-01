@@ -225,6 +225,33 @@ def test_indeterminate_create_resolution_requires_real_key(web_client, queue):
     assert resolved.json()["new_issue_key"] == "PROJ-50"
 
 
+def test_indeterminate_attachment_resolution_uses_nested_result(web_client, queue):
+    attachment = queue.queue.enqueue(
+        "add_attachment",
+        "PROJ-1",
+        {"file_path": "C:\\fixtures\\a.jpg", "file_name": "a.jpg"},
+        "attachment",
+        "test",
+    )
+    queue.submission.submit(1, [attachment.operation_id], False)
+    queue.execution.claim_next()
+    queue.execution.recover_interrupted()
+    body = {
+        "operation_id": attachment.operation_id,
+        "resolution": "succeeded",
+        "high_risk_confirmed": False,
+        "new_issue_key": None,
+        "attachment_result": {"id": "80008", "filename": "a-1.jpg"},
+    }
+
+    resolved = web_client.post(
+        "/api/execution/indeterminate/resolve", json=body
+    )
+
+    assert resolved.status_code == 200
+    assert resolved.json()["attachment_result"] == body["attachment_result"]
+
+
 def test_template_has_only_local_assets_and_no_html_sink(web_client):
     page = web_client.get("/queue")
     assert page.status_code == 200

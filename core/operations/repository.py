@@ -7,18 +7,20 @@ from collections.abc import Iterable, Sequence
 from typing import Any, Literal
 
 from core.operations.models import (
+    AttachmentResult,
     DependencyBindingResult,
+    DependencyState,
     ExecutionRecord,
     OperationRecord,
-    ProducerState,
     Resolution,
     RiskLevel,
     StagingRecord,
 )
 from core.operations.rules.dependencies import (
     dependency_operation_ids,
-    is_jira_issue_key,
 )
+from core.operations.rules import attachment_dependencies
+from core.operations.rules.identifiers import is_jira_issue_key
 from core.storage.database import canonical_json, new_id, parse_json, utc_ms
 
 
@@ -38,6 +40,13 @@ class OperationRepository:
         if not isinstance(payload, dict):
             raise ValueError("payload_json 必须是 JSON 对象")
         return payload
+
+    @staticmethod
+    def _attachment_result(value: str | None) -> AttachmentResult | None:
+        if value is None:
+            return None
+        decoded = parse_json(value)
+        return AttachmentResult.model_validate(decoded)
 
     def operation_from_row(self, row: sqlite3.Row) -> OperationRecord:
         """Decode and strictly validate a self-contained operation row."""
@@ -86,6 +95,9 @@ class OperationRepository:
             summary=row["summary"],
             error=row["error"],
             new_issue_key=row["new_issue_key"],
+            attachment_result=self._attachment_result(
+                row["attachment_result_json"]
+            ),
             elapsed_ms=row["elapsed_ms"],
             resolution=row["resolution"],
             resolved_at=row["resolved_at"],
@@ -370,11 +382,13 @@ class OperationRepository:
         summary: str | None,
         error: str | None,
         new_issue_key: str | None,
+        attachment_result: AttachmentResult | None,
         elapsed_ms: int,
     ) -> bool:
         cursor = connection.execute(
             """UPDATE execution_records
-               SET finished_at=?,outcome=?,summary=?,error=?,new_issue_key=?,elapsed_ms=?
+               SET finished_at=?,outcome=?,summary=?,error=?,new_issue_key=?,
+                   attachment_result_json=?,elapsed_ms=?
                WHERE execution_id=? AND outcome IS NULL""",
             (
                 finished_at,
@@ -382,6 +396,11 @@ class OperationRepository:
                 summary,
                 error,
                 new_issue_key,
+                (
+                    canonical_json(attachment_result.model_dump(mode="json"))
+                    if attachment_result is not None
+                    else None
+                ),
                 elapsed_ms,
                 execution_id,
             ),
@@ -421,12 +440,25 @@ class OperationRepository:
         resolution: Resolution,
         resolved_at: int,
         new_issue_key: str | None,
+        attachment_result: AttachmentResult | None,
     ) -> bool:
+        attachment_json = (
+            canonical_json(attachment_result.model_dump(mode="json"))
+            if attachment_result is not None
+            else None
+        )
         cursor = connection.execute(
             """UPDATE execution_records
-               SET resolution=?,resolved_at=?,new_issue_key=COALESCE(?,new_issue_key)
+               SET resolution=?,resolved_at=?,new_issue_key=COALESCE(?,new_issue_key),
+                   attachment_result_json=COALESCE(?,attachment_result_json)
                WHERE execution_id=? AND outcome='indeterminate' AND resolution IS NULL""",
-            (resolution, resolved_at, new_issue_key, execution_id),
+            (
+                resolution,
+                resolved_at,
+                new_issue_key,
+                attachment_json,
+                execution_id,
+            ),
         )
         return cursor.rowcount == 1
 
@@ -442,7 +474,7 @@ class OperationRepository:
         execution_id = new_id("exec")
         occurred_at = utc_ms()
         summary = (
-            "未调用 Jira：依赖的创建/克隆 operation 未产生可用事务 "
+            "未调用 Jira：依赖 operation 未产生可用结果 "
             f"({producer_operation_id})"
         )
         connection.execute(
@@ -556,37 +588,40 @@ class OperationRepository:
             is not None
         )
 
-    def producer_states(
+    def dependency_states(
         self,
         connection: sqlite3.Connection,
         operation_ids: Iterable[str],
-    ) -> dict[str, ProducerState]:
-        """Batch-load producer lifecycle facts with active rows taking precedence."""
+    ) -> dict[str, DependencyState]:
+        """Batch-load dependency lifecycle facts with active rows taking precedence."""
 
         requested = tuple(dict.fromkeys(operation_ids))
         if not requested:
             return {}
-        result: dict[str, ProducerState] = {}
+        result: dict[str, DependencyState] = {}
         for chunk_start in range(0, len(requested), 400):
             chunk = requested[chunk_start : chunk_start + 400]
             placeholders = ",".join("?" for _ in chunk)
             queue_rows = connection.execute(
-                f"SELECT operation_id,operation_type FROM queue_items WHERE operation_id IN ({placeholders})",
+                f"""SELECT operation_id,operation_type,issue_key
+                    FROM queue_items WHERE operation_id IN ({placeholders})""",
                 chunk,
             ).fetchall()
             for row in queue_rows:
-                result[row["operation_id"]] = ProducerState(
+                result[row["operation_id"]] = DependencyState(
                     operation_id=row["operation_id"],
                     operation_type=row["operation_type"],
                     state="queued",
+                    issue_key=row["issue_key"],
                 )
 
             remaining = tuple(item for item in chunk if item not in result)
             if remaining:
                 marks = ",".join("?" for _ in remaining)
                 staging_rows = connection.execute(
-                    f"""SELECT s.operation_id,s.operation_type,s.state,
-                               r.outcome,r.resolution,r.new_issue_key
+                    f"""SELECT s.operation_id,s.operation_type,s.issue_key,s.state,
+                               r.outcome,r.resolution,r.new_issue_key,
+                               r.attachment_result_json
                         FROM execution_staging AS s
                         LEFT JOIN execution_records AS r ON r.execution_id=s.execution_id
                         WHERE s.operation_id IN ({marks})""",
@@ -594,21 +629,23 @@ class OperationRepository:
                 ).fetchall()
                 for row in staging_rows:
                     if row["outcome"] is not None:
-                        result[row["operation_id"]] = self._producer_state_from_result(
+                        result[row["operation_id"]] = self._dependency_state_from_result(
                             row["operation_id"], row
                         )
                     else:
-                        result[row["operation_id"]] = ProducerState(
+                        result[row["operation_id"]] = DependencyState(
                             operation_id=row["operation_id"],
                             operation_type=row["operation_type"],
                             state=row["state"],
+                            issue_key=row["issue_key"],
                         )
 
             remaining = tuple(item for item in chunk if item not in result)
             if remaining:
                 marks = ",".join("?" for _ in remaining)
                 history_rows = connection.execute(
-                    f"""SELECT operation_id,operation_type,outcome,resolution,new_issue_key,
+                    f"""SELECT operation_id,operation_type,issue_key,outcome,resolution,
+                               new_issue_key,attachment_result_json,
                                attempt_no,started_at,execution_id
                         FROM execution_records WHERE operation_id IN ({marks})
                         ORDER BY attempt_no DESC,started_at DESC,execution_id DESC""",
@@ -616,14 +653,14 @@ class OperationRepository:
                 ).fetchall()
                 for row in history_rows:
                     if row["operation_id"] not in result:
-                        result[row["operation_id"]] = self._producer_state_from_result(
+                        result[row["operation_id"]] = self._dependency_state_from_result(
                             row["operation_id"], row
                         )
 
         for operation_id in requested:
             result.setdefault(
                 operation_id,
-                ProducerState(
+                DependencyState(
                     operation_id=operation_id,
                     operation_type=None,
                     state="unknown",
@@ -631,10 +668,19 @@ class OperationRepository:
             )
         return result
 
+    def producer_states(
+        self,
+        connection: sqlite3.Connection,
+        operation_ids: Iterable[str],
+    ) -> dict[str, DependencyState]:
+        """Compatibility wrapper for the former issue-only state loader."""
+
+        return self.dependency_states(connection, operation_ids)
+
     @staticmethod
-    def _producer_state_from_result(
+    def _dependency_state_from_result(
         operation_id: str, row: sqlite3.Row
-    ) -> ProducerState:
+    ) -> DependencyState:
         outcome = row["outcome"]
         resolution = row["resolution"]
         if outcome == "success" or (
@@ -649,14 +695,18 @@ class OperationRepository:
             state = "indeterminate"
         else:
             state = outcome or "executing"
-        return ProducerState(
+        return DependencyState(
             operation_id=operation_id,
             operation_type=row["operation_type"],
             state=state,
+            issue_key=row["issue_key"],
             new_issue_key=row["new_issue_key"],
+            attachment_result=OperationRepository._attachment_result(
+                row["attachment_result_json"]
+            ),
         )
 
-    def bind_produced_issue(
+    def broadcast_issue_resolution(
         self,
         connection: sqlite3.Connection,
         *,
@@ -702,6 +752,81 @@ class OperationRepository:
         return DependencyBindingResult(
             queue_operation_ids=tuple(queue),
             staging_operation_ids=tuple(staging),
+        )
+
+    def bind_produced_issue(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        producer_operation_id: str,
+        new_issue_key: str,
+    ) -> DependencyBindingResult:
+        """Compatibility wrapper for the renamed issue-resolution broadcast."""
+
+        return self.broadcast_issue_resolution(
+            connection,
+            producer_operation_id=producer_operation_id,
+            new_issue_key=new_issue_key,
+        )
+
+    def broadcast_attachment_resolution(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        producer_operation_id: str,
+        attachment_result: AttachmentResult,
+    ) -> DependencyBindingResult:
+        """Materialize one upload result in all queued and staged consumers."""
+
+        queue_ids: list[str] = []
+        staging_ids: list[str] = []
+        for table, records, location, target_ids in (
+            (
+                "queue_items",
+                self.queue_operations(connection),
+                "queue",
+                queue_ids,
+            ),
+            (
+                "execution_staging",
+                self.staging_records(connection),
+                "staging",
+                staging_ids,
+            ),
+        ):
+            for record in records:
+                refs = tuple(
+                    reference
+                    for reference in attachment_dependencies.references(record)
+                    if reference.operation_id == producer_operation_id
+                )
+                if not refs:
+                    continue
+                materialized = attachment_dependencies.materialize_references(
+                    record.as_operation(),
+                    {producer_operation_id: attachment_result},
+                )
+                connection.execute(
+                    f"UPDATE {table} SET payload_json=? WHERE operation_id=?",
+                    (canonical_json(materialized.payload), record.operation_id),
+                )
+                paths = tuple(dict.fromkeys(reference.path for reference in refs))
+                target_ids.append(record.operation_id)
+                self.append_event(
+                    connection,
+                    record.operation_id,
+                    "internal",
+                    "attachment_resolved",
+                    {
+                        "producer_operation_id": producer_operation_id,
+                        "attachment_result": attachment_result.model_dump(mode="json"),
+                        "paths": paths,
+                        "location": location,
+                    },
+                )
+        return DependencyBindingResult(
+            queue_operation_ids=tuple(queue_ids),
+            staging_operation_ids=tuple(staging_ids),
         )
 
     @staticmethod

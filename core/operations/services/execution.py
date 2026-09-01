@@ -5,11 +5,19 @@ from __future__ import annotations
 from typing import Literal
 
 from core.operations.errors import StoreError
-from core.operations.models import ExecutionClaim, OperationRecord, StagingRecord
+from core.operations.models import (
+    AttachmentResult,
+    ExecutionClaim,
+    OperationRecord,
+    StagingRecord,
+)
 from core.operations.repository import OperationRepository
 from core.operations.rules.dependencies import (
+    ATTACHMENT_PRODUCER_OPERATION_TYPES,
+    ISSUE_PRODUCER_OPERATION_TYPES,
     PRODUCER_OPERATION_TYPES,
     dependency_operation_ids,
+    has_usable_success_result,
     is_jira_issue_key,
 )
 from core.operations.rules.safety import OperationSafetyError, assert_safe_to_execute
@@ -43,18 +51,37 @@ class ExecutionService:
                 operation = self._operation(staging)
                 dependencies = dependency_operation_ids(operation)
                 if dependencies:
-                    states = self._repository.producer_states(connection, dependencies)
+                    states = self._repository.dependency_states(
+                        connection, dependencies
+                    )
                     changed = False
                     for dependency_id in dependencies:
                         state = states[dependency_id]
-                        if state.state == "success" and is_jira_issue_key(
-                            state.new_issue_key
+                        if state.state == "success" and has_usable_success_result(
+                            state
                         ):
-                            binding = self._repository.bind_produced_issue(
-                                connection,
-                                producer_operation_id=dependency_id,
-                                new_issue_key=state.new_issue_key,
-                            )
+                            if (
+                                state.operation_type
+                                in ISSUE_PRODUCER_OPERATION_TYPES
+                                and is_jira_issue_key(state.new_issue_key)
+                            ):
+                                binding = self._repository.broadcast_issue_resolution(
+                                    connection,
+                                    producer_operation_id=dependency_id,
+                                    new_issue_key=state.new_issue_key,
+                                )
+                            elif (
+                                state.operation_type
+                                in ATTACHMENT_PRODUCER_OPERATION_TYPES
+                                and state.attachment_result is not None
+                            ):
+                                binding = self._repository.broadcast_attachment_resolution(
+                                    connection,
+                                    producer_operation_id=dependency_id,
+                                    attachment_result=state.attachment_result,
+                                )
+                            else:
+                                raise StoreError("依赖成功结果类型不一致")
                             revisions: list[str] = []
                             if binding.queue_changed:
                                 revisions.append("queue")
@@ -68,6 +95,10 @@ class ExecutionService:
                             state.terminal_failure
                             or state.state == "unknown"
                             or state.operation_type not in PRODUCER_OPERATION_TYPES
+                            or (
+                                state.state == "success"
+                                and not has_usable_success_result(state)
+                            )
                         ):
                             self._repository.terminalize_dependency_failure(
                                 connection,
@@ -120,6 +151,7 @@ class ExecutionService:
         error: str | None,
         new_issue_key: str | None,
         elapsed_ms: int,
+        attachment_result: AttachmentResult | None = None,
     ) -> None:
         """Persist a worker result and broadcast producer outcomes atomically."""
 
@@ -139,11 +171,31 @@ class ExecutionService:
                         self._repository.bump_revisions(connection, "execution")
                     return
                 raise StoreError("execution record 已有不同终态")
-            is_producer = record.operation_type in PRODUCER_OPERATION_TYPES
-            if is_producer and outcome == "success" and not is_jira_issue_key(
+            is_issue_producer = (
+                record.operation_type in ISSUE_PRODUCER_OPERATION_TYPES
+            )
+            is_attachment_producer = (
+                record.operation_type in ATTACHMENT_PRODUCER_OPERATION_TYPES
+            )
+            is_producer = is_issue_producer or is_attachment_producer
+            if is_issue_producer and outcome == "success" and not is_jira_issue_key(
                 new_issue_key
             ):
                 raise StoreError("创建/克隆成功结果必须包含合法的新事务 Key")
+            if (
+                is_attachment_producer
+                and outcome == "success"
+                and attachment_result is None
+            ):
+                raise StoreError("附件上传成功结果必须包含附件 ID 和最终文件名")
+            if not is_issue_producer and new_issue_key is not None:
+                raise StoreError("只有创建/克隆结果可以包含新事务 Key")
+            if not is_attachment_producer and attachment_result is not None:
+                raise StoreError("只有附件上传结果可以包含 attachment_result")
+            if outcome != "success" and (
+                new_issue_key is not None or attachment_result is not None
+            ):
+                raise StoreError("失败结果不得包含生产者结果")
             if elapsed_ms < 0:
                 raise StoreError("elapsed_ms 不得为负数")
             if not self._repository.finish_execution(
@@ -154,16 +206,28 @@ class ExecutionService:
                 summary=summary,
                 error=error,
                 new_issue_key=new_issue_key,
+                attachment_result=attachment_result,
                 elapsed_ms=elapsed_ms,
             ):
                 raise StoreError("execution record 终态写入冲突")
 
             queue_changed = False
-            if is_producer and outcome == "success":
-                binding = self._repository.bind_produced_issue(
+            if is_issue_producer and outcome == "success":
+                if new_issue_key is None:
+                    raise StoreError("创建/克隆成功结果缺少新事务 Key")
+                binding = self._repository.broadcast_issue_resolution(
                     connection,
                     producer_operation_id=record.operation_id,
-                    new_issue_key=new_issue_key,  # type: ignore[arg-type]
+                    new_issue_key=new_issue_key,
+                )
+                queue_changed = binding.queue_changed
+            elif is_attachment_producer and outcome == "success":
+                if attachment_result is None:
+                    raise StoreError("附件上传成功结果缺少附件结果")
+                binding = self._repository.broadcast_attachment_resolution(
+                    connection,
+                    producer_operation_id=record.operation_id,
+                    attachment_result=attachment_result,
                 )
                 queue_changed = binding.queue_changed
             elif is_producer and outcome == "failed":

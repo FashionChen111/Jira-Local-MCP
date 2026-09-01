@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from core.operations.errors import ConfirmationRequired, StoreError
-from core.operations.models import OperationRecord
+from core.operations.models import AttachmentResult, OperationRecord
 from core.operations.repository import OperationRepository
 from core.operations.rules.dependencies import (
+    ATTACHMENT_PRODUCER_OPERATION_TYPES,
+    ISSUE_PRODUCER_OPERATION_TYPES,
     PRODUCER_OPERATION_TYPES,
     dependency_operation_ids,
+    has_usable_success_result,
     is_jira_issue_key,
 )
 from core.storage.database import transaction, utc_ms
@@ -25,6 +28,7 @@ class RecoveryService:
         resolution: str,
         high_risk_confirmed: bool,
         new_issue_key: str | None = None,
+        attachment_result: AttachmentResult | None = None,
     ) -> dict[str, object]:
         """Record the human conclusion for an indeterminate execution."""
 
@@ -36,15 +40,31 @@ class RecoveryService:
                 raise StoreError("仅允许处置 indeterminate operation")
             if staging.execution_id is None:
                 raise StoreError("indeterminate operation 缺少 execution ID")
-            is_producer = staging.operation_type in PRODUCER_OPERATION_TYPES
-            if is_producer and resolution == "succeeded" and not is_jira_issue_key(
+            is_issue_producer = (
+                staging.operation_type in ISSUE_PRODUCER_OPERATION_TYPES
+            )
+            is_attachment_producer = (
+                staging.operation_type in ATTACHMENT_PRODUCER_OPERATION_TYPES
+            )
+            is_producer = is_issue_producer or is_attachment_producer
+            if is_issue_producer and resolution == "succeeded" and not is_jira_issue_key(
                 new_issue_key
             ):
                 raise StoreError("创建/克隆标记为已生效时必须填写真实 issue Key")
-            if not is_producer and new_issue_key is not None:
+            if (
+                is_attachment_producer
+                and resolution == "succeeded"
+                and attachment_result is None
+            ):
+                raise StoreError("附件上传标记为已生效时必须填写附件 ID 和最终文件名")
+            if not is_issue_producer and new_issue_key is not None:
                 raise StoreError("只有创建/克隆 operation 可以补录新事务 Key")
-            if resolution != "succeeded" and new_issue_key is not None:
-                raise StoreError("仅已生效处置可以提供新事务 Key")
+            if not is_attachment_producer and attachment_result is not None:
+                raise StoreError("只有附件上传 operation 可以补录附件结果")
+            if resolution != "succeeded" and (
+                new_issue_key is not None or attachment_result is not None
+            ):
+                raise StoreError("仅已生效处置可以提供生产者结果")
             if (
                 resolution == "not_applied"
                 and staging.submission_risk_level == "high"
@@ -59,16 +79,28 @@ class RecoveryService:
                 resolution=resolution,  # type: ignore[arg-type]
                 resolved_at=utc_ms(),
                 new_issue_key=new_issue_key,
+                attachment_result=attachment_result,
             ):
                 raise StoreError("execution record 已处置或状态不一致")
             self._repository.delete_staging_by_operation(connection, operation_id)
 
             queue_changed = False
-            if is_producer and resolution == "succeeded":
-                binding = self._repository.bind_produced_issue(
+            if is_issue_producer and resolution == "succeeded":
+                if new_issue_key is None:
+                    raise StoreError("创建/克隆已生效处置缺少新事务 Key")
+                binding = self._repository.broadcast_issue_resolution(
                     connection,
                     producer_operation_id=operation_id,
-                    new_issue_key=new_issue_key,  # type: ignore[arg-type]
+                    new_issue_key=new_issue_key,
+                )
+                queue_changed = binding.queue_changed
+            elif is_attachment_producer and resolution == "succeeded":
+                if attachment_result is None:
+                    raise StoreError("附件已生效处置缺少附件结果")
+                binding = self._repository.broadcast_attachment_resolution(
+                    connection,
+                    producer_operation_id=operation_id,
+                    attachment_result=attachment_result,
                 )
                 queue_changed = binding.queue_changed
             elif is_producer and resolution == "abandoned":
@@ -94,6 +126,11 @@ class RecoveryService:
                 "execution_id": staging.execution_id,
                 "resolution": resolution,
                 "new_issue_key": new_issue_key,
+                "attachment_result": (
+                    attachment_result.model_dump(mode="json")
+                    if attachment_result is not None
+                    else None
+                ),
             }
 
     def resolve_held(
@@ -125,7 +162,7 @@ class RecoveryService:
                     for record in records
                     for dependency_id in dependency_operation_ids(record)
                 }
-                states = self._repository.producer_states(
+                states = self._repository.dependency_states(
                     connection, all_dependencies
                 )
                 active_by_id = {
@@ -135,7 +172,9 @@ class RecoveryService:
                 for record in records:
                     for dependency_id in dependency_operation_ids(record):
                         state = states[dependency_id]
-                        if state.state == "success":
+                        if state.state == "success" and has_usable_success_result(
+                            state
+                        ):
                             continue
                         producer = active_by_id.get(dependency_id)
                         will_run_first = bool(
@@ -151,7 +190,7 @@ class RecoveryService:
                         )
                         if not will_run_first:
                             raise StoreError(
-                                "held operation 的创建/克隆依赖尚未解析；"
+                                "held operation 的前置依赖尚未解析；"
                                 f"请同时恢复前置生产者或重新入队：{dependency_id}"
                             )
 

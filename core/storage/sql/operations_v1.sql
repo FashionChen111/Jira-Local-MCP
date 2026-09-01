@@ -3,7 +3,7 @@ CREATE TABLE schema_metadata (
     value TEXT NOT NULL
 );
 INSERT INTO schema_metadata(name,value) VALUES (
-    'schema_identity','jira-local-mcp-operations-direct-keys-v1'
+    'schema_identity','jira-local-mcp-operations-attachment-dependencies-v1'
 );
 
 CREATE TABLE revisions (
@@ -39,7 +39,7 @@ CREATE TABLE queue_events (
     action_code TEXT NOT NULL CHECK (action_code IN (
       'mcp_append','submit_for_execution','cancelled_by_user',
       'requeued_not_applied','held_resumed','held_requeued','held_abandoned',
-      'issue_key_resolved','dependency_failed','cascade_cancelled'
+      'issue_key_resolved','attachment_resolved','dependency_failed','cascade_cancelled'
     )),
     data_json TEXT NOT NULL
 );
@@ -96,6 +96,7 @@ CREATE TABLE execution_records (
     summary TEXT,
     error TEXT,
     new_issue_key TEXT,
+    attachment_result_json TEXT,
     elapsed_ms INTEGER CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
     resolution TEXT CHECK (resolution IN ('succeeded','not_applied','abandoned')),
     resolved_at INTEGER CHECK (resolved_at IS NULL OR resolved_at >= 0),

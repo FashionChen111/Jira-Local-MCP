@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import JsonValue
 
 from core.operations.rules.dependencies import DependencyError, validate_target_syntax
 from core.operations.models import OperationDraft, OperationRecord
 from core.operations.rules.safety import (
     OperationSafetyError,
     assert_allowed_and_non_delete,
+    assert_valid_payload_shape,
     validate_for_enqueue,
 )
 from knowledge.prompts import PROMPTS
@@ -103,6 +105,116 @@ def test_create_has_no_key_and_payload_cannot_duplicate_targets() -> None:
     )
     with pytest.raises(OperationSafetyError, match="不得重复"):
         validate_for_enqueue(duplicate)
+
+
+@pytest.mark.parametrize(
+    ("operation_type", "payload"),
+    [
+        (
+            "create_issue",
+            {"project_key": "P", "issue_type": "Task", "summary": "new"},
+        ),
+        ("clone_issue", {}),
+        ("move_issue", {"target_project_key": "OTHER"}),
+        ("change_type", {"target_issue_type": "Bug"}),
+        ("transition_issue", {"transition_name": "Start"}),
+        ("update_field", {"fields": {"summary": "new"}}),
+        (
+            "update_custom_field",
+            {"custom_fields": {"customfield_10001": ["one"]}},
+        ),
+        ("add_attachment", {"file_path": "C:\\fixtures\\a.txt"}),
+        ("add_comment", {"body": "hello"}),
+        ("add_worklog", {"time_spent": "1h"}),
+        ("add_issuelink", {"link_type": "Relates"}),
+    ],
+)
+def test_payload_shape_covers_every_operation_without_jira_value_rules(
+    operation_type: str, payload: dict[str, JsonValue]
+) -> None:
+    assert_valid_payload_shape(operation_type, payload)
+
+
+@pytest.mark.parametrize(
+    ("operation_type", "payload", "message"),
+    [
+        (
+            "create_issue",
+            {"project_key": "P", "issue_type": "Task"},
+            "缺少必需字段",
+        ),
+        ("clone_issue", {"clone_subtasks": "false"}, "必须是布尔值"),
+        (
+            "transition_issue",
+            {"transition_name": "Start", "fields": []},
+            "必须是对象",
+        ),
+        ("update_field", {"fields": {}}, "必须是非空对象"),
+        ("add_comment", {"body": 1}, "必须是字符串"),
+        (
+            "add_worklog",
+            {"time_spent": "1h", "ignored": True},
+            "包含未定义字段",
+        ),
+        (
+            "update_custom_field",
+            {"custom_fields": {"summary": "wrong tool"}},
+            "包含无效字段 ID",
+        ),
+    ],
+)
+def test_payload_shape_rejects_only_handler_relevant_shape_errors(
+    operation_type: str,
+    payload: dict[str, JsonValue],
+    message: str,
+) -> None:
+    with pytest.raises(OperationSafetyError, match=message):
+        assert_valid_payload_shape(operation_type, payload)
+
+
+@pytest.mark.parametrize(
+    ("operation_type", "payload"),
+    [
+        (
+            "create_issue",
+            {
+                "project_key": "P",
+                "issue_type": "Task",
+                "summary": "new",
+                "extra_fields": {"description": {"file": "stale.txt"}},
+            },
+        ),
+        ("update_field", {"fields": {"description": ["not text"]}}),
+        (
+            "change_type",
+            {
+                "target_issue_type": "Bug",
+                "fields_mapping": {"description": False},
+            },
+        ),
+        (
+            "transition_issue",
+            {"transition_name": "Start", "fields": {"description": 1}},
+        ),
+    ],
+)
+def test_payload_shape_requires_materialized_description_snapshots(
+    operation_type: str, payload: dict[str, JsonValue]
+) -> None:
+    with pytest.raises(OperationSafetyError, match="入队时固化"):
+        assert_valid_payload_shape(operation_type, payload)
+
+
+def test_enqueue_boundary_reuses_payload_shape_validation() -> None:
+    draft = OperationDraft(
+        operation_type="add_comment",
+        issue_key="PROJ-1",
+        payload={"body": 1},
+        description="invalid comment",
+    )
+
+    with pytest.raises(OperationSafetyError, match="payload.body"):
+        validate_for_enqueue(draft)
 
 
 def test_prompts_publish_review_and_untrusted_data_contract() -> None:

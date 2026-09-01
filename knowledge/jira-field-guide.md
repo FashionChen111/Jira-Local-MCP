@@ -32,6 +32,11 @@
 -->
 （尚未配置，请根据实际 JIRA 实例补充。）
 
+## description 与附件引用
+- `{"description": {"file": "...txt"}}` 会在入队时读取为 UTF-8 字符串快照，排队后不再读取源文件。
+- 同一事务中待上传附件的链接引用为 `[^{{attachment:op-…}}]`，图片引用为 `!{{attachment:op-…}}!`；`op-…` 必须来自 `jira_attachment_add_append`。
+- 创建事务的初始 description 不接受附件引用。新事务应按“创建 → 上传附件 → 更新 description”入队。
+
 ## Server / Data Center 注意事项
 - 用户标识用 `name`（用户名），而非 Cloud 的 `accountId`。
 - **移动事务（move）REST 不支持**，请在网页端手动操作。

@@ -5,6 +5,7 @@ import inspect
 import json
 import re
 from collections.abc import Awaitable, Callable
+from types import SimpleNamespace
 
 import anyio
 import mcp.types as mcp_types
@@ -146,6 +147,43 @@ def test_create_response_exposes_reference_contract_and_followup_accepts_id(queu
     assert "issue_key/target_issue_key" in created
     followup = mcp_tools.jira_comment_add_append(operation_id, "follow up")
     assert "Operation ID: op-" in followup and "尚未执行" in followup
+
+
+def test_attachment_response_exposes_explicit_reference_syntax(
+    queue, tmp_path
+):
+    path = tmp_path / "a.jpg"
+    path.write_bytes(b"image")
+
+    response = mcp_tools.jira_attachment_add_append(
+        "PROJ-1", str(path), "a.jpg"
+    )
+
+    operation_id = re.search(r"op-[0-9a-f]{32}", response)
+    assert operation_id is not None
+    assert "[^{{attachment:" + operation_id.group(0) + "}}]" in response
+    assert "!{{attachment:" + operation_id.group(0) + "}}!" in response
+
+
+def test_attachment_query_returns_id_with_filename(queue, monkeypatch):
+    attachment = SimpleNamespace(
+        id="10001",
+        filename="a.jpg",
+        size=3,
+        author=SimpleNamespace(displayName="User"),
+        created="2026-08-31",
+        content="https://jira.example/10001",
+    )
+    issue = SimpleNamespace(
+        fields=SimpleNamespace(attachment=[attachment])
+    )
+    client = SimpleNamespace(issue=lambda _key: issue)
+    monkeypatch.setattr(mcp_tools.jira_client, "get_client", lambda: client)
+
+    result = json.loads(mcp_tools.jira_query_attachments("PROJ-1"))
+
+    assert result[0]["id"] == "10001"
+    assert result[0]["filename"] == "a.jpg"
 
 
 def test_show_queue_opens_even_when_empty(cfg, monkeypatch):

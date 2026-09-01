@@ -11,8 +11,8 @@ from core.operations.errors import (
 from core.operations.models import OperationRecord, RiskLevel
 from core.operations.repository import DatabaseConnection, OperationRepository
 from core.operations.rules.dependencies import (
-    PRODUCER_OPERATION_TYPES,
     dependency_operation_ids,
+    submission_block_reason,
 )
 from core.operations.rules.ordering import (
     OrderingError,
@@ -65,8 +65,10 @@ class SubmissionService:
             for operation_id in operation_ids
             for dependency_id in dependency_operation_ids(operation_by_id[operation_id])
         }
-        producer_states = self._repository.producer_states(connection, all_dependency_ids)
-        display = automatic_queue(queue_operations, producer_states).flattened()
+        dependency_states = self._repository.dependency_states(
+            connection, all_dependency_ids
+        )
+        display = automatic_queue(queue_operations, dependency_states).flattened()
         selected = tuple(
             operation for operation in display if operation.operation_id in selected_ids
         )
@@ -76,25 +78,14 @@ class SubmissionService:
                 assert_safe_for_submit(operation)
             except OperationSafetyError as exc:
                 raise StoreError(str(exc)) from exc
+            reason = submission_block_reason(operation, dependency_states)
+            if reason is not None:
+                raise StoreError(reason)
             for dependency_id in dependency_operation_ids(operation):
-                state = producer_states[dependency_id]
-                if state.operation_type not in PRODUCER_OPERATION_TYPES:
-                    raise StoreError(
-                        f"依赖的 operation 不是创建/克隆事务：{dependency_id}"
-                    )
+                state = dependency_states[dependency_id]
                 if state.state == "queued" and dependency_id not in selected_ids:
                     raise StoreError(
-                        f"提交缺少依赖的创建/克隆 operation：{dependency_id}"
-                    )
-                if state.state in {
-                    "unknown",
-                    "failed",
-                    "dependency_failed",
-                    "indeterminate",
-                    "abandoned",
-                }:
-                    raise StoreError(
-                        f"依赖的创建/克隆 operation 不可用：{dependency_id} ({state.state})"
+                        f"提交缺少依赖 operation：{dependency_id}"
                     )
 
         try:

@@ -26,6 +26,7 @@ from core import jira_client
 from core.executing import worker as execution_worker
 from core.runtime_logger import get_logger
 from core.operations import (
+    AttachmentResult,
     ConfirmationRequired,
     DependencyConfirmationRequired,
     ExecutionBlocked,
@@ -97,6 +98,7 @@ class ResolveIndeterminateRequest(StrictModel):
     new_issue_key: str | None = Field(
         default=None, max_length=255
     )
+    attachment_result: AttachmentResult | None = None
 
     @model_validator(mode="after")
     def key_only_for_success(self) -> "ResolveIndeterminateRequest":
@@ -104,8 +106,11 @@ class ResolveIndeterminateRequest(StrictModel):
             self.new_issue_key
         ):
             raise ValueError("new_issue_key 格式无效")
-        if self.resolution != "succeeded" and self.new_issue_key is not None:
-            raise ValueError("仅已生效处置可以提供 new_issue_key")
+        if self.resolution != "succeeded" and (
+            self.new_issue_key is not None
+            or self.attachment_result is not None
+        ):
+            raise ValueError("仅已生效处置可以提供生产者结果")
         return self
 
 
@@ -284,6 +289,7 @@ def create_app(
                 body.resolution,
                 body.high_risk_confirmed,
                 body.new_issue_key,
+                body.attachment_result,
             )
             execution_worker.wake_worker()
             return JSONResponse(result)

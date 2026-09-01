@@ -5,49 +5,25 @@ import os
 from typing import Any
 
 from core import jira_client
-from core.operations import assert_safe_to_execute
-from core.textfile_loader import TextFileError, read_text_file
+from core.operations import (
+    AttachmentResult,
+    OperationExecutionResult,
+    assert_safe_to_execute,
+)
 
 MOVE_UNSUPPORTED_MSG = (
     "Jira Server / Data Center REST API 不支持移动事务，请在 Jira 页面人工处理。"
 )
 
 
-def _resolve_description(payload: dict[str, Any]) -> str | None:
-    file_path = payload.get("description_file")
-    if file_path:
-        if not isinstance(file_path, str):
-            raise TextFileError("description_file 必须是文件路径字符串")
-        return read_text_file(file_path)
-    if "description" not in payload:
-        return None
-    value = payload["description"]
-    if isinstance(value, dict):
-        path = value.get("file")
-        if not isinstance(path, str) or not path:
-            raise TextFileError("description 字典必须包含非空 file 路径")
-        return read_text_file(path)
-    if isinstance(value, str) or value is None:
-        return value
-    raise TextFileError("description 必须是字符串、文件参数或 None")
-
-
-def _resolve_fields(fields: dict[str, Any]) -> dict[str, Any]:
-    result = dict(fields)
-    value = result.get("description")
-    if isinstance(value, dict) and value.get("file"):
-        result["description"] = read_text_file(value["file"])
-    return result
-
-
-def _create(client: Any, task: Any) -> tuple[str, str | None]:
+def _create(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
     fields: dict[str, Any] = {
         "project": {"key": payload["project_key"]},
         "issuetype": {"name": payload["issue_type"]},
         "summary": payload["summary"],
     }
-    description = _resolve_description(payload)
+    description = payload.get("description")
     if description is not None:
         fields["description"] = description
     if payload.get("priority"):
@@ -56,10 +32,12 @@ def _create(client: Any, task: Any) -> tuple[str, str | None]:
         fields["assignee"] = {"name": payload["assignee"]}
     fields.update(payload.get("extra_fields") or {})
     issue = client.create_issue(fields=fields)
-    return f"已创建事务 {issue.key}", issue.key
+    return OperationExecutionResult(
+        summary=f"已创建事务 {issue.key}", new_issue_key=issue.key
+    )
 
 
-def _clone(client: Any, task: Any) -> tuple[str, str | None]:
+def _clone(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
     source = client.issue(task.issue_key)
     fields: dict[str, Any] = {
@@ -83,14 +61,17 @@ def _clone(client: Any, task: Any) -> tuple[str, str | None]:
     if payload.get("clone_subtasks"):
         notes.append("子任务克隆需人工核对（未自动执行）")
     suffix = "；" + "，".join(notes) if notes else ""
-    return f"已克隆 {task.issue_key} → {issue.key}{suffix}", issue.key
+    return OperationExecutionResult(
+        summary=f"已克隆 {task.issue_key} → {issue.key}{suffix}",
+        new_issue_key=issue.key,
+    )
 
 
-def _move(_client: Any, _task: Any) -> tuple[str, str | None]:
+def _move(_client: Any, _task: Any) -> OperationExecutionResult:
     raise RuntimeError(MOVE_UNSUPPORTED_MSG)
 
 
-def _change_type(client: Any, task: Any) -> tuple[str, str | None]:
+def _change_type(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
     fields = {"issuetype": {"name": payload["target_issue_type"]}}
     fields.update(payload.get("fields_mapping") or {})
@@ -98,10 +79,12 @@ def _change_type(client: Any, task: Any) -> tuple[str, str | None]:
         client.issue(task.issue_key).update(fields=fields)
     except Exception as exc:
         raise RuntimeError(f"变更事务类型失败: {type(exc).__name__}") from exc
-    return f"{task.issue_key} 类型已变更为 {payload['target_issue_type']}", None
+    return OperationExecutionResult(
+        summary=f"{task.issue_key} 类型已变更为 {payload['target_issue_type']}"
+    )
 
 
-def _transition(client: Any, task: Any) -> tuple[str, str | None]:
+def _transition(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
     issue = client.issue(task.issue_key)
     wanted = str(payload["transition_name"]).strip().lower()
@@ -110,43 +93,76 @@ def _transition(client: Any, task: Any) -> tuple[str, str | None]:
         raise RuntimeError(f"未找到流转「{payload['transition_name']}」")
     kwargs: dict[str, Any] = {}
     if payload.get("fields"):
-        kwargs["fields"] = _resolve_fields(payload["fields"])
+        kwargs["fields"] = dict(payload["fields"])
     if payload.get("comment"):
         kwargs["comment"] = payload["comment"]
     client.transition_issue(issue, transition_id, **kwargs)
-    return f"{task.issue_key} 状态已流转：{payload['transition_name']}", None
+    return OperationExecutionResult(
+        summary=f"{task.issue_key} 状态已流转：{payload['transition_name']}"
+    )
 
 
-def _update_field(client: Any, task: Any) -> tuple[str, str | None]:
+def _update_field(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
-    fields = _resolve_fields(payload["fields"])
+    fields = dict(payload["fields"])
     client.issue(task.issue_key).update(fields=fields)
-    return f"{task.issue_key} 已更新字段：{', '.join(fields)}", None
+    return OperationExecutionResult(
+        summary=f"{task.issue_key} 已更新字段：{', '.join(fields)}"
+    )
 
 
-def _update_custom_field(client: Any, task: Any) -> tuple[str, str | None]:
+def _update_custom_field(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
-    fields = _resolve_fields(payload["custom_fields"])
+    fields = dict(payload["custom_fields"])
     client.issue(task.issue_key).update(fields=fields)
-    return f"{task.issue_key} 已更新自定义字段：{', '.join(fields)}", None
+    return OperationExecutionResult(
+        summary=f"{task.issue_key} 已更新自定义字段：{', '.join(fields)}"
+    )
 
 
-def _attachment(client: Any, task: Any) -> tuple[str, str | None]:
+def _resource_value(resource: Any, name: str) -> object:
+    value = getattr(resource, name, None)
+    if value is not None:
+        return value
+    raw = getattr(resource, "raw", None)
+    return raw.get(name) if isinstance(raw, dict) else None
+
+
+def _attachment(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
     path = payload["file_path"]
     if not os.path.isabs(path) or not os.path.isfile(path):
         raise RuntimeError(f"附件文件不存在或非绝对路径: {path}")
     with open(path, "rb") as handle:
-        client.add_attachment(issue=task.issue_key, attachment=handle, filename=payload.get("file_name"))
-    return f"{task.issue_key} 已添加附件 {payload.get('file_name') or os.path.basename(path)}", None
+        uploaded = client.add_attachment(
+            issue=task.issue_key,
+            attachment=handle,
+            filename=payload.get("file_name"),
+        )
+    attachment_id = _resource_value(uploaded, "id")
+    if attachment_id is None or not str(attachment_id).strip():
+        raise RuntimeError("Jira 附件上传响应缺少附件 ID")
+    filename = _resource_value(uploaded, "filename")
+    if filename is None or not str(filename).strip():
+        confirmed = client.attachment(str(attachment_id))
+        filename = _resource_value(confirmed, "filename")
+    if filename is None or not str(filename).strip():
+        raise RuntimeError("无法根据 Jira 附件 ID 确认最终文件名")
+    attachment_result = AttachmentResult(
+        id=str(attachment_id), filename=str(filename)
+    )
+    return OperationExecutionResult(
+        summary=f"{task.issue_key} 已添加附件 {attachment_result.filename}",
+        attachment_result=attachment_result,
+    )
 
 
-def _comment(client: Any, task: Any) -> tuple[str, str | None]:
+def _comment(client: Any, task: Any) -> OperationExecutionResult:
     client.add_comment(task.issue_key, task.payload["body"])
-    return f"{task.issue_key} 已添加评论", None
+    return OperationExecutionResult(summary=f"{task.issue_key} 已添加评论")
 
 
-def _worklog(client: Any, task: Any) -> tuple[str, str | None]:
+def _worklog(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
     kwargs: dict[str, Any] = {"timeSpent": payload["time_spent"]}
     if payload.get("comment"):
@@ -154,13 +170,20 @@ def _worklog(client: Any, task: Any) -> tuple[str, str | None]:
     if payload.get("started"):
         kwargs["started"] = payload["started"]
     client.add_worklog(issue=task.issue_key, **kwargs)
-    return f"{task.issue_key} 已添加工作日志 {payload['time_spent']}", None
+    return OperationExecutionResult(
+        summary=f"{task.issue_key} 已添加工作日志 {payload['time_spent']}"
+    )
 
 
-def _link(client: Any, task: Any) -> tuple[str, str | None]:
+def _link(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
     client.create_issue_link(type=payload["link_type"], inwardIssue=task.issue_key, outwardIssue=task.target_issue_key)
-    return f"已链接 {task.issue_key} --[{payload['link_type']}]--> {task.target_issue_key}", None
+    return OperationExecutionResult(
+        summary=(
+            f"已链接 {task.issue_key} --[{payload['link_type']}]--> "
+            f"{task.target_issue_key}"
+        )
+    )
 
 
 _HANDLERS = {
@@ -172,7 +195,7 @@ _HANDLERS = {
 }
 
 
-def execute_operation(task: Any) -> tuple[str, str | None]:
+def execute_operation(task: Any) -> OperationExecutionResult:
     """Execute one authorized operation after the mandatory final safety gate."""
     assert_safe_to_execute(task)
     handler = _HANDLERS.get(task.operation_type)

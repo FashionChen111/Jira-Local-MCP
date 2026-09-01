@@ -155,6 +155,29 @@ def test_executor_runs_safety_gate_before_handler_selection_or_jira_client(
     assert calls == []
 
 
+def test_executor_rechecks_payload_shape_before_jira_client(monkeypatch):
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="add_comment",
+        issue_key="PROJ-1",
+        risk_level="low",
+        payload={"body": 1},
+        description="malformed persisted payload",
+        source="test",
+        created_at=1,
+    )
+    calls = []
+    monkeypatch.setattr(
+        jira_executor.jira_client,
+        "get_client",
+        lambda: calls.append("client"),
+    )
+
+    with pytest.raises(operation_safety.OperationSafetyError, match="payload.body"):
+        jira_executor.execute_operation(operation)
+    assert calls == []
+
+
 def test_executor_reads_both_link_targets_from_top_level(monkeypatch):
     calls = []
 

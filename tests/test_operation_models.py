@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from core.operations.models import OperationDraft, OperationRecord, StagingRecord
+from core.operations.models import (
+    AttachmentResult,
+    OperationDraft,
+    OperationExecutionResult,
+    OperationRecord,
+    StagingRecord,
+)
 
 
 def operation(**changes: object) -> OperationRecord:
@@ -95,3 +101,19 @@ def test_staging_model_rejects_unknown_persisted_state() -> None:
                 "blocked_by_execution_id": None,
             }
         )
+
+
+def test_attachment_result_is_one_strict_frozen_identity_value() -> None:
+    attachment = AttachmentResult(id="10001", filename="a-1.jpg")
+    result = OperationExecutionResult(
+        summary="uploaded", attachment_result=attachment
+    )
+
+    assert result.model_dump(mode="json")["attachment_result"] == {
+        "id": "10001",
+        "filename": "a-1.jpg",
+    }
+    with pytest.raises(ValidationError):
+        AttachmentResult(id="", filename="a.jpg")
+    with pytest.raises(ValidationError):
+        attachment.filename = "changed.jpg"  # type: ignore[misc]

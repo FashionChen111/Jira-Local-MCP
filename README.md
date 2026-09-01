@@ -25,7 +25,8 @@ MCP append → queued → Web submit → staged → executing → success/failed
 - `data/mcp_logs.sqlite3`：Tool 调用、Resource 读取和 Prompt/Skill 获取的完整业务请求/响应；不记录能力列表等协议元数据。
 - SQLite 是唯一业务状态源；使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema version。完整 schema 初始化按进程和数据库路径执行一次，普通连接不重复获取 schema 写锁。
 - queue、staging 和 history 都保存自包含的 operation 快照。主目标保存在顶层 `issue_key`，仅 `add_issuelink` 使用可空的顶层 `target_issue_key`；`payload_json` 只保存 operation 专属参数，不重复保存这两个 Key。
-- 2.2.0 将 operations schema 重新定义为带结构身份标识的新 v1 开发基线，不兼容任何旧 operations 数据。升级时必须先停止 Web/worker，再仅清除配置指向的 `operations.sqlite3` 及其精确匹配的 `-wal`、`-shm` sidecar；启动检测到旧 v1/v2 或身份不符时会明确拒绝，不会自动清库。`mcp_logs.sqlite3` 使用独立 schema，不得随 operations DB 一并清除。
+- description 文件会在入队时读取为 UTF-8 字符串快照，后续审核和执行不再依赖源文件；附件仍保存本地绝对路径并在执行时读取。
+- 2.3.0 使用新的 operations v1 结构身份，执行记录以单个 `attachment_result_json` 保存附件 ID 与 Jira 最终文件名，不兼容旧 operations 数据。升级时必须先停止 Web/worker，再仅清除配置指向的 `operations.sqlite3` 及其精确匹配的 `-wal`、`-shm` sidecar；`mcp_logs.sqlite3` 使用独立 schema，不得随 operations DB 一并清除。
 
 队列不保存布局或位置。每次读取时都会按确定性规则自动分组和排序：真实 Jira 组按 Key 自然排序，待创建事务组随后按生产者创建时间排序，组内按生产者、标准字段、自定义字段、工作流、附件、评论、worklog、其他类别以及创建时间和 operation ID 排序，零散项最后展示。生产者返回真实 Key 后，下一次读取会自动重新分组；待审队列不提供任何人工排序或锚点。提交后持久化的 `stage_order` 仍代表用户已授权的执行顺序。
 
@@ -37,7 +38,7 @@ MCP append → queued → Web submit → staged → executing → success/failed
 - `jira_get_execution_log`：读取实际执行和人工对账历史。
 - 4 个 Resources 和 4 个 Prompts。
 
-`move_issue` 仍可入队展示，但 Jira Server/DC REST 不支持时会明确记录失败。创建或克隆 Tool 返回的 operation ID 可直接作为后续修改的 `issue_key`，`add_issuelink.target_issue_key` 也支持相同引用；服务端会在生产者成功后原子物化两个顶层 Key。克隆来源仍必须是真实 Jira Key，也不接受自定义 placeholder。公共输出使用 `target_issue_key`、`dependency_operation_ids` 与 `dependency_states` 明确表达这一有限依赖模型。
+`move_issue` 仍可入队展示，但 Jira Server/DC REST 不支持时会明确记录失败。创建或克隆 Tool 返回的 operation ID 可直接作为后续修改的 `issue_key`，`add_issuelink.target_issue_key` 也支持相同引用；服务端会在生产者成功后原子物化两个顶层 Key。附件上传 operation ID 可在同一事务的 description、comment 和 worklog 中写成 `[^{{attachment:op-…}}]` 或 `!{{attachment:op-…}}!`；上传成功后，系统使用 Jira 返回的附件 ID 确认身份，并把引用原子替换为最终文件名。创建事务的初始 description 不允许附件引用，应采用“创建 → 上传 → 更新 description”。克隆来源仍必须是真实 Jira Key，也不接受自定义 placeholder。公共输出使用 `dependency_operation_ids` 与 `dependency_states` 表达两类依赖。
 
 ## 配置与运行
 
@@ -73,11 +74,11 @@ python server.py
 
 - `GET /api/state`：队列、执行区和 revisions，支持 ETag/304。
 - `POST /api/queue/cancel`、`POST /api/queue/submit`；待审队列完全自动排序，不提供 reorder API。
-- `POST /api/execution/indeterminate/resolve`、`/held/resolve`。
+- `POST /api/execution/indeterminate/resolve`、`/held/resolve`；不确定的附件上传标记为已生效时，前者要求嵌套提供附件 ID 与最终文件名。
 - `GET /api/execution-history`：UTC 时间范围和分页。
 
 审核页面静态资源全部本地化，并启用 CSP、frame 防护、`nosniff`、`no-referrer` 和 `no-store`。
 
 ## 已知边界
 
-附件和 description 文件目前仍只保存本地路径，没有 staging 或 hash 绑定；审核后文件可能变化。克隆源和最终规范化 Jira payload 也尚未与审核内容不可变绑定。SQLite 和本地日志不是针对同一 OS 用户恶意篡改的安全存储，因此不要宣称“生产安全”或“完整不可抵赖审计”。
+附件目前仍只保存本地路径，没有 staging 或 hash 绑定；审核后文件可能变化。description 文件已在入队时保存内容快照。克隆源和最终规范化 Jira payload 也尚未与审核内容不可变绑定。SQLite 和本地日志不是针对同一 OS 用户恶意篡改的安全存储，因此不要宣称“生产安全”或“完整不可抵赖审计”。

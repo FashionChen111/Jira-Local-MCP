@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from pydantic import ValidationError
 
 from core.operations.errors import DependencyConfirmationRequired, RevisionConflict, StoreError
@@ -9,14 +11,64 @@ from core.operations.models import OperationDraft, OperationRecord
 from core.operations.repository import OperationRepository
 from core.operations.rules.dependencies import (
     DependencyError,
-    dependency_fields,
     dependency_operation_ids,
-    materialize_targets,
-    validate_referenced_producers,
+    materialize_references,
+    resolution_events,
+    validate_references,
 )
 from core.operations.rules.ordering import automatic_queue
 from core.operations.rules.safety import OperationSafetyError, validate_for_enqueue
 from core.storage.database import new_id, transaction, utc_ms
+from core.textfile_loader import TextFileError, read_text_file
+
+
+def _snapshot_description_value(value: object) -> object:
+    if not isinstance(value, dict) or "file" not in value:
+        return value
+    file_path = value["file"]
+    if not isinstance(file_path, str):
+        raise TextFileError("description.file 必须是文件路径字符串")
+    return read_text_file(file_path)
+
+
+def _snapshot_nested_description(
+    payload: dict[str, object], container_name: str
+) -> None:
+    container = payload.get(container_name)
+    if not isinstance(container, dict) or "description" not in container:
+        return
+    copied = dict(container)
+    copied["description"] = _snapshot_description_value(
+        copied["description"]
+    )
+    payload[container_name] = copied
+
+
+def _snapshot_description_files(
+    operation_type: str, payload: dict[str, object]
+) -> dict[str, object]:
+    """Read supported description files before the immutable queue snapshot."""
+
+    result = deepcopy(payload)
+    if operation_type == "create_issue":
+        description_file = result.pop("description_file", None)
+        if description_file is not None:
+            if not isinstance(description_file, str):
+                raise TextFileError("description_file 必须是文件路径字符串")
+            result["description"] = read_text_file(description_file)
+        elif "description" in result:
+            value = _snapshot_description_value(result["description"])
+            if isinstance(value, dict):
+                raise TextFileError("description 字典必须包含非空 file 路径")
+            result["description"] = value
+        _snapshot_nested_description(result, "extra_fields")
+    elif operation_type == "update_field":
+        _snapshot_nested_description(result, "fields")
+    elif operation_type == "change_type":
+        _snapshot_nested_description(result, "fields_mapping")
+    elif operation_type == "transition_issue":
+        _snapshot_nested_description(result, "fields")
+    return result
 
 
 class QueueService:
@@ -37,6 +89,7 @@ class QueueService:
         """Validate, immediately materialize completed producers, and enqueue."""
 
         try:
+            payload = _snapshot_description_files(operation_type, payload)
             draft = OperationDraft.model_validate(
                 {
                     "operation_type": operation_type,
@@ -48,7 +101,7 @@ class QueueService:
                 }
             )
             risk_level, risk_reason = validate_for_enqueue(draft)
-        except (ValidationError, OperationSafetyError) as exc:
+        except (ValidationError, OperationSafetyError, TextFileError) as exc:
             raise StoreError(str(exc)) from exc
 
         operation = OperationRecord(
@@ -63,33 +116,31 @@ class QueueService:
             created_at=utc_ms(),
             attempt_no=1,
         )
-        original_fields = dependency_fields(operation)
+        original_operation = operation
         with transaction() as connection:
-            states = self._repository.producer_states(
-                connection, dependency_operation_ids(operation)
-            )
             try:
-                resolved = validate_referenced_producers(operation, states)
+                states = self._repository.dependency_states(
+                    connection, dependency_operation_ids(operation)
+                )
+                resolutions = validate_references(operation, states)
             except DependencyError as exc:
                 raise StoreError(str(exc)) from exc
-            operation = materialize_targets(operation, resolved)
+            operation = materialize_references(operation, resolutions)
             self._repository.insert_queue(
                 connection,
                 operation,
                 action_code="mcp_append",
                 event_data={"source": source, "risk_reason": risk_reason},
             )
-            for producer_id, new_issue_key in resolved.items():
-                fields = [name for name, value in original_fields if value == producer_id]
+            for event in resolution_events(original_operation, resolutions):
                 self._repository.append_event(
                     connection,
                     operation.operation_id,
                     "internal",
-                    "issue_key_resolved",
+                    event.action_code,
                     {
-                        "producer_operation_id": producer_id,
-                        "new_issue_key": new_issue_key,
-                        "fields": fields,
+                        "producer_operation_id": event.producer_operation_id,
+                        **event.data,
                         "location": "queue",
                         "resolved_during_enqueue": True,
                     },

@@ -5,6 +5,10 @@ class StoreError(RuntimeError):
     """Expected state or validation failure."""
 
 
+class DependencyError(ValueError):
+    """An issue or attachment dependency violates the operations contract."""
+
+
 class RevisionConflict(StoreError):
     """The submitted queue revision no longer matches persisted state."""
 

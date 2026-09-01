@@ -15,7 +15,9 @@ from config import get_config
 
 OPERATIONS_SCHEMA_VERSION = 1
 MCP_LOG_SCHEMA_VERSION = 1
-OPERATIONS_SCHEMA_IDENTITY = "jira-local-mcp-operations-direct-keys-v1"
+OPERATIONS_SCHEMA_IDENTITY = (
+    "jira-local-mcp-operations-attachment-dependencies-v1"
+)
 BUSY_TIMEOUT_MS = 10_000
 _INITIALIZATION_LOCK = threading.Lock()
 _INITIALIZED_DATABASES: set[tuple[str, str]] = set()

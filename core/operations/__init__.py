@@ -8,16 +8,23 @@ from core.operations.errors import (
     RevisionConflict,
     StoreError,
 )
-from core.operations.models import ExecutionClaim, OperationRecord
-from core.operations.rules.dependencies import is_jira_issue_key, is_operation_id
+from core.operations.models import (
+    AttachmentResult,
+    ExecutionClaim,
+    OperationExecutionResult,
+    OperationRecord,
+)
+from core.operations.rules.identifiers import is_jira_issue_key, is_operation_id
 from core.operations.rules.safety import assert_safe_to_execute
 
 __all__ = [
     "ConfirmationRequired",
+    "AttachmentResult",
     "DependencyConfirmationRequired",
     "ExecutionBlocked",
     "ExecutionClaim",
     "OperationRecord",
+    "OperationExecutionResult",
     "OperationServices",
     "RevisionConflict",
     "StoreError",

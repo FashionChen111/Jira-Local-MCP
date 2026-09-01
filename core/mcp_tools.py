@@ -35,6 +35,15 @@ def _response(operation: Any) -> str:
             "\n在真实事务尚未生成时，可将此 Operation ID 直接作为后续修改 "
             "Tool 的 issue_key/target_issue_key。"
         )
+    if operation.operation_type == "add_attachment":
+        result += (
+            "\n可在同一事务的后续 description、comment 或 worklog 中使用 "
+            "[^{{attachment:"
+            + operation.operation_id
+            + "}}] 或 !{{attachment:"
+            + operation.operation_id
+            + "}}! 引用本次上传结果。"
+        )
     return result
 
 
@@ -168,6 +177,9 @@ def jira_query_attachments(issue_key: str) -> str:
         issue = jira_client.get_client().issue(issue_key)
         values = [
             {
+                "id": (
+                    str(item.id) if getattr(item, "id", None) is not None else None
+                ),
                 "filename": item.filename,
                 "size": getattr(item, "size", None),
                 "author": getattr(getattr(item, "author", None), "displayName", None),
@@ -259,6 +271,9 @@ def jira_issue_create_append(
         priority: 可选的 Jira 优先级名称。
         assignee: 可选的 Jira Server/Data Center 经办人用户名。
         extra_fields: 可选的其他 Jira 字段映射。
+
+        初始 description 不接受 Jira 本地附件引用。需要引用附件时，应先创建
+        事务，再上传附件，最后通过字段更新 Tool 设置 description。
 
     返回：
         已入队的 operation ID、基础风险等级及“尚未执行”提示。只有用户在
@@ -364,6 +379,7 @@ def jira_issue_type_change_append(
         issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         target_issue_type: 目标事务类型名称。
         fields_mapping: 可选的字段映射，用于适配不同事务类型的字段差异。
+            其中 description 支持入队时文本文件快照及同事务附件引用语法。
 
     返回：
         已入队的 operation ID、基础风险等级及“尚未执行”提示；执行前必须由
@@ -396,8 +412,9 @@ def jira_issue_transition_append(
     参数：
         issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         transition_name: Jira 工作流流转名称。
-        comment: 可选的流转评论。
-        fields: 可选的流转字段映射。
+        comment: 可选的流转评论，支持同事务附件引用语法。
+        fields: 可选的流转字段映射，其中 description 支持入队时文本文件
+            快照及同事务附件引用语法。
 
     返回：
         已入队的 operation ID、基础风险等级及“尚未执行”提示；执行前必须由
@@ -427,6 +444,8 @@ def jira_field_update_append(issue_key: str, fields: dict) -> str:
         issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         fields: 非空的标准字段映射。描述文件可写为
             ``{"description": {"file": "C:\\absolute\\path.txt"}}``。
+            description 可使用 ``[^{{attachment:op-…}}]`` 或
+            ``!{{attachment:op-…}}!`` 引用同一事务的附件上传 operation。
 
     返回：
         已入队的 operation ID、基础风险等级及“尚未执行”提示；执行前必须由
@@ -511,6 +530,8 @@ def jira_comment_add_append(issue_key: str, body: str) -> str:
     参数：
         issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         body: 评论正文。
+            可使用 ``[^{{attachment:op-…}}]`` 或 ``!{{attachment:op-…}}!``
+            引用同一事务的附件上传 operation。
 
     返回：
         已入队的 operation ID、基础风险等级及“尚未执行”提示；执行前必须由
@@ -541,6 +562,8 @@ def jira_worklog_add_append(
         issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         time_spent: Jira 耗时表达式，例如 ``2h`` 或 ``1d 4h``。
         comment: 可选的工作说明。
+            可使用 ``[^{{attachment:op-…}}]`` 或 ``!{{attachment:op-…}}!``
+            引用同一事务的附件上传 operation。
         started: 可选的 ISO 格式开始时间；省略时由 Jira 使用当前时间。
 
     返回：
