@@ -7,10 +7,12 @@ import re
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 
+from core.operations.dependencies import (
+    collect_dependency_operation_ids,
+    pending_issue_group_id,
+)
 from core.operations.models import DependencyState, OperationRecord, QueueGroupKind
-from core.operations.rules.dependencies import dependency_operation_ids
-from core.operations.rules.identifiers import is_jira_issue_key, is_operation_id
-from core.operations.rules.issue_dependencies import ISSUE_PRODUCER_OPERATION_TYPES
+from core.operations.rules.identifiers import is_jira_issue_key
 
 
 CATEGORY_BY_OPERATION = {
@@ -78,12 +80,7 @@ def natural_issue_key(value: str) -> tuple[tuple[int, int | str], ...]:
 def operation_category(operation: OperationRecord) -> str:
     """Return the fixed in-group category for an operation."""
 
-    if (
-        operation.operation_type in ISSUE_PRODUCER_OPERATION_TYPES
-        and operation.operation_id == operation.issue_key
-    ):
-        return "producer"
-    if operation.operation_type in ISSUE_PRODUCER_OPERATION_TYPES:
+    if pending_issue_group_id(operation) == operation.operation_id:
         return "producer"
     return CATEGORY_BY_OPERATION.get(operation.operation_type, "other")
 
@@ -111,10 +108,9 @@ def automatic_queue(
     standalone: list[OperationRecord] = []
 
     for operation in operations:
-        if operation.operation_type in ISSUE_PRODUCER_OPERATION_TYPES:
-            pending_groups.setdefault(operation.operation_id, []).append(operation)
-        elif is_operation_id(operation.issue_key):
-            pending_groups.setdefault(operation.issue_key, []).append(operation)
+        pending_group = pending_issue_group_id(operation)
+        if pending_group is not None:
+            pending_groups.setdefault(pending_group, []).append(operation)
         elif (
             operation.operation_type in CATEGORY_BY_OPERATION
             and is_jira_issue_key(operation.issue_key)
@@ -181,7 +177,7 @@ def stable_dependency_order(
     graph = {
         operation.operation_id: {
             dependency_id
-            for dependency_id in dependency_operation_ids(operation)
+            for dependency_id in collect_dependency_operation_ids(operation)
             if dependency_id in operation_by_id
         }
         for operation in ordered

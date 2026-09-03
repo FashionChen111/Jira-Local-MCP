@@ -172,12 +172,17 @@ class ExecutionClaim(StrictFrozenModel):
 
 
 class DependencyState(StrictFrozenModel):
-    """Current lifecycle fact and typed result for a referenced operation."""
+    """Persisted lifecycle projection for one referenced operation.
+
+    ``operation_issue_key`` is the producer operation's Jira issue context.
+    Result fields mirror storage; consumers obtain a typed resolution through
+    the dependency package instead of inferring a type from nullable fields.
+    """
 
     operation_id: str
     operation_type: OperationType | None
     state: ProducerLifecycleState
-    issue_key: str | None = None
+    operation_issue_key: str | None = None
     new_issue_key: str | None = None
     attachment_result: AttachmentResult | None = None
 
@@ -201,12 +206,27 @@ class DependencyState(StrictFrozenModel):
         }
 
 
-# Kept as a source-compatible alias for integrations importing the old name.
-ProducerState = DependencyState
+class IssueDependencyResolution(StrictFrozenModel):
+    """A Jira issue key produced by a completed create or clone operation."""
+
+    kind: Literal["issue"] = "issue"
+    producer_operation_id: str
+    issue_key: str
+
+
+class AttachmentDependencyResolution(StrictFrozenModel):
+    """A Jira attachment identity produced by a completed upload operation."""
+
+    kind: Literal["attachment"] = "attachment"
+    producer_operation_id: str
+    attachment_result: AttachmentResult
+
+
+DependencyResolution = IssueDependencyResolution | AttachmentDependencyResolution
 
 
 class DependencyBindingResult(StrictFrozenModel):
-    """Aggregate effects of broadcasting one producer's resolved Jira key."""
+    """Active consumers changed by broadcasting one typed dependency result."""
 
     queue_operation_ids: tuple[str, ...] = ()
     staging_operation_ids: tuple[str, ...] = ()

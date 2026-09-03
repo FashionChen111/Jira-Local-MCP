@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from core.operations.repository import OperationRepository
 from core.operations.services.execution import ExecutionService
 from core.operations.services.query import QueryService
 from core.operations.services.queue import QueueService
@@ -34,13 +33,12 @@ def get_services() -> OperationServices:
     if _services is None:
         connection = open_database("operations")
         connection.close()
-        repository = OperationRepository()
         _services = OperationServices(
-            queue=QueueService(repository),
-            submission=SubmissionService(repository),
-            execution=ExecutionService(repository),
-            recovery=RecoveryService(repository),
-            query=QueryService(repository),
+            queue=QueueService(),
+            submission=SubmissionService(),
+            execution=ExecutionService(),
+            recovery=RecoveryService(),
+            query=QueryService(),
         )
     return _services
 

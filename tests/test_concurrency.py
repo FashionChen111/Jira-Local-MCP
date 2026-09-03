@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import config as config_mod
 from core.executing import lock as execution_lock
 from core.executing import worker as execution_worker
+from core.operations.models import OperationExecutionResult
 
 
 def _hold_slot(cfg, entered, release):
@@ -43,7 +44,7 @@ def _worker_process(cfg, start, calls):
         with calls.get_lock():
             calls.value += 1
         time.sleep(0.1)
-        return "ok", None
+        return OperationExecutionResult(summary="ok")
 
     worker.jira_executor.execute_operation = handler
     assert start.wait(10)
@@ -97,7 +98,7 @@ def test_threaded_workers_never_overlap_jira_writes(queue, monkeypatch):
         time.sleep(0.05)
         with lock:
             active -= 1
-        return "ok", None
+        return OperationExecutionResult(summary="ok")
     monkeypatch.setattr(execution_worker.jira_executor, "execute_operation", handler)
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda _value: execution_worker.process_once(), range(2)))
@@ -137,7 +138,7 @@ def test_submit_can_continue_while_an_operation_is_executing(queue, monkeypatch)
     def handler(_operation):
         entered.set()
         assert release.wait(10)
-        return "ok", None
+        return OperationExecutionResult(summary="ok")
 
     monkeypatch.setattr(execution_worker.jira_executor, "execute_operation", handler)
     thread = threading.Thread(target=execution_worker.process_once)
@@ -150,7 +151,11 @@ def test_submit_can_continue_while_an_operation_is_executing(queue, monkeypatch)
     release.set()
     thread.join(10)
     assert not thread.is_alive()
-    monkeypatch.setattr(execution_worker.jira_executor, "execute_operation", lambda _operation: ("ok", None))
+    monkeypatch.setattr(
+        execution_worker.jira_executor,
+        "execute_operation",
+        lambda _operation: OperationExecutionResult(summary="ok"),
+    )
     assert execution_worker.process_once() is True
     assert len(queue.query.read_execution_log(10)) == 2
 

@@ -5,8 +5,16 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from core.operations.dependencies import (
+    MaterializableDependency,
+    classify_dependency_state,
+    dependency_resolution_from_result,
+)
 from core.operations.models import (
+    AttachmentDependencyResolution,
     AttachmentResult,
+    DependencyState,
+    IssueDependencyResolution,
     OperationDraft,
     OperationExecutionResult,
     OperationRecord,
@@ -117,3 +125,58 @@ def test_attachment_result_is_one_strict_frozen_identity_value() -> None:
         AttachmentResult(id="", filename="a.jpg")
     with pytest.raises(ValidationError):
         attachment.filename = "changed.jpg"  # type: ignore[misc]
+
+
+def test_dependency_state_separates_operation_context_from_results() -> None:
+    state = DependencyState(
+        operation_id="op-" + "a" * 32,
+        operation_type="add_attachment",
+        state="queued",
+        operation_issue_key="PROJ-1",
+    )
+
+    assert state.operation_issue_key == "PROJ-1"
+    assert state.new_issue_key is None
+    assert state.attachment_result is None
+    with pytest.raises(ValidationError):
+        DependencyState.model_validate(
+            {
+                "operation_id": "op-" + "a" * 32,
+                "operation_type": "add_attachment",
+                "state": "queued",
+                "issue_key": "PROJ-1",
+            }
+        )
+
+
+def test_dependency_results_project_to_a_discriminated_resolution() -> None:
+    issue = dependency_resolution_from_result(
+        producer_operation_id="op-" + "a" * 32,
+        operation_type="create_issue",
+        successful=True,
+        new_issue_key="PROJ-10",
+        attachment_result=None,
+    )
+    attachment = dependency_resolution_from_result(
+        producer_operation_id="op-" + "b" * 32,
+        operation_type="add_attachment",
+        successful=True,
+        new_issue_key=None,
+        attachment_result=AttachmentResult(id="10", filename="a.jpg"),
+    )
+
+    assert isinstance(issue, IssueDependencyResolution)
+    assert issue.kind == "issue" and issue.issue_key == "PROJ-10"
+    assert isinstance(attachment, AttachmentDependencyResolution)
+    assert attachment.kind == "attachment"
+
+    decision = classify_dependency_state(
+        DependencyState(
+            operation_id=issue.producer_operation_id,
+            operation_type="create_issue",
+            state="success",
+            new_issue_key=issue.issue_key,
+        )
+    )
+    assert isinstance(decision, MaterializableDependency)
+    assert decision.resolution == issue

@@ -10,8 +10,19 @@ import pytest
 
 from core.executing import jira_executor
 from core.operations import AttachmentResult, StoreError
+from core.operations.dependencies import (
+    collect_dependency_operation_ids,
+    collect_dependency_references,
+    description_reference_paths,
+    validate_dependency_syntax,
+)
+from core.operations.errors import DependencyError
 from core.operations.models import OperationRecord
+from core.operations.rules.safety import OperationSafetyError, assert_safe_to_execute
+from core.operations.services import queue as queue_service_module
+from core.operations.services.queue import _snapshot_description_payload
 from core.storage.database import open_database
+from core.textfile_loader import TextFileError, snapshot_text_source
 
 
 def _attachment(queue, issue_key: str = "PROJ-1"):
@@ -140,6 +151,103 @@ def test_create_initial_description_allows_external_image_url(queue) -> None:
 
 
 @pytest.mark.parametrize(
+    "body",
+    [
+        "{{attachment:}}",
+        "[^{{attachment:op-short}}]",
+        "[{{attachment:op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}]",
+        "{{attachment:not-an-operation-id}}",
+    ],
+)
+def test_attachment_reference_syntax_rejects_malformed_placeholders(
+    queue, body: str
+) -> None:
+    with pytest.raises(StoreError, match="附件引用必须使用"):
+        queue.queue.enqueue(
+            "add_comment", "PROJ-1", {"body": body}, "invalid", "test"
+        )
+
+
+def test_reference_collection_is_non_throwing_and_syntax_is_explicit() -> None:
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="add_comment",
+        issue_key="PROJ-1",
+        risk_level="low",
+        payload={"body": "{{attachment:bad}}"},
+        description="invalid",
+        source="test",
+        created_at=1,
+    )
+
+    references = collect_dependency_references(operation)
+
+    assert collect_dependency_operation_ids(
+        operation, references=references
+    ) == ()
+    with pytest.raises(DependencyError, match="附件引用必须使用"):
+        validate_dependency_syntax(
+            operation,
+            allow_unresolved=True,
+            references=references,
+        )
+
+
+def test_execution_gate_rejects_unmaterialized_attachment_reference() -> None:
+    producer_id = "op-" + "b" * 32
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="add_comment",
+        issue_key="PROJ-1",
+        risk_level="low",
+        payload={"body": f"[^{{{{attachment:{producer_id}}}}}]"},
+        description="unmaterialized",
+        source="test",
+        created_at=1,
+    )
+
+    with pytest.raises(OperationSafetyError, match="执行前必须物化"):
+        assert_safe_to_execute(operation)
+
+
+def test_materialized_jira_attachment_text_passes_execution_syntax() -> None:
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="add_comment",
+        issue_key="PROJ-1",
+        risk_level="low",
+        payload={"body": "see [^a-1.jpg] and !a-1.jpg!"},
+        description="materialized",
+        source="test",
+        created_at=1,
+    )
+
+    validate_dependency_syntax(operation, allow_unresolved=False)
+
+
+def test_enqueue_reuses_one_dependency_reference_scan(
+    queue, monkeypatch
+) -> None:
+    scans = 0
+    original = queue_service_module.collect_dependency_references
+
+    def counted(operation: OperationRecord):
+        nonlocal scans
+        scans += 1
+        return original(operation)
+
+    monkeypatch.setattr(
+        queue_service_module, "collect_dependency_references", counted
+    )
+
+    queue.queue.enqueue(
+        "add_comment", "PROJ-1", {"body": "plain"}, "plain", "test"
+    )
+
+    assert scans == 1
+
+
+@pytest.mark.parametrize(
     "operation_type,container",
     [
         ("update_field", "fields"),
@@ -190,6 +298,141 @@ def test_create_description_file_is_snapshotted_and_path_removed(
     )
     assert operation.payload["description"] == "创建快照"
     assert "description_file" not in operation.payload
+
+
+def test_description_paths_share_attachment_reference_rules() -> None:
+    assert description_reference_paths("create_issue") == (
+        "description",
+        "extra_fields.description",
+    )
+    assert description_reference_paths("update_field") == (
+        "fields.description",
+    )
+    assert description_reference_paths("change_type") == (
+        "fields_mapping.description",
+    )
+    assert description_reference_paths("transition_issue") == (
+        "fields.description",
+    )
+
+
+def test_create_description_sources_are_normalized_by_priority(
+    queue, tmp_path
+) -> None:
+    file_source = tmp_path / "file-source.txt"
+    top_source = tmp_path / "top-source.txt"
+    nested_source = tmp_path / "nested-source.txt"
+    file_source.write_text("file wins", encoding="utf-8")
+    top_source.write_text("top wins", encoding="utf-8")
+    nested_source.write_text("nested wins", encoding="utf-8")
+    missing = tmp_path / "must-not-be-read.txt"
+
+    first_payload: dict[str, object] = {
+        "project_key": "PROJ",
+        "issue_type": "Task",
+        "summary": "file",
+        "description_file": str(file_source),
+        "description": {"file": str(missing)},
+        "extra_fields": {
+            "description": {"file": str(missing)},
+            "labels": ["kept"],
+        },
+    }
+    first = queue.queue.enqueue(
+        "create_issue", None, first_payload, "file", "test"
+    )
+    assert first.payload["description"] == "file wins"
+    assert "description_file" not in first.payload
+    assert first.payload["extra_fields"] == {"labels": ["kept"]}
+    assert first_payload["description_file"] == str(file_source)
+
+    second = queue.queue.enqueue(
+        "create_issue",
+        None,
+        {
+            "project_key": "PROJ",
+            "issue_type": "Task",
+            "summary": "top",
+            "description_file": None,
+            "description": {"file": str(top_source)},
+            "extra_fields": {"description": {"file": str(missing)}},
+        },
+        "top",
+        "test",
+    )
+    assert second.payload["description"] == "top wins"
+    assert second.payload["extra_fields"] == {}
+
+    third = queue.queue.enqueue(
+        "create_issue",
+        None,
+        {
+            "project_key": "PROJ",
+            "issue_type": "Task",
+            "summary": "nested",
+            "description": None,
+            "extra_fields": {
+                "description": {"file": str(nested_source)}
+            },
+        },
+        "nested",
+        "test",
+    )
+    assert third.payload["description"] == "nested wins"
+    assert third.payload["extra_fields"] == {}
+
+
+def test_description_snapshot_is_copy_on_write(tmp_path) -> None:
+    path = tmp_path / "description.txt"
+    path.write_text("snapshot", encoding="utf-8")
+    untouched = {"labels": ["same"]}
+    fields: dict[str, object] = {
+        "description": {"file": str(path)},
+        "summary": "same",
+    }
+    payload: dict[str, object] = {"fields": fields, "untouched": untouched}
+
+    snapped = _snapshot_description_payload("update_field", payload)
+
+    assert payload["fields"] is fields
+    assert fields["description"] == {"file": str(path)}
+    assert snapped is not payload
+    assert snapped["fields"] is not fields
+    assert snapped["untouched"] is untouched
+    assert isinstance(snapped["fields"], dict)
+    assert snapped["fields"]["description"] == "snapshot"
+
+
+def test_inline_description_snapshot_reuses_untouched_container() -> None:
+    fields: dict[str, object] = {"description": "inline", "summary": "same"}
+    payload: dict[str, object] = {"fields": fields}
+
+    snapped = _snapshot_description_payload("update_field", payload)
+
+    assert snapped is not payload
+    assert snapped["fields"] is fields
+
+
+def test_text_source_shape_is_strict_and_field_aware(tmp_path) -> None:
+    path = tmp_path / "source.txt"
+    path.write_text("text", encoding="utf-8")
+    assert snapshot_text_source("inline", field_path="fields.description") == "inline"
+    assert snapshot_text_source(None, field_path="fields.description") is None
+    assert snapshot_text_source(
+        {"file": str(path)}, field_path="fields.description"
+    ) == "text"
+
+    invalid_values: tuple[object, ...] = (
+        {"file": str(path), "extra": True},
+        {"file": ""},
+        {"file": 1},
+        {"file": "relative.txt"},
+        ["not", "text"],
+        False,
+    )
+    for value in invalid_values:
+        with pytest.raises(TextFileError, match="fields.description"):
+            snapshot_text_source(value, field_path="fields.description")
 
 
 def test_completed_upload_materializes_every_supported_content_path(queue) -> None:

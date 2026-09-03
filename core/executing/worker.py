@@ -6,7 +6,7 @@ import time
 import traceback
 
 from core.executing import jira_executor, lock as execution_lock
-from core.operations import OperationExecutionResult, get_services
+from core.operations import get_services
 from core.runtime_logger import get_logger, redact
 
 _POLL_SECONDS = 1.0
@@ -36,22 +36,7 @@ def process_once() -> bool:
             try:
                 if claim.preflight_error is not None:
                     raise RuntimeError(claim.preflight_error)
-                raw_result: object = jira_executor.execute_operation(
-                    claim.operation
-                )
-                if isinstance(raw_result, OperationExecutionResult):
-                    result = raw_result
-                elif isinstance(raw_result, tuple) and len(raw_result) == 2:
-                    # Preserve test/integration compatibility with the pre-2.3 tuple.
-                    summary, new_issue_key = raw_result
-                    result = OperationExecutionResult.model_validate(
-                        {
-                            "summary": summary,
-                            "new_issue_key": new_issue_key,
-                        }
-                    )
-                else:
-                    raise RuntimeError("Jira handler 返回了无效的执行结果")
+                result = jira_executor.execute_operation(claim.operation)
                 outcome = "success"
                 error = None
             except Exception as exc:

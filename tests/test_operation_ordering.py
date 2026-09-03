@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.operations.models import OperationRecord, ProducerState
+from core.operations.models import DependencyState, OperationRecord
 from core.operations.rules.ordering import (
     OrderingError,
     automatic_queue,
@@ -91,7 +91,7 @@ def test_pending_groups_use_producer_time_then_member_fallback() -> None:
         op("op-" + "e" * 32, "add_comment", missing_id, 15),
     ]
     states = {
-        item: ProducerState(
+        item: DependencyState(
             operation_id=item,
             operation_type="create_issue" if item != missing_id else None,
             state="queued" if item != missing_id else "unknown",

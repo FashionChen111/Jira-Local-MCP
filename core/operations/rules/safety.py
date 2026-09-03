@@ -9,9 +9,9 @@ from typing import Literal
 
 from pydantic import JsonValue
 
+from core.operations.dependencies import validate_dependency_syntax
 from core.operations.models import OperationDraft, OperationRecord, RiskLevel
 from core.operations.errors import DependencyError
-from core.operations.rules.issue_dependencies import validate_target_syntax
 
 
 ALLOWED_OPERATION_TYPES = frozenset(
@@ -58,7 +58,6 @@ class _PayloadShape:
 
     required: Mapping[str, _PayloadValueKind]
     optional: Mapping[str, _PayloadValueKind]
-    description_containers: tuple[str, ...] = ()
 
 
 _PAYLOAD_SHAPES: Mapping[str, _PayloadShape] = {
@@ -74,7 +73,6 @@ _PAYLOAD_SHAPES: Mapping[str, _PayloadShape] = {
             "assignee": "nullable_string",
             "extra_fields": "mapping",
         },
-        description_containers=("extra_fields",),
     ),
     "clone_issue": _PayloadShape(
         required={},
@@ -91,7 +89,6 @@ _PAYLOAD_SHAPES: Mapping[str, _PayloadShape] = {
     "change_type": _PayloadShape(
         required={"target_issue_type": "string"},
         optional={"fields_mapping": "mapping"},
-        description_containers=("fields_mapping",),
     ),
     "transition_issue": _PayloadShape(
         required={"transition_name": "string"},
@@ -99,12 +96,10 @@ _PAYLOAD_SHAPES: Mapping[str, _PayloadShape] = {
             "comment": "nullable_string",
             "fields": "mapping",
         },
-        description_containers=("fields",),
     ),
     "update_field": _PayloadShape(
         required={"fields": "nonempty_mapping"},
         optional={},
-        description_containers=("fields",),
     ),
     "update_custom_field": _PayloadShape(
         required={"custom_fields": "nonempty_mapping"},
@@ -189,17 +184,6 @@ def assert_valid_payload_shape(
                     f"{_PAYLOAD_KIND_LABELS[kind]}"
                 )
 
-    for container_name in shape.description_containers:
-        container = payload.get(container_name)
-        if not isinstance(container, dict) or "description" not in container:
-            continue
-        description = container["description"]
-        if description is not None and not isinstance(description, str):
-            raise OperationSafetyError(
-                f"{operation_type}.payload.{container_name}.description "
-                "必须是入队时固化的字符串或 null"
-            )
-
     if operation_type == "update_custom_field":
         custom_fields = payload["custom_fields"]
         if not isinstance(custom_fields, dict):
@@ -273,22 +257,6 @@ def validate_for_enqueue(draft: OperationDraft) -> tuple[RiskLevel, str]:
 
     assert_allowed_and_non_delete(draft.operation_type, draft.payload)
     assert_valid_payload_shape(draft.operation_type, draft.payload)
-    provisional = OperationRecord(
-        operation_id="op-00000000000000000000000000000000",
-        operation_type=draft.operation_type,
-        issue_key=draft.issue_key,
-        target_issue_key=draft.target_issue_key,
-        risk_level="low",
-        payload=draft.payload,
-        description=draft.description,
-        source=draft.source,
-        created_at=0,
-        attempt_no=1,
-    )
-    try:
-        validate_target_syntax(provisional, allow_operation_ids=True)
-    except DependencyError as exc:
-        raise OperationSafetyError(str(exc)) from exc
     return classify_base_risk(draft.operation_type, draft.payload)
 
 
@@ -297,7 +265,7 @@ def assert_safe_for_submit(operation: OperationRecord) -> None:
 
     assert_allowed_and_non_delete(operation.operation_type, operation.payload)
     try:
-        validate_target_syntax(operation, allow_operation_ids=True)
+        validate_dependency_syntax(operation, allow_unresolved=True)
     except DependencyError as exc:
         raise OperationSafetyError(str(exc)) from exc
 
@@ -332,6 +300,6 @@ def assert_safe_to_execute(operation: OperationRecord) -> None:
     assert_allowed_and_non_delete(operation.operation_type, operation.payload)
     assert_valid_payload_shape(operation.operation_type, operation.payload)
     try:
-        validate_target_syntax(operation, allow_operation_ids=False)
+        validate_dependency_syntax(operation, allow_unresolved=False)
     except DependencyError as exc:
         raise OperationSafetyError(str(exc)) from exc

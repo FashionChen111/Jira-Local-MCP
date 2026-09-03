@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from core.operations import repository
+from core.operations.dependencies import (
+    collect_dependency_operation_ids,
+    submission_block_reason,
+)
 from core.operations.errors import (
     ConfirmationRequired,
     ExecutionBlocked,
@@ -9,11 +14,7 @@ from core.operations.errors import (
     StoreError,
 )
 from core.operations.models import OperationRecord, RiskLevel
-from core.operations.repository import DatabaseConnection, OperationRepository
-from core.operations.rules.dependencies import (
-    dependency_operation_ids,
-    submission_block_reason,
-)
+from core.operations.repository import DatabaseConnection
 from core.operations.rules.ordering import (
     OrderingError,
     automatic_queue,
@@ -30,9 +31,6 @@ from core.storage.database import open_database, transaction, utc_ms
 class SubmissionService:
     """Own the only queue-to-staging authorization transition."""
 
-    def __init__(self, repository: OperationRepository) -> None:
-        self._repository = repository
-
     def _selection(
         self,
         connection: DatabaseConnection,
@@ -46,14 +44,14 @@ class SubmissionService:
             or len(operation_ids) != len(set(operation_ids))
         ):
             raise StoreError("提交 operation ID 必须为 1 至 1000 个且不得重复")
-        if self._repository.revision(connection, "queue") != expected_queue_revision:
+        if repository.revision(connection, "queue") != expected_queue_revision:
             raise RevisionConflict("队列已更新，请刷新后重新确认")
-        if self._repository.has_recovery_block(connection):
+        if repository.has_recovery_block(connection):
             raise ExecutionBlocked(
                 "存在不确定或冻结任务，处置完成前不能提交新任务"
             )
 
-        queue_operations = self._repository.queue_operations(connection)
+        queue_operations = repository.queue_operations(connection)
         operation_by_id = {
             operation.operation_id: operation for operation in queue_operations
         }
@@ -63,9 +61,11 @@ class SubmissionService:
         all_dependency_ids = {
             dependency_id
             for operation_id in operation_ids
-            for dependency_id in dependency_operation_ids(operation_by_id[operation_id])
+            for dependency_id in collect_dependency_operation_ids(
+                operation_by_id[operation_id]
+            )
         }
-        dependency_states = self._repository.dependency_states(
+        dependency_states = repository.dependency_states(
             connection, all_dependency_ids
         )
         display = automatic_queue(queue_operations, dependency_states).flattened()
@@ -81,7 +81,7 @@ class SubmissionService:
             reason = submission_block_reason(operation, dependency_states)
             if reason is not None:
                 raise StoreError(reason)
-            for dependency_id in dependency_operation_ids(operation):
+            for dependency_id in collect_dependency_operation_ids(operation):
                 state = dependency_states[dependency_id]
                 if state.state == "queued" and dependency_id not in selected_ids:
                     raise StoreError(
@@ -134,18 +134,18 @@ class SubmissionService:
                 operation_ids,
                 high_risk_confirmed,
             )
-            stage_base = self._repository.maximum_stage_order(connection)
+            stage_base = repository.maximum_stage_order(connection)
             submitted_at = utc_ms()
             for offset, operation in enumerate(selected, 1):
                 stage_order = stage_base + offset
-                self._repository.insert_staging(
+                repository.insert_staging(
                     connection,
                     operation,
                     stage_order=stage_order,
                     submission_risk_level=submission_risks[operation.operation_id],
                     submitted_at=submitted_at,
                 )
-                self._repository.append_event(
+                repository.append_event(
                     connection,
                     operation.operation_id,
                     "dequeue",
@@ -157,11 +157,11 @@ class SubmissionService:
                         ],
                     },
                 )
-            self._repository.delete_queue(
+            repository.delete_queue(
                 connection, [operation.operation_id for operation in selected]
             )
-            self._repository.bump_revisions(connection, "queue", "execution")
+            repository.bump_revisions(connection, "queue", "execution")
             return (
                 [operation.operation_id for operation in selected],
-                self._repository.revisions(connection),
+                repository.revisions(connection),
             )

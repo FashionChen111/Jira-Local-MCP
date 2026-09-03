@@ -5,7 +5,7 @@ import pytest
 
 from core.executing import jira_executor
 from core.executing import worker as execution_worker
-from core.operations.models import OperationRecord
+from core.operations.models import OperationExecutionResult, OperationRecord
 from core.operations.rules import safety as operation_safety
 from core.storage.database import open_database
 
@@ -20,7 +20,11 @@ def _stage(queue):
 
 def test_worker_executes_success_and_persists_history(queue, monkeypatch):
     operation = _stage(queue)
-    monkeypatch.setattr(execution_worker.jira_executor, "execute_operation", lambda task: ("done", None))
+    monkeypatch.setattr(
+        execution_worker.jira_executor,
+        "execute_operation",
+        lambda task: OperationExecutionResult(summary="done"),
+    )
     assert execution_worker.process_once() is True
     record = queue.query.read_execution_log(1)[0]
     assert record["operation_id"] == operation.operation_id
@@ -40,7 +44,11 @@ def test_worker_captures_jira_exception_as_failed(queue, monkeypatch):
 
 def test_result_transaction_failure_retains_executing(queue, monkeypatch):
     _stage(queue)
-    monkeypatch.setattr(execution_worker.jira_executor, "execute_operation", lambda task: ("done", None))
+    monkeypatch.setattr(
+        execution_worker.jira_executor,
+        "execute_operation",
+        lambda task: OperationExecutionResult(summary="done"),
+    )
     monkeypatch.setattr(queue.execution, "complete_execution", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("disk")))
     execution_worker.process_once()
     assert queue.query.get_state().execution.executing
@@ -59,7 +67,7 @@ def test_delete_defence_is_rechecked_by_executor(queue, monkeypatch):
     def should_not_execute(_task):
         nonlocal called
         called = True
-        return "bad", None
+        return OperationExecutionResult(summary="bad")
     monkeypatch.setitem(execution_worker.jira_executor._HANDLERS, "add_comment", should_not_execute)
     execution_worker.process_once()
     assert called is False
@@ -113,7 +121,7 @@ def test_unresolved_operation_id_never_reaches_jira_handler(queue, monkeypatch):
     def should_not_execute(_task):
         nonlocal called
         called = True
-        return "bad", None
+        return OperationExecutionResult(summary="bad")
 
     monkeypatch.setitem(
         execution_worker.jira_executor._HANDLERS,

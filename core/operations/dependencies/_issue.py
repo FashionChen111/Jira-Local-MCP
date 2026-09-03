@@ -1,29 +1,31 @@
-"""Pure rules for direct operation-to-operation Jira issue references."""
+"""Pure rules for explicit operation-to-operation Jira issue references."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Literal
 
+from core.operations.dependencies._types import IssueReference
 from core.operations.errors import DependencyError
-from core.operations.models import DependencyState, OperationRecord
+from core.operations.models import (
+    DependencyState,
+    IssueDependencyResolution,
+    OperationRecord,
+    OperationType,
+)
 from core.operations.rules.identifiers import is_jira_issue_key, is_operation_id
 
 
-ISSUE_PRODUCER_OPERATION_TYPES = frozenset({"create_issue", "clone_issue"})
+_PRODUCER_OPERATION_TYPES = frozenset({"create_issue", "clone_issue"})
 
 
-@dataclass(frozen=True)
-class IssueReference:
-    """One explicit top-level target backed by an issue-producing operation."""
+def is_producer(operation_type: OperationType | None) -> bool:
+    """Return whether an operation type produces a new Jira issue key."""
 
-    operation_id: str
-    path: Literal["issue_key", "target_issue_key"]
+    return operation_type in _PRODUCER_OPERATION_TYPES
 
 
-def references(operation: OperationRecord) -> tuple[IssueReference, ...]:
-    """Return issue references in stable top-level field order."""
+def collect_references(operation: OperationRecord) -> tuple[IssueReference, ...]:
+    """Collect valid operation IDs from supported top-level issue targets."""
 
     result: list[IssueReference] = []
     if is_operation_id(operation.issue_key):
@@ -38,14 +40,14 @@ def references(operation: OperationRecord) -> tuple[IssueReference, ...]:
     return tuple(result)
 
 
-def validate_target_syntax(
-    operation: OperationRecord, *, allow_operation_ids: bool
+def validate_reference_syntax(
+    operation: OperationRecord, *, allow_unresolved: bool
 ) -> None:
-    """Validate the two explicit targets for the operation lifecycle."""
+    """Assert target applicability and lifecycle-specific Jira key syntax."""
 
     def valid_target(value: str | None) -> bool:
         return is_jira_issue_key(value) or (
-            allow_operation_ids and is_operation_id(value)
+            allow_unresolved and is_operation_id(value)
         )
 
     if operation.operation_type == "create_issue":
@@ -57,7 +59,7 @@ def validate_target_syntax(
     elif not valid_target(operation.issue_key):
         expected = (
             "真实 Jira Key 或待创建 operation ID"
-            if allow_operation_ids
+            if allow_unresolved
             else "真实 Jira Key"
         )
         raise DependencyError(
@@ -68,7 +70,7 @@ def validate_target_syntax(
         if not valid_target(operation.target_issue_key):
             expected = (
                 "真实 Jira Key 或待创建 operation ID"
-                if allow_operation_ids
+                if allow_unresolved
                 else "真实 Jira Key"
             )
             raise DependencyError(
@@ -80,33 +82,48 @@ def validate_target_syntax(
         )
 
 
-def validate_references(
-    operation: OperationRecord,
+def validate_reference_contract(
+    references: tuple[IssueReference, ...],
     states: Mapping[str, DependencyState],
-) -> dict[str, str]:
-    """Validate referenced issue producers and return available Jira keys."""
+) -> None:
+    """Assert existence, capability, lifecycle, and result integrity."""
 
-    resolved: dict[str, str] = {}
-    for reference in references(operation):
+    for reference in references:
         producer_id = reference.operation_id
         state = states.get(producer_id)
         if state is None or state.state == "unknown":
             raise DependencyError(f"引用的 operation 不存在：{producer_id}")
-        if state.operation_type not in ISSUE_PRODUCER_OPERATION_TYPES:
+        if not is_producer(state.operation_type):
             raise DependencyError(
                 f"引用的 operation 不是 create_issue/clone_issue：{producer_id}"
             )
-        if state.state == "success":
-            if not is_jira_issue_key(state.new_issue_key):
-                raise DependencyError(
-                    f"引用的事务生产者缺少有效 Jira Key：{producer_id}"
-                )
-            resolved[producer_id] = state.new_issue_key
-            continue
-        if not state.active:
+        if state.state == "success" and not is_jira_issue_key(
+            state.new_issue_key
+        ):
+            raise DependencyError(
+                f"引用的事务生产者缺少有效 Jira Key：{producer_id}"
+            )
+        if state.state != "success" and not state.active:
             raise DependencyError(
                 f"引用的事务生产者已处于不可用状态 {state.state}：{producer_id}"
             )
+
+
+def collect_resolutions(
+    references: tuple[IssueReference, ...],
+    states: Mapping[str, DependencyState],
+) -> dict[str, str]:
+    """Collect available Jira keys after the reference contract is validated."""
+
+    resolved: dict[str, str] = {}
+    for reference in references:
+        state = states.get(reference.operation_id)
+        if (
+            state is not None
+            and state.state == "success"
+            and is_jira_issue_key(state.new_issue_key)
+        ):
+            resolved[reference.operation_id] = state.new_issue_key
     return resolved
 
 
@@ -134,18 +151,18 @@ def materialize_references(
     )
 
 
-def block_reason(
-    operation: OperationRecord,
+def submission_block_reason(
+    references: tuple[IssueReference, ...],
     states: Mapping[str, DependencyState],
 ) -> str | None:
-    """Describe the first issue dependency state preventing submission."""
+    """Describe the first issue dependency preventing submission."""
 
-    for reference in references(operation):
+    for reference in references:
         operation_id = reference.operation_id
         state = states.get(operation_id)
         if state is None or state.state == "unknown":
             return f"依赖的 operation 不存在：{operation_id}"
-        if state.operation_type not in ISSUE_PRODUCER_OPERATION_TYPES:
+        if not is_producer(state.operation_type):
             return f"依赖的 operation 不是创建/克隆事务：{operation_id}"
         if state.state in {"failed", "dependency_failed", "abandoned"}:
             return f"依赖的创建/克隆事务已失败：{operation_id}"
@@ -155,4 +172,49 @@ def block_reason(
             state.new_issue_key
         ):
             return f"依赖的创建/克隆事务缺少 Jira Key：{operation_id}"
+    return None
+
+
+def comparable_target(
+    value: str | None, states: Mapping[str, DependencyState]
+) -> str | None:
+    """Return a concrete key when available, otherwise preserve the target ID."""
+
+    if is_jira_issue_key(value):
+        return value
+    if is_operation_id(value):
+        state = states.get(value)
+        if (
+            state is not None
+            and is_producer(state.operation_type)
+            and is_jira_issue_key(state.new_issue_key)
+        ):
+            return state.new_issue_key
+    return value
+
+
+def resolution_from_state(
+    state: DependencyState,
+) -> IssueDependencyResolution | None:
+    """Project a valid successful state to its typed issue resolution."""
+
+    if (
+        is_producer(state.operation_type)
+        and state.state == "success"
+        and is_jira_issue_key(state.new_issue_key)
+    ):
+        return IssueDependencyResolution(
+            producer_operation_id=state.operation_id,
+            issue_key=state.new_issue_key,
+        )
+    return None
+
+
+def pending_group_id(operation: OperationRecord) -> str | None:
+    """Return the pending-issue group ID implied by one operation."""
+
+    if is_producer(operation.operation_type):
+        return operation.operation_id
+    if is_operation_id(operation.issue_key):
+        return operation.issue_key
     return None

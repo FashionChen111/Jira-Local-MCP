@@ -8,6 +8,8 @@ from pathlib import Path
 
 OPERATIONS = Path("core/operations")
 RULES = OPERATIONS / "rules"
+DEPENDENCIES = OPERATIONS / "dependencies"
+REPOSITORY = OPERATIONS / "repository"
 SERVICES = OPERATIONS / "services"
 EXECUTING = Path("core/executing")
 FORBIDDEN_PREFIXES = (
@@ -34,7 +36,11 @@ def imports(path: Path) -> set[str]:
 
 
 def test_models_and_rules_do_not_depend_on_outer_layers() -> None:
-    pure_modules = (OPERATIONS / "models.py", *sorted(RULES.glob("*.py")))
+    pure_modules = (
+        OPERATIONS / "models.py",
+        *sorted(RULES.glob("*.py")),
+        *sorted(DEPENDENCIES.glob("*.py")),
+    )
     for path in pure_modules:
         imported = imports(path)
         assert not {
@@ -44,13 +50,54 @@ def test_models_and_rules_do_not_depend_on_outer_layers() -> None:
         }, path
 
 
-def test_repository_is_only_operations_module_importing_sqlite3() -> None:
+def test_only_repository_package_imports_sqlite3() -> None:
     sqlite_modules = {
         path.relative_to(OPERATIONS).as_posix()
         for path in OPERATIONS.rglob("*.py")
         if "sqlite3" in imports(path)
     }
-    assert sqlite_modules == {"repository.py"}
+    assert sqlite_modules
+    assert all(Path(name).parent == Path("repository") for name in sqlite_modules)
+
+
+def test_dependency_private_modules_do_not_leak_outside_package() -> None:
+    for path in OPERATIONS.rglob("*.py"):
+        if path.is_relative_to(DEPENDENCIES):
+            continue
+        assert not {
+            name
+            for name in imports(path)
+            if name.startswith("core.operations.dependencies._")
+        }, path
+
+
+def test_services_only_use_repository_package_api() -> None:
+    for path in SERVICES.glob("*.py"):
+        assert not {
+            name
+            for name in imports(path)
+            if name.startswith("core.operations.repository._")
+        }, path
+
+
+def test_services_do_not_branch_on_concrete_dependency_types() -> None:
+    forbidden_terms = (
+        "ISSUE_PRODUCER_OPERATION_TYPES",
+        "ATTACHMENT_PRODUCER_OPERATION_TYPES",
+        "IssueDependencyResolution",
+        "AttachmentDependencyResolution",
+        "broadcast_issue_resolution",
+        "broadcast_attachment_resolution",
+    )
+    for filename in ("execution.py", "recovery.py"):
+        source = (SERVICES / filename).read_text(encoding="utf-8")
+        assert not [term for term in forbidden_terms if term in source]
+
+
+def test_repository_package_has_no_stateless_compatibility_class() -> None:
+    from core.operations import repository
+
+    assert not hasattr(repository, "OperationRepository")
 
 
 def test_services_do_not_call_or_import_sibling_services() -> None:
@@ -117,6 +164,7 @@ def test_removed_internal_modules_and_old_runtime_do_not_exist() -> None:
     ):
         assert not (OPERATIONS / filename).exists()
     assert not Path("core/execution").exists()
+    assert not (OPERATIONS / "repository.py").exists()
 
 
 def test_public_packages_import_without_cycles() -> None:

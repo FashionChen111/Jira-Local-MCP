@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from core.operations import ConfirmationRequired, RevisionConflict, StoreError
-from core.operations.repository import OperationRepository
+from core.operations import repository
 from core.storage.database import open_database, transaction
 
 
@@ -41,8 +41,6 @@ def test_schema_pragmas_and_revisions_initialized(queue) -> None:
 def test_repository_terminalizes_one_dependency_failure(queue) -> None:
     operation = enqueue_comment(queue, "PROJ-1")
     queue.submission.submit(1, [operation.operation_id], False)
-    repository = OperationRepository()
-
     with transaction() as connection:
         staging = repository.staging_record(connection, operation.operation_id)
         assert staging is not None
@@ -79,8 +77,6 @@ def test_repository_terminalizes_one_dependency_failure(queue) -> None:
 def test_dependency_failure_transition_rolls_back_with_outer_transaction(queue) -> None:
     operation = enqueue_comment(queue, "PROJ-1")
     queue.submission.submit(1, [operation.operation_id], False)
-    repository = OperationRepository()
-
     with pytest.raises(RuntimeError, match="rollback dependency transition"):
         with transaction() as connection:
             staging = repository.staging_record(connection, operation.operation_id)

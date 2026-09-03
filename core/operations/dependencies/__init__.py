@@ -1,0 +1,53 @@
+"""Stable public boundary for pure operation dependency rules."""
+
+from core.operations.dependencies._orchestration import (
+    classify_dependency_state,
+    collect_dependency_operation_ids,
+    collect_dependency_references,
+    collect_dependency_resolutions,
+    dependency_resolution_events,
+    dependency_resolution_from_result,
+    dependency_resolution_reference_paths,
+    dependency_state_map,
+    description_reference_paths,
+    materialize_dependency_references,
+    materialize_dependency_resolution,
+    pending_issue_group_id,
+    submission_block_reason,
+    validate_dependency_contract,
+    validate_dependency_syntax,
+)
+from core.operations.dependencies._types import (
+    DependencyReferences,
+    DependencyResolutionEvent,
+    DependencyResolutions,
+    DependencyStateDecision,
+    MaterializableDependency,
+    UnavailableDependency,
+    WaitingDependency,
+)
+
+__all__ = [
+    "DependencyReferences",
+    "DependencyResolutionEvent",
+    "DependencyResolutions",
+    "DependencyStateDecision",
+    "MaterializableDependency",
+    "UnavailableDependency",
+    "WaitingDependency",
+    "classify_dependency_state",
+    "collect_dependency_operation_ids",
+    "collect_dependency_references",
+    "collect_dependency_resolutions",
+    "dependency_resolution_events",
+    "dependency_resolution_from_result",
+    "dependency_resolution_reference_paths",
+    "dependency_state_map",
+    "description_reference_paths",
+    "materialize_dependency_references",
+    "materialize_dependency_resolution",
+    "pending_issue_group_id",
+    "submission_block_reason",
+    "validate_dependency_contract",
+    "validate_dependency_syntax",
+]

@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 from pydantic import JsonValue
 
-from core.operations.rules.dependencies import DependencyError, validate_target_syntax
+from core.operations.dependencies import validate_dependency_syntax
+from core.operations.errors import DependencyError
 from core.operations.models import OperationDraft, OperationRecord
 from core.operations.rules.safety import (
     OperationSafetyError,
@@ -57,13 +58,15 @@ def record(
 @pytest.mark.parametrize("key", [None, "$TASK{x}", "{new}", "bad", "PROJ-x"])
 def test_modify_requires_real_key_or_server_operation_id(key: str | None) -> None:
     with pytest.raises(DependencyError):
-        validate_target_syntax(record("add_comment", key), allow_operation_ids=True)
+        validate_dependency_syntax(
+            record("add_comment", key), allow_unresolved=True
+        )
 
 
 def test_clone_source_is_always_real_and_link_target_is_explicit() -> None:
     operation_id = "op-" + "b" * 32
     with pytest.raises(DependencyError, match="clone_issue"):
-        validate_target_syntax(
+        validate_dependency_syntax(
             OperationRecord(
                 operation_id="op-" + "a" * 32,
                 operation_type="clone_issue",
@@ -74,16 +77,16 @@ def test_clone_source_is_always_real_and_link_target_is_explicit() -> None:
                 source="test",
                 created_at=1,
             ),
-            allow_operation_ids=True,
+            allow_unresolved=True,
         )
-    validate_target_syntax(
+    validate_dependency_syntax(
         record("add_issuelink", "PROJ-1", operation_id),
-        allow_operation_ids=True,
+        allow_unresolved=True,
     )
     with pytest.raises(DependencyError, match="target_issue_key"):
-        validate_target_syntax(
+        validate_dependency_syntax(
             record("add_comment", "PROJ-1", "PROJ-2"),
-            allow_operation_ids=True,
+            allow_unresolved=True,
         )
 
 
@@ -198,11 +201,10 @@ def test_payload_shape_rejects_only_handler_relevant_shape_errors(
         ),
     ],
 )
-def test_payload_shape_requires_materialized_description_snapshots(
+def test_payload_shape_does_not_model_nested_jira_field_values(
     operation_type: str, payload: dict[str, JsonValue]
 ) -> None:
-    with pytest.raises(OperationSafetyError, match="入队时固化"):
-        assert_valid_payload_shape(operation_type, payload)
+    assert_valid_payload_shape(operation_type, payload)
 
 
 def test_enqueue_boundary_reuses_payload_shape_validation() -> None:
