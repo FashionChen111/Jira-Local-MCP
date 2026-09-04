@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Literal
 
 from core.operations.dependencies import _issue
-from core.operations.dependencies._types import (
-    AttachmentReference,
-    AttachmentReferenceInspection,
-)
 from core.operations.errors import DependencyError
 from core.operations.models import (
     AttachmentDependencyResolution,
@@ -29,7 +27,7 @@ _ANY_PLACEHOLDER = re.compile(r"\{\{attachment:[^{}]*\}\}")
 _JIRA_ATTACHMENT_LINK = re.compile(r"\[\^[^\]\r\n]+\]")
 _JIRA_IMAGE = re.compile(r"!([^!\r\n]+)!")
 _REFERENCE_TEXT_PATHS: Mapping[str, tuple[str, ...]] = {
-    "create_issue": ("description", "extra_fields.description"),
+    "create_issue": ("description",),
     "change_type": ("fields_mapping.description",),
     "transition_issue": ("fields.description", "comment"),
     "update_field": ("fields.description",),
@@ -38,43 +36,63 @@ _REFERENCE_TEXT_PATHS: Mapping[str, tuple[str, ...]] = {
 }
 
 
+@dataclass(frozen=True)
+class AttachmentReference:
+    """One attachment producer reference embedded in a Jira text field."""
+
+    referenced_operation_id: str
+    path: str
+    render_kind: Literal["link", "image"]
+
+
+@dataclass(frozen=True)
+class AttachmentReferenceInspection:
+    """One scan result containing references and syntax diagnostics."""
+
+    references: tuple[AttachmentReference, ...]
+    invalid_placeholder_paths: tuple[str, ...]
+    jira_attachment_markup_paths: tuple[str, ...]
+
+
 def is_producer(operation_type: OperationType | None) -> bool:
     """Return whether an operation type produces a Jira attachment result."""
 
     return operation_type in _PRODUCER_OPERATION_TYPES
 
 
-def reference_text_paths(operation_type: str) -> tuple[str, ...]:
+def supported_reference_text_paths(operation_type: str) -> tuple[str, ...]:
     """Return the supported Jira text paths for an operation type."""
 
     return _REFERENCE_TEXT_PATHS.get(operation_type, ())
 
 
-def description_paths(operation_type: str) -> tuple[str, ...]:
+def attachment_reference_description_paths(
+    operation_type: str,
+) -> tuple[str, ...]:
     """Return supported description paths from the shared text-path rules."""
 
     return tuple(
         path
-        for path in reference_text_paths(operation_type)
+        for path in supported_reference_text_paths(operation_type)
         if path == "description" or path.endswith(".description")
     )
 
 
-def _reference_text_fields(
+def _reference_text_values(
     operation: OperationRecord,
 ) -> tuple[tuple[str, object], ...]:
     payload = operation.payload
-    items: list[tuple[str, object]] = []
-    for path in reference_text_paths(operation.operation_type):
+    values: list[tuple[str, object]] = []
+    for path in supported_reference_text_paths(operation.operation_type):
         if "." not in path:
             if path in payload:
-                items.append((path, payload[path]))
+                values.append((path, payload[path]))
             continue
         container_name, field_name = path.split(".", 1)
         container = payload.get(container_name)
         if isinstance(container, dict) and field_name in container:
-            items.append((path, container[field_name]))
-    return tuple(items)
+            values.append((path, container[field_name]))
+    return tuple(values)
 
 
 def _contains_jira_attachment_markup(value: object) -> bool:
@@ -94,7 +112,7 @@ def inspect_references(operation: OperationRecord) -> AttachmentReferenceInspect
     references: list[AttachmentReference] = []
     invalid_paths: list[str] = []
     jira_markup_paths: list[str] = []
-    for path, value in _reference_text_fields(operation):
+    for path, value in _reference_text_values(operation):
         if not isinstance(value, str):
             continue
         for match in _REFERENCE_PATTERN.finditer(value):
@@ -102,7 +120,7 @@ def inspect_references(operation: OperationRecord) -> AttachmentReferenceInspect
             image_id = match.group("image")
             references.append(
                 AttachmentReference(
-                    operation_id=link_id or image_id,
+                    referenced_operation_id=link_id or image_id,
                     path=path,
                     render_kind="link" if link_id else "image",
                 )
@@ -148,13 +166,13 @@ def validate_reference_syntax(
         )
 
 
-def _same_issue(
+def _shares_issue_context(
     operation: OperationRecord,
     state: DependencyState,
     states: Mapping[str, DependencyState],
 ) -> bool:
-    consumer_target = _issue.comparable_target(operation.issue_key, states)
-    producer_target = _issue.comparable_target(
+    consumer_target = _issue.comparable_issue_target(operation.issue_key, states)
+    producer_target = _issue.comparable_issue_target(
         state.operation_issue_key, states
     )
     return (
@@ -164,6 +182,52 @@ def _same_issue(
     )
 
 
+def reference_problem(
+    operation: OperationRecord,
+    references: tuple[AttachmentReference, ...],
+    states: Mapping[str, DependencyState],
+    *,
+    allow_available_resolution: bool,
+) -> str | None:
+    """Return the first attachment-reference problem for one lifecycle."""
+
+    for reference in references:
+        referenced_operation_id = reference.referenced_operation_id
+        state = states.get(referenced_operation_id)
+        if state is None or state.state == "unknown":
+            return (
+                "引用的附件 operation 不存在："
+                f"{referenced_operation_id}"
+            )
+        if not is_producer(state.operation_type):
+            return (
+                "引用的 operation 不是 add_attachment："
+                f"{referenced_operation_id}"
+            )
+        if not _shares_issue_context(operation, state, states):
+            return (
+                "附件引用与正文 operation 不属于同一 Jira 事务："
+                f"{referenced_operation_id}"
+            )
+        if state.state == "success":
+            if state.attachment_result is None:
+                return (
+                    "引用的附件生产者缺少上传结果："
+                    f"{referenced_operation_id}"
+                )
+            if not allow_available_resolution:
+                return (
+                    "依赖的附件上传已成功但引用尚未物化，数据不一致："
+                    f"{referenced_operation_id}"
+                )
+        elif not state.active:
+            return (
+                "引用的附件生产者已处于不可用状态 "
+                f"{state.state}：{referenced_operation_id}"
+            )
+    return None
+
+
 def validate_reference_contract(
     operation: OperationRecord,
     references: tuple[AttachmentReference, ...],
@@ -171,123 +235,88 @@ def validate_reference_contract(
 ) -> None:
     """Assert producer existence, capability, issue context, and lifecycle."""
 
-    for reference in references:
-        producer_id = reference.operation_id
-        state = states.get(producer_id)
-        if state is None or state.state == "unknown":
-            raise DependencyError(f"引用的附件 operation 不存在：{producer_id}")
-        if not is_producer(state.operation_type):
-            raise DependencyError(
-                f"引用的 operation 不是 add_attachment：{producer_id}"
-            )
-        if not _same_issue(operation, state, states):
-            raise DependencyError(
-                f"附件引用与正文 operation 不属于同一 Jira 事务：{producer_id}"
-            )
-        if state.state == "success" and state.attachment_result is None:
-            raise DependencyError(
-                f"引用的附件生产者缺少上传结果：{producer_id}"
-            )
-        if state.state != "success" and not state.active:
-            raise DependencyError(
-                f"引用的附件生产者已处于不可用状态 {state.state}：{producer_id}"
-            )
+    problem = reference_problem(
+        operation,
+        references,
+        states,
+        allow_available_resolution=True,
+    )
+    if problem is not None:
+        raise DependencyError(problem)
 
 
-def collect_resolutions(
-    references: tuple[AttachmentReference, ...],
-    states: Mapping[str, DependencyState],
-) -> dict[str, AttachmentResult]:
-    """Collect available upload results after contract validation."""
-
-    resolved: dict[str, AttachmentResult] = {}
-    for reference in references:
-        state = states.get(reference.operation_id)
-        if (
-            state is not None
-            and state.state == "success"
-            and state.attachment_result is not None
-        ):
-            resolved[reference.operation_id] = state.attachment_result
-    return resolved
-
-
-def _replace_payload_text(
-    operation: OperationRecord, path: str, value: str
+def _replace_payload_texts(
+    operation: OperationRecord,
+    replacements: Mapping[str, str],
 ) -> OperationRecord:
-    data = operation.model_dump(mode="python")
+    data = operation.model_dump(
+        mode="python", include=set(OperationRecord.model_fields)
+    )
     payload = data["payload"]
     if not isinstance(payload, dict):
         raise DependencyError("operation payload 必须是对象")
-    if "." in path:
-        container_name, field_name = path.split(".", 1)
-        container = payload.get(container_name)
-        if not isinstance(container, dict):
-            raise DependencyError(f"附件引用路径不存在：{path}")
-        copied = dict(container)
-        copied[field_name] = value
-        payload[container_name] = copied
-    else:
-        payload[path] = value
+    for path, value in replacements.items():
+        if "." in path:
+            container_name, field_name = path.split(".", 1)
+            container = payload.get(container_name)
+            if not isinstance(container, dict):
+                raise DependencyError(f"附件引用路径不存在：{path}")
+            copied_container = dict(container)
+            copied_container[field_name] = value
+            payload[container_name] = copied_container
+        else:
+            payload[path] = value
     data["payload"] = payload
     return OperationRecord.model_validate(data)
 
 
 def materialize_references(
     operation: OperationRecord,
-    resolved_attachments: Mapping[str, AttachmentResult],
-) -> OperationRecord:
-    """Replace attachment placeholders with Jira-native filename syntax."""
+    attachment_results_by_producer: Mapping[str, AttachmentResult],
+) -> tuple[OperationRecord, tuple[tuple[str, tuple[str, ...]], ...]]:
+    """Replace attachment placeholders and report actual producer paths."""
 
-    result = operation
-    for path, value in _reference_text_fields(operation):
+    if not attachment_results_by_producer:
+        return operation, ()
+
+    replacements: dict[str, str] = {}
+    paths_by_producer: dict[str, list[str]] = {}
+    for path, value in _reference_text_values(operation):
         if not isinstance(value, str):
             continue
 
         def replacement(match: re.Match[str]) -> str:
-            operation_id = match.group("link") or match.group("image")
-            attachment = resolved_attachments.get(operation_id)
-            if attachment is None:
+            referenced_operation_id = match.group("link") or match.group("image")
+            attachment_result = attachment_results_by_producer.get(
+                referenced_operation_id
+            )
+            if attachment_result is None:
                 return match.group(0)
+            producer_paths = paths_by_producer.setdefault(
+                referenced_operation_id, []
+            )
+            if path not in producer_paths:
+                producer_paths.append(path)
             if match.group("link"):
-                return f"[^{attachment.filename}]"
-            return f"!{attachment.filename}!"
+                return f"[^{attachment_result.filename}]"
+            return f"!{attachment_result.filename}!"
 
         materialized = _REFERENCE_PATTERN.sub(replacement, value)
         if materialized != value:
-            result = _replace_payload_text(result, path, materialized)
-    return result
+            replacements[path] = materialized
 
-
-def submission_block_reason(
-    operation: OperationRecord,
-    inspection: AttachmentReferenceInspection,
-    states: Mapping[str, DependencyState],
-) -> str | None:
-    """Describe the first attachment dependency preventing submission."""
-
-    try:
-        validate_reference_syntax(
-            operation, inspection, allow_unresolved=True
+    if not replacements:
+        return operation, ()
+    materialized_operation = _replace_payload_texts(operation, replacements)
+    changes = tuple(
+        (
+            producer_operation_id,
+            tuple(paths_by_producer[producer_operation_id]),
         )
-    except DependencyError as exc:
-        return str(exc)
-    for reference in inspection.references:
-        operation_id = reference.operation_id
-        state = states.get(operation_id)
-        if state is None or state.state == "unknown":
-            return f"依赖的附件 operation 不存在：{operation_id}"
-        if not is_producer(state.operation_type):
-            return f"依赖的 operation 不是附件上传：{operation_id}"
-        if not _same_issue(operation, state, states):
-            return f"依赖的附件与正文不属于同一 Jira 事务：{operation_id}"
-        if state.state in {"failed", "dependency_failed", "abandoned"}:
-            return f"依赖的附件上传已失败：{operation_id}"
-        if state.state == "indeterminate":
-            return f"依赖的附件上传结果待人工处置：{operation_id}"
-        if state.state == "success" and state.attachment_result is None:
-            return f"依赖的附件上传缺少结果：{operation_id}"
-    return None
+        for producer_operation_id in attachment_results_by_producer
+        if producer_operation_id in paths_by_producer
+    )
+    return materialized_operation, changes
 
 
 def resolution_from_state(

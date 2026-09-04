@@ -265,14 +265,14 @@ def jira_issue_create_append(
         project_key: Jira 项目 Key。
         issue_type: 事务类型名称，例如 ``Bug``、``Task`` 或 ``Story``。
         summary: 事务标题。
-        description: 可选的内联事务描述；未提供文件时优先于
-            ``extra_fields.description``。
+        description: 可选的内联事务描述；未提供文件时使用该值。
         description_file: 可选的本地 ``.txt`` 文件绝对路径；其内容拥有最高
             优先级，并在入队时固化为文本快照。
         priority: 可选的 Jira 优先级名称。
         assignee: 可选的 Jira Server/Data Center 经办人用户名。
-        extra_fields: 可选的其他 Jira 字段映射；其中的 ``description`` 仅在
-            上述两个来源均未提供有效内容时采用，并会归一化为专用字段。
+        extra_fields: 可选的其他 Jira 字段映射。不得包含已有专用参数负责的
+            ``project``、``issuetype``、``summary``、``description``、
+            ``priority`` 或 ``assignee``；这些字段必须使用对应顶层参数。
 
         初始 description 不接受 Jira 本地附件引用。需要引用附件时，应先创建
         事务，再上传附件，最后通过字段更新 Tool 设置 description。

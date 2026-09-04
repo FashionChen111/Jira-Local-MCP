@@ -74,7 +74,7 @@ Jira Local MCP 是连接通用 Agent 与 Jira Server/Data Center 的本地 MCP �
 
 | Tool | Operation | 当前执行能力 |
 | --- | --- | --- |
-| `jira_issue_create_append` | `create_issue` | 创建事务；description 按文件、顶层内联值、`extra_fields.description` 的优先级在入队时归一化为内容快照，初始 description 禁止附件引用。 |
+| `jira_issue_create_append` | `create_issue` | 创建事务；description 按文件、顶层内联值的优先级在入队时归一化为内容快照，`extra_fields` 拒绝覆盖专用字段，初始 description 禁止附件引用。 |
 | `jira_issue_clone_append` | `clone_issue` | 克隆来源事务的核心字段，可选复制附件；子任务选项当前记录为需人工核对。 |
 | `jira_issue_move_append` | `move_issue` | 可进入队列和审核；当前 Server/DC REST executor 会明确记录“不支持移动”的失败结果。 |
 | `jira_issue_type_change_append` | `change_type` | 更新事务类型；字段映射中的 description 支持文件快照和附件 operation 引用。 |

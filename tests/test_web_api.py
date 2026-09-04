@@ -1,6 +1,8 @@
 """Authenticated strict Web API and HTTP security behavior."""
 from __future__ import annotations
 
+from core.operations.dependencies import orchestration as dependency_orchestration
+from core.operations.models import OperationRecord
 from web import app as web_app
 
 
@@ -121,6 +123,38 @@ def test_submit_revalidates_revision_after_ping(web_client, queue, monkeypatch):
     assert response.status_code == 409
     assert response.json()["code"] == "revision_conflict"
     assert queue.query.total_active() == 2
+
+
+def test_submit_inspects_once_in_each_required_consistency_boundary(
+    web_client, queue, monkeypatch
+) -> None:
+    operation = _comment(queue)
+    inspected_operation_ids: list[str] = []
+    original = dependency_orchestration.inspect_dependencies
+
+    def counted(record: OperationRecord):
+        inspected_operation_ids.append(record.operation_id)
+        return original(record)
+
+    monkeypatch.setattr(
+        dependency_orchestration,
+        "inspect_dependencies",
+        counted,
+    )
+    monkeypatch.setattr(web_app.jira_client, "ping", lambda: True)
+    monkeypatch.setattr(web_app.execution_worker, "wake_worker", lambda: None)
+
+    response = web_client.post(
+        "/api/queue/submit",
+        json={
+            "expected_queue_revision": 1,
+            "operation_ids": [operation.operation_id],
+            "high_risk_confirmed": False,
+        },
+    )
+
+    assert response.status_code == 202
+    assert inspected_operation_ids == [operation.operation_id] * 2
 
 
 def test_high_risk_requires_confirmation_then_returns_accepted(web_client, queue, monkeypatch):

@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Sequence
 
 from core.operations.models import OperationRecord
-from core.operations.repository._metadata import append_event
+from core.operations.repository.metadata import append_event
 from core.operations.repository._records import (
     OPERATION_COLUMNS,
     operation_from_row,
@@ -19,7 +19,8 @@ def queue_operations(connection: sqlite3.Connection) -> list[OperationRecord]:
     """Load every queued immutable operation snapshot."""
 
     rows = connection.execute(
-        f"SELECT {OPERATION_COLUMNS} FROM queue_items"
+        f"""SELECT {OPERATION_COLUMNS} FROM queue_items
+            ORDER BY created_at,operation_id"""
     ).fetchall()
     return [operation_from_row(row) for row in rows]
 

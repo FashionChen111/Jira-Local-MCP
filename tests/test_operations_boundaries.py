@@ -35,6 +35,16 @@ def imports(path: Path) -> set[str]:
     return values
 
 
+def imported_names(path: Path, module: str) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == module
+        for alias in node.names
+    }
+
+
 def test_models_and_rules_do_not_depend_on_outer_layers() -> None:
     pure_modules = (
         OPERATIONS / "models.py",
@@ -71,13 +81,55 @@ def test_dependency_private_modules_do_not_leak_outside_package() -> None:
         }, path
 
 
-def test_services_only_use_repository_package_api() -> None:
+def test_services_use_public_repository_capability_modules() -> None:
+    allowed_names = {
+        "DatabaseConnection",
+        "dependencies",
+        "execution",
+        "metadata",
+        "queue",
+    }
     for path in SERVICES.glob("*.py"):
         assert not {
             name
             for name in imports(path)
             if name.startswith("core.operations.repository._")
         }, path
+        assert imported_names(
+            path, "core.operations.repository"
+        ) <= allowed_names, path
+        assert "from core.operations import repository" not in path.read_text(
+            encoding="utf-8"
+        )
+
+
+def test_repository_public_modules_and_private_records_match_real_boundaries() -> None:
+    for module_name in ("queue", "execution", "dependencies", "metadata"):
+        assert (REPOSITORY / f"{module_name}.py").is_file()
+        assert not (REPOSITORY / f"_{module_name}.py").exists()
+
+    records_importers = {
+        path.relative_to(OPERATIONS).as_posix()
+        for path in OPERATIONS.rglob("*.py")
+        if "core.operations.repository._records" in imports(path)
+    }
+    assert records_importers
+    assert all(name.startswith("repository/") for name in records_importers)
+
+
+def test_dependency_orchestration_is_the_only_public_rule_module() -> None:
+    assert (DEPENDENCIES / "orchestration.py").is_file()
+    assert not (DEPENDENCIES / "_orchestration.py").exists()
+    assert not (DEPENDENCIES / "_types.py").exists()
+    for path in OPERATIONS.rglob("*.py"):
+        if path.is_relative_to(DEPENDENCIES):
+            continue
+        dependency_imports = {
+            name
+            for name in imports(path)
+            if name.startswith("core.operations.dependencies")
+        }
+        assert dependency_imports <= {"core.operations.dependencies"}, path
 
 
 def test_services_do_not_branch_on_concrete_dependency_types() -> None:
@@ -98,6 +150,9 @@ def test_repository_package_has_no_stateless_compatibility_class() -> None:
     from core.operations import repository
 
     assert not hasattr(repository, "OperationRepository")
+    assert not hasattr(repository, "insert_queue")
+    assert not hasattr(repository, "staging_records")
+    assert not hasattr(repository, "broadcast_dependency_resolution")
 
 
 def test_services_do_not_call_or_import_sibling_services() -> None:

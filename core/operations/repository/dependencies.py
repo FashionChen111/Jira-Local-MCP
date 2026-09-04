@@ -8,11 +8,7 @@ from typing import Literal
 
 from typing_extensions import assert_never
 
-from core.operations.dependencies import (
-    collect_dependency_operation_ids,
-    dependency_resolution_reference_paths,
-    materialize_dependency_resolution,
-)
+from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.models import (
     AttachmentDependencyResolution,
     DependencyBindingResult,
@@ -22,15 +18,16 @@ from core.operations.models import (
     OperationRecord,
     StagingRecord,
 )
-from core.operations.repository._execution import (
-    delete_staging_by_operation,
-    staging_records,
-)
-from core.operations.repository._metadata import append_event
-from core.operations.repository._queue import queue_operations
+from core.operations.repository import execution as execution_repository
+from core.operations.repository import metadata as repository_metadata
+from core.operations.repository import queue as queue_repository
 from core.operations.repository._records import attachment_result_from_json
 from core.operations.rules.identifiers import is_jira_issue_key
 from core.storage.database import canonical_json, new_id, utc_ms
+
+
+_ConsumerTable = Literal["queue_items", "execution_staging"]
+_ConsumerLocation = Literal["queue", "staging"]
 
 
 def dependency_states(
@@ -161,16 +158,88 @@ def _broadcast_issue_resolution(
 ) -> DependencyBindingResult:
     if not is_jira_issue_key(resolution.issue_key):
         raise ValueError("生产者结果必须包含合法 Jira Key")
-    queue = _matching_target_fields(
-        connection, "queue_items", resolution.producer_operation_id
+    queue_operation_ids = _materialize_issue_consumers(
+        connection,
+        "queue_items",
+        "queue",
+        resolution,
     )
-    staging = _matching_target_fields(
-        connection, "execution_staging", resolution.producer_operation_id
+    staging_operation_ids = _materialize_issue_consumers(
+        connection,
+        "execution_staging",
+        "staging",
+        resolution,
     )
-    for table, matched, location in (
-        ("queue_items", queue, "queue"),
-        ("execution_staging", staging, "staging"),
-    ):
+    return DependencyBindingResult(
+        queue_operation_ids=queue_operation_ids,
+        staging_operation_ids=staging_operation_ids,
+    )
+
+
+def _broadcast_attachment_resolution(
+    connection: sqlite3.Connection,
+    resolution: AttachmentDependencyResolution,
+) -> DependencyBindingResult:
+    queue_operation_ids = _materialize_attachment_consumers(
+        connection,
+        "queue_items",
+        "queue",
+        resolution,
+    )
+    staging_operation_ids = _materialize_attachment_consumers(
+        connection,
+        "execution_staging",
+        "staging",
+        resolution,
+    )
+    return DependencyBindingResult(
+        queue_operation_ids=queue_operation_ids,
+        staging_operation_ids=staging_operation_ids,
+    )
+
+
+def _materialize_issue_consumers(
+    connection: sqlite3.Connection,
+    table: _ConsumerTable,
+    location: _ConsumerLocation,
+    resolution: IssueDependencyResolution,
+) -> tuple[str, ...]:
+    rows = connection.execute(
+        f"""SELECT operation_id,operation_type,issue_key,target_issue_key
+            FROM {table}
+            WHERE issue_key=? OR (
+                operation_type='add_issuelink' AND target_issue_key=?
+            ) ORDER BY created_at,operation_id""",
+        (resolution.producer_operation_id, resolution.producer_operation_id),
+    ).fetchall()
+    changed_operation_ids: list[str] = []
+    for row in rows:
+        fields: list[str] = []
+        if row["issue_key"] == resolution.producer_operation_id:
+            fields.append("issue_key")
+        if (
+            row["operation_type"] == "add_issuelink"
+            and row["target_issue_key"] == resolution.producer_operation_id
+        ):
+            fields.append("target_issue_key")
+        event = dependency_orchestration.DependencyResolutionEvent(
+            resolution=resolution,
+            reference_paths=tuple(fields),
+        )
+        changed_operation_ids.append(row["operation_id"])
+        repository_metadata.append_event(
+            connection,
+            row["operation_id"],
+            "internal",
+            event.action_code,
+            {
+                "producer_operation_id": event.producer_operation_id,
+                **event.data,
+                "location": location,
+            },
+        )
+
+    if changed_operation_ids:
         connection.execute(
             f"UPDATE {table} SET issue_key=? WHERE issue_key=?",
             (resolution.issue_key, resolution.producer_operation_id),
@@ -180,112 +249,49 @@ def _broadcast_issue_resolution(
                 WHERE operation_type='add_issuelink' AND target_issue_key=?""",
             (resolution.issue_key, resolution.producer_operation_id),
         )
-        for operation_id, fields in matched.items():
-            append_event(
-                connection,
-                operation_id,
-                "internal",
-                "issue_key_resolved",
-                {
-                    "producer_operation_id": resolution.producer_operation_id,
-                    "new_issue_key": resolution.issue_key,
-                    "fields": fields,
-                    "location": location,
-                },
-            )
-    return DependencyBindingResult(
-        queue_operation_ids=tuple(queue),
-        staging_operation_ids=tuple(staging),
-    )
-
-
-def _broadcast_attachment_resolution(
-    connection: sqlite3.Connection,
-    resolution: AttachmentDependencyResolution,
-) -> DependencyBindingResult:
-    queue_ids = _materialize_attachment_consumers(
-        connection,
-        "queue_items",
-        queue_operations(connection),
-        "queue",
-        resolution,
-    )
-    staging_ids = _materialize_attachment_consumers(
-        connection,
-        "execution_staging",
-        staging_records(connection),
-        "staging",
-        resolution,
-    )
-    return DependencyBindingResult(
-        queue_operation_ids=tuple(queue_ids),
-        staging_operation_ids=tuple(staging_ids),
-    )
+    return tuple(changed_operation_ids)
 
 
 def _materialize_attachment_consumers(
     connection: sqlite3.Connection,
-    table: Literal["queue_items", "execution_staging"],
-    records: Sequence[OperationRecord],
-    location: Literal["queue", "staging"],
+    table: _ConsumerTable,
+    location: _ConsumerLocation,
     resolution: AttachmentDependencyResolution,
-) -> list[str]:
-    changed: list[str] = []
+) -> tuple[str, ...]:
+    changed_operation_ids: list[str] = []
+    records: Sequence[OperationRecord]
+    if table == "queue_items":
+        records = queue_repository.queue_operations(connection)
+    else:
+        records = execution_repository.staging_records(connection)
     for record in records:
-        operation = record.as_operation()
-        paths = dependency_resolution_reference_paths(operation, resolution)
-        if not paths:
-            continue
-        materialized = materialize_dependency_resolution(
-            operation, resolution
+        materialization = dependency_orchestration.materialize_references(
+            record,
+            (resolution,),
         )
+        if not materialization.events:
+            continue
+        event = materialization.events[0]
         connection.execute(
             f"UPDATE {table} SET payload_json=? WHERE operation_id=?",
-            (canonical_json(materialized.payload), record.operation_id),
+            (
+                canonical_json(materialization.operation.payload),
+                record.operation_id,
+            ),
         )
-        changed.append(record.operation_id)
-        append_event(
+        changed_operation_ids.append(record.operation_id)
+        repository_metadata.append_event(
             connection,
             record.operation_id,
             "internal",
-            "attachment_resolved",
+            event.action_code,
             {
-                "producer_operation_id": resolution.producer_operation_id,
-                "attachment_result": resolution.attachment_result.model_dump(
-                    mode="json"
-                ),
-                "paths": paths,
+                "producer_operation_id": event.producer_operation_id,
+                **event.data,
                 "location": location,
             },
         )
-    return changed
-
-
-def _matching_target_fields(
-    connection: sqlite3.Connection,
-    table: Literal["queue_items", "execution_staging"],
-    producer_operation_id: str,
-) -> dict[str, list[str]]:
-    rows = connection.execute(
-        f"""SELECT operation_id,operation_type,issue_key,target_issue_key
-            FROM {table}
-            WHERE issue_key=? OR (
-                operation_type='add_issuelink' AND target_issue_key=?
-            ) ORDER BY created_at,operation_id""",
-        (producer_operation_id, producer_operation_id),
-    ).fetchall()
-    matched: dict[str, list[str]] = {}
-    for row in rows:
-        fields: list[str] = []
-        if row["issue_key"] == producer_operation_id:
-            fields.append("issue_key")
-        if (
-            row["operation_type"] == "add_issuelink"
-            and row["target_issue_key"] == producer_operation_id
-        ):
-            fields.append("target_issue_key")
-        matched[row["operation_id"]] = fields
-    return matched
+    return tuple(changed_operation_ids)
 
 
 def terminalize_dependency_failure(
@@ -328,14 +334,16 @@ def terminalize_dependency_failure(
             f"dependency_failed: {producer_operation_id}",
         ),
     )
-    append_event(
+    repository_metadata.append_event(
         connection,
         staging.operation_id,
         "internal",
         "dependency_failed",
         {"producer_operation_id": producer_operation_id},
     )
-    delete_staging_by_operation(connection, staging.operation_id)
+    execution_repository.delete_staging_by_operation(
+        connection, staging.operation_id
+    )
 
 
 def terminalize_dependants(
@@ -344,8 +352,14 @@ def terminalize_dependants(
     """Terminalize staged or held operations referencing one producer."""
 
     affected = 0
-    for staging in staging_records(connection, {"staged", "held"}):
-        if producer_operation_id not in collect_dependency_operation_ids(staging):
+    for staging in execution_repository.staging_records(
+        connection, {"staged", "held"}
+    ):
+        inspection = dependency_orchestration.inspect_dependencies(staging)
+        referenced_operation_ids = (
+            dependency_orchestration.collect_referenced_operation_ids(inspection)
+        )
+        if producer_operation_id not in referenced_operation_ids:
             continue
         terminalize_dependency_failure(
             connection,

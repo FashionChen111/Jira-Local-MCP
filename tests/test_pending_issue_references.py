@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 
 import pytest
 
+from core.executing import worker as execution_worker
 from core.operations import DependencyConfirmationRequired, StoreError
-from core.storage.database import open_database
+from core.operations.dependencies import orchestration as dependency_orchestration
+from core.operations.models import OperationExecutionResult, OperationRecord
+from core.operations.repository import execution as execution_repository
+from core.operations.repository import metadata as repository_metadata
+from core.operations.repository import queue as queue_repository
+from core.storage.database import open_database, transaction
 
 
 def public_state(services):
@@ -53,6 +60,19 @@ def finish_create(services, issue_key: str):
         claim.execution_id, "success", "created", None, issue_key, 1
     )
     return claim
+
+
+def unresolved_consumer(producer_operation_id: str) -> OperationRecord:
+    return OperationRecord(
+        operation_id="op-" + "f" * 32,
+        operation_type="add_comment",
+        issue_key=producer_operation_id,
+        risk_level="low",
+        payload={"body": "malformed persisted consumer"},
+        description="malformed persisted consumer",
+        source="test",
+        created_at=10,
+    )
 
 
 def test_pending_group_and_submission_closure_are_automatic(queue) -> None:
@@ -256,7 +276,9 @@ def test_cancel_producer_cascades_through_primary_and_target_references(queue) -
     assert queue.query.total_active() == 0
 
 
-def test_manual_success_binds_both_targets_before_held_resume(queue) -> None:
+def test_manual_success_binds_both_targets_before_held_resume(
+    queue, monkeypatch
+) -> None:
     blocker = enqueue_comment(queue, "PROJ-1", "blocker")
     producer = enqueue_create(queue)
     link = enqueue_link(queue, producer.operation_id, producer.operation_id)
@@ -269,8 +291,29 @@ def test_manual_success_binds_both_targets_before_held_resume(queue) -> None:
     queue.recovery.resolve_indeterminate(
         blocker.operation_id, "succeeded", False
     )
+    inspected_operation_ids: list[str] = []
+    original_inspect = dependency_orchestration.inspect_dependencies
+
+    def counted_inspect(operation: OperationRecord):
+        inspected_operation_ids.append(operation.operation_id)
+        return original_inspect(operation)
+
+    monkeypatch.setattr(
+        dependency_orchestration,
+        "inspect_dependencies",
+        counted_inspect,
+    )
     queue.recovery.resolve_held(
         [producer.operation_id, link.operation_id], "resume"
+    )
+    assert Counter(inspected_operation_ids) == {
+        producer.operation_id: 1,
+        link.operation_id: 1,
+    }
+    monkeypatch.setattr(
+        dependency_orchestration,
+        "inspect_dependencies",
+        original_inspect,
     )
     producer_claim = queue.execution.claim_next()
     assert producer_claim is not None
@@ -310,3 +353,92 @@ def test_broadcast_failure_rolls_back_result_keys_events_and_revisions(queue) ->
     assert after["execution"]["executing"][0]["operation_id"] == producer.operation_id
     assert after["execution"]["staged"][0]["issue_key"] == producer.operation_id
     assert after["execution"]["staged"][0]["target_issue_key"] == producer.operation_id
+
+
+def test_successful_unmaterialized_queue_reference_is_consistency_blocker(
+    queue,
+) -> None:
+    producer = enqueue_create(queue)
+    queue.submission.submit(1, [producer.operation_id], False)
+    finish_create(queue, "PROJ-70")
+    consumer = unresolved_consumer(producer.operation_id)
+    with transaction() as connection:
+        queue_repository.insert_queue(
+            connection,
+            consumer,
+            action_code="mcp_append",
+            event_data={"source": "test"},
+        )
+        repository_metadata.bump_revisions(connection, "queue")
+
+    state = queue.query.get_state()
+    public_consumer = state.queue.groups[0].operations[0]
+    assert public_consumer.submittable is False
+    assert "数据不一致" in (public_consumer.submission_block_reason or "")
+    with pytest.raises(StoreError, match="数据不一致"):
+        queue.submission.submit(
+            state.revisions["queue"], [consumer.operation_id], False
+        )
+
+
+def test_successful_unmaterialized_held_reference_cannot_resume(queue) -> None:
+    producer = enqueue_create(queue)
+    queue.submission.submit(1, [producer.operation_id], False)
+    finish_create(queue, "PROJ-71")
+    consumer = unresolved_consumer(producer.operation_id)
+    with transaction() as connection:
+        execution_repository.insert_staging(
+            connection,
+            consumer,
+            stage_order=1,
+            submission_risk_level="low",
+            submitted_at=10,
+        )
+        execution_repository.set_staging_state(
+            connection,
+            consumer.operation_id,
+            state="held",
+            held_reason="test_invariant",
+        )
+        repository_metadata.bump_revisions(connection, "execution")
+
+    with pytest.raises(StoreError, match="数据不一致"):
+        queue.recovery.resolve_held([consumer.operation_id], "resume")
+
+
+def test_successful_unmaterialized_staged_reference_fails_without_jira(
+    queue, monkeypatch
+) -> None:
+    producer = enqueue_create(queue)
+    queue.submission.submit(1, [producer.operation_id], False)
+    finish_create(queue, "PROJ-72")
+    consumer = unresolved_consumer(producer.operation_id)
+    with transaction() as connection:
+        execution_repository.insert_staging(
+            connection,
+            consumer,
+            stage_order=1,
+            submission_risk_level="low",
+            submitted_at=10,
+        )
+        repository_metadata.bump_revisions(connection, "execution")
+    jira_calls: list[str] = []
+
+    def should_not_execute(operation: OperationRecord) -> OperationExecutionResult:
+        jira_calls.append(operation.operation_id)
+        return OperationExecutionResult(summary="unexpected")
+
+    monkeypatch.setattr(
+        execution_worker.jira_executor,
+        "execute_operation",
+        should_not_execute,
+    )
+
+    assert execution_worker.process_once() is True
+    assert jira_calls == []
+    history = queue.query.execution_history(None, None).items
+    consumer_history = next(
+        item for item in history if item.operation_id == consumer.operation_id
+    )
+    assert consumer_history.outcome == "failed"
+    assert "数据不一致" in (consumer_history.error or "")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import JsonValue
 
-from core.operations.dependencies import validate_dependency_syntax
+from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.errors import DependencyError
 from core.operations.models import OperationDraft, OperationRecord
 from core.operations.rules.safety import (
@@ -55,10 +55,21 @@ def record(
     )
 
 
+def validate_reference_syntax(
+    operation: OperationRecord, *, allow_unresolved: bool
+) -> None:
+    inspection = dependency_orchestration.inspect_dependencies(operation)
+    dependency_orchestration.validate_reference_syntax(
+        operation,
+        inspection,
+        allow_unresolved=allow_unresolved,
+    )
+
+
 @pytest.mark.parametrize("key", [None, "$TASK{x}", "{new}", "bad", "PROJ-x"])
 def test_modify_requires_real_key_or_server_operation_id(key: str | None) -> None:
     with pytest.raises(DependencyError):
-        validate_dependency_syntax(
+        validate_reference_syntax(
             record("add_comment", key), allow_unresolved=True
         )
 
@@ -66,7 +77,7 @@ def test_modify_requires_real_key_or_server_operation_id(key: str | None) -> Non
 def test_clone_source_is_always_real_and_link_target_is_explicit() -> None:
     operation_id = "op-" + "b" * 32
     with pytest.raises(DependencyError, match="clone_issue"):
-        validate_dependency_syntax(
+        validate_reference_syntax(
             OperationRecord(
                 operation_id="op-" + "a" * 32,
                 operation_type="clone_issue",
@@ -79,12 +90,12 @@ def test_clone_source_is_always_real_and_link_target_is_explicit() -> None:
             ),
             allow_unresolved=True,
         )
-    validate_dependency_syntax(
+    validate_reference_syntax(
         record("add_issuelink", "PROJ-1", operation_id),
         allow_unresolved=True,
     )
     with pytest.raises(DependencyError, match="target_issue_key"):
-        validate_dependency_syntax(
+        validate_reference_syntax(
             record("add_comment", "PROJ-1", "PROJ-2"),
             allow_unresolved=True,
         )
@@ -178,15 +189,6 @@ def test_payload_shape_rejects_only_handler_relevant_shape_errors(
 @pytest.mark.parametrize(
     ("operation_type", "payload"),
     [
-        (
-            "create_issue",
-            {
-                "project_key": "P",
-                "issue_type": "Task",
-                "summary": "new",
-                "extra_fields": {"description": {"file": "stale.txt"}},
-            },
-        ),
         ("update_field", {"fields": {"description": ["not text"]}}),
         (
             "change_type",
@@ -205,6 +207,25 @@ def test_payload_shape_does_not_model_nested_jira_field_values(
     operation_type: str, payload: dict[str, JsonValue]
 ) -> None:
     assert_valid_payload_shape(operation_type, payload)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["project", "issuetype", "summary", "description", "priority", "assignee"],
+)
+def test_create_payload_shape_rejects_dedicated_field_overrides(
+    field_name: str,
+) -> None:
+    with pytest.raises(OperationSafetyError, match="专用字段"):
+        assert_valid_payload_shape(
+            "create_issue",
+            {
+                "project_key": "P",
+                "issue_type": "Task",
+                "summary": "new",
+                "extra_fields": {field_name: "shadow"},
+            },
+        )
 
 
 def test_enqueue_boundary_reuses_payload_shape_validation() -> None:

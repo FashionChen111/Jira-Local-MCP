@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import heapq
 import re
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 
-from core.operations.dependencies import (
-    collect_dependency_operation_ids,
-    pending_issue_group_id,
-)
+from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.models import DependencyState, OperationRecord, QueueGroupKind
 from core.operations.rules.identifiers import is_jira_issue_key
 
@@ -80,7 +78,10 @@ def natural_issue_key(value: str) -> tuple[tuple[int, int | str], ...]:
 def operation_category(operation: OperationRecord) -> str:
     """Return the fixed in-group category for an operation."""
 
-    if pending_issue_group_id(operation) == operation.operation_id:
+    if (
+        dependency_orchestration.pending_issue_group_id(operation)
+        == operation.operation_id
+    ):
         return "producer"
     return CATEGORY_BY_OPERATION.get(operation.operation_type, "other")
 
@@ -108,7 +109,7 @@ def automatic_queue(
     standalone: list[OperationRecord] = []
 
     for operation in operations:
-        pending_group = pending_issue_group_id(operation)
+        pending_group = dependency_orchestration.pending_issue_group_id(operation)
         if pending_group is not None:
             pending_groups.setdefault(pending_group, []).append(operation)
         elif (
@@ -166,8 +167,9 @@ def automatic_queue(
 
 def stable_dependency_order(
     operations: list[OperationRecord] | tuple[OperationRecord, ...],
+    referenced_operation_ids_by_consumer: Mapping[str, Collection[str]],
 ) -> tuple[OperationRecord, ...]:
-    """Topologically order selected operations while preserving display priority."""
+    """Order a selected set from its already-inspected dependency adjacency."""
 
     ordered = tuple(operations)
     operation_by_id = {operation.operation_id: operation for operation in ordered}
@@ -176,9 +178,13 @@ def stable_dependency_order(
     }
     graph = {
         operation.operation_id: {
-            dependency_id
-            for dependency_id in collect_dependency_operation_ids(operation)
-            if dependency_id in operation_by_id
+            referenced_operation_id
+            for referenced_operation_id in (
+                referenced_operation_ids_by_consumer.get(
+                    operation.operation_id, ()
+                )
+            )
+            if referenced_operation_id in operation_by_id
         }
         for operation in ordered
     }
@@ -196,9 +202,9 @@ def stable_dependency_order(
         operation_id: len(dependencies)
         for operation_id, dependencies in graph.items()
     }
-    for operation_id, dependencies in graph.items():
-        for dependency_id in dependencies:
-            children[dependency_id].append(operation_id)
+    for operation_id, referenced_operation_ids in graph.items():
+        for referenced_operation_id in referenced_operation_ids:
+            children[referenced_operation_id].append(operation_id)
     heap = [
         (display_index[operation_id], operation_id)
         for operation_id, count in remaining_dependencies.items()

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Literal
 
-from core.operations.dependencies._types import IssueReference
 from core.operations.errors import DependencyError
 from core.operations.models import (
     DependencyState,
@@ -16,6 +17,14 @@ from core.operations.rules.identifiers import is_jira_issue_key, is_operation_id
 
 
 _PRODUCER_OPERATION_TYPES = frozenset({"create_issue", "clone_issue"})
+
+
+@dataclass(frozen=True)
+class IssueReference:
+    """One explicit Jira issue target backed by another operation."""
+
+    referenced_operation_id: str
+    path: Literal["issue_key", "target_issue_key"]
 
 
 def is_producer(operation_type: OperationType | None) -> bool:
@@ -82,100 +91,103 @@ def validate_reference_syntax(
         )
 
 
+def reference_problem(
+    references: tuple[IssueReference, ...],
+    states: Mapping[str, DependencyState],
+    *,
+    allow_available_resolution: bool,
+) -> str | None:
+    """Return the first issue-reference state problem for one lifecycle."""
+
+    for reference in references:
+        referenced_operation_id = reference.referenced_operation_id
+        state = states.get(referenced_operation_id)
+        if state is None or state.state == "unknown":
+            return f"引用的 operation 不存在：{referenced_operation_id}"
+        if not is_producer(state.operation_type):
+            return (
+                "引用的 operation 不是 create_issue/clone_issue："
+                f"{referenced_operation_id}"
+            )
+        if state.state == "success":
+            if not is_jira_issue_key(state.new_issue_key):
+                return (
+                    "引用的事务生产者缺少有效 Jira Key："
+                    f"{referenced_operation_id}"
+                )
+            if not allow_available_resolution:
+                return (
+                    "依赖的创建/克隆事务已成功但引用尚未物化，数据不一致："
+                    f"{referenced_operation_id}"
+                )
+        elif not state.active:
+            return (
+                "引用的事务生产者已处于不可用状态 "
+                f"{state.state}：{referenced_operation_id}"
+            )
+    return None
+
+
 def validate_reference_contract(
     references: tuple[IssueReference, ...],
     states: Mapping[str, DependencyState],
 ) -> None:
-    """Assert existence, capability, lifecycle, and result integrity."""
+    """Assert producer existence, capability, lifecycle, and result integrity."""
 
-    for reference in references:
-        producer_id = reference.operation_id
-        state = states.get(producer_id)
-        if state is None or state.state == "unknown":
-            raise DependencyError(f"引用的 operation 不存在：{producer_id}")
-        if not is_producer(state.operation_type):
-            raise DependencyError(
-                f"引用的 operation 不是 create_issue/clone_issue：{producer_id}"
-            )
-        if state.state == "success" and not is_jira_issue_key(
-            state.new_issue_key
-        ):
-            raise DependencyError(
-                f"引用的事务生产者缺少有效 Jira Key：{producer_id}"
-            )
-        if state.state != "success" and not state.active:
-            raise DependencyError(
-                f"引用的事务生产者已处于不可用状态 {state.state}：{producer_id}"
-            )
-
-
-def collect_resolutions(
-    references: tuple[IssueReference, ...],
-    states: Mapping[str, DependencyState],
-) -> dict[str, str]:
-    """Collect available Jira keys after the reference contract is validated."""
-
-    resolved: dict[str, str] = {}
-    for reference in references:
-        state = states.get(reference.operation_id)
-        if (
-            state is not None
-            and state.state == "success"
-            and is_jira_issue_key(state.new_issue_key)
-        ):
-            resolved[reference.operation_id] = state.new_issue_key
-    return resolved
+    problem = reference_problem(
+        references,
+        states,
+        allow_available_resolution=True,
+    )
+    if problem is not None:
+        raise DependencyError(problem)
 
 
 def materialize_references(
-    operation: OperationRecord, resolved_keys: Mapping[str, str]
-) -> OperationRecord:
-    """Replace explicit targets whose producer results are available."""
+    operation: OperationRecord,
+    issue_keys_by_producer: Mapping[str, str],
+) -> tuple[OperationRecord, tuple[tuple[str, tuple[str, ...]], ...]]:
+    """Replace available issue targets and report actual producer fields."""
 
     issue_key = operation.issue_key
     target_issue_key = operation.target_issue_key
-    replace_issue = isinstance(issue_key, str) and issue_key in resolved_keys
-    replace_target = (
-        isinstance(target_issue_key, str)
-        and target_issue_key in resolved_keys
+    fields_by_producer: dict[str, list[str]] = {}
+
+    replace_issue_key = (
+        isinstance(issue_key, str) and issue_key in issue_keys_by_producer
     )
-    if replace_issue and issue_key is not None:
-        issue_key = resolved_keys[issue_key]
-    if replace_target and target_issue_key is not None:
-        target_issue_key = resolved_keys[target_issue_key]
-    return operation.with_targets(
+    if replace_issue_key and issue_key is not None:
+        fields_by_producer.setdefault(issue_key, []).append("issue_key")
+        issue_key = issue_keys_by_producer[issue_key]
+
+    replace_target_issue_key = (
+        isinstance(target_issue_key, str)
+        and target_issue_key in issue_keys_by_producer
+    )
+    if replace_target_issue_key and target_issue_key is not None:
+        fields_by_producer.setdefault(target_issue_key, []).append(
+            "target_issue_key"
+        )
+        target_issue_key = issue_keys_by_producer[target_issue_key]
+
+    if not replace_issue_key and not replace_target_issue_key:
+        return operation, ()
+
+    materialized = operation.with_targets(
         issue_key=issue_key,
         target_issue_key=target_issue_key,
-        replace_issue_key=replace_issue,
-        replace_target_issue_key=replace_target,
+        replace_issue_key=replace_issue_key,
+        replace_target_issue_key=replace_target_issue_key,
     )
+    changes = tuple(
+        (producer_operation_id, tuple(fields_by_producer[producer_operation_id]))
+        for producer_operation_id in issue_keys_by_producer
+        if producer_operation_id in fields_by_producer
+    )
+    return materialized, changes
 
 
-def submission_block_reason(
-    references: tuple[IssueReference, ...],
-    states: Mapping[str, DependencyState],
-) -> str | None:
-    """Describe the first issue dependency preventing submission."""
-
-    for reference in references:
-        operation_id = reference.operation_id
-        state = states.get(operation_id)
-        if state is None or state.state == "unknown":
-            return f"依赖的 operation 不存在：{operation_id}"
-        if not is_producer(state.operation_type):
-            return f"依赖的 operation 不是创建/克隆事务：{operation_id}"
-        if state.state in {"failed", "dependency_failed", "abandoned"}:
-            return f"依赖的创建/克隆事务已失败：{operation_id}"
-        if state.state == "indeterminate":
-            return f"依赖的创建/克隆事务结果待人工处置：{operation_id}"
-        if state.state == "success" and not is_jira_issue_key(
-            state.new_issue_key
-        ):
-            return f"依赖的创建/克隆事务缺少 Jira Key：{operation_id}"
-    return None
-
-
-def comparable_target(
+def comparable_issue_target(
     value: str | None, states: Mapping[str, DependencyState]
 ) -> str | None:
     """Return a concrete key when available, otherwise preserve the target ID."""
@@ -210,7 +222,7 @@ def resolution_from_state(
     return None
 
 
-def pending_group_id(operation: OperationRecord) -> str | None:
+def pending_issue_group_id(operation: OperationRecord) -> str | None:
     """Return the pending-issue group ID implied by one operation."""
 
     if is_producer(operation.operation_type):

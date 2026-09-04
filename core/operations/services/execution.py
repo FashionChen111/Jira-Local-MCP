@@ -4,14 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from core.operations import repository
-from core.operations.dependencies import (
-    MaterializableDependency,
-    WaitingDependency,
-    classify_dependency_state,
-    collect_dependency_operation_ids,
-    dependency_resolution_from_result,
-)
+from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.errors import DependencyError, StoreError
 from core.operations.models import (
     AttachmentResult,
@@ -19,6 +12,9 @@ from core.operations.models import (
     OperationRecord,
     StagingRecord,
 )
+from core.operations.repository import dependencies as dependency_repository
+from core.operations.repository import execution as execution_repository
+from core.operations.repository import metadata as repository_metadata
 from core.operations.rules.safety import OperationSafetyError, assert_safe_to_execute
 from core.storage.database import new_id, transaction, utc_ms
 
@@ -36,71 +32,84 @@ class ExecutionService:
         with transaction() as connection:
             if any(
                 record.state == "indeterminate"
-                for record in repository.staging_records(connection)
+                for record in execution_repository.staging_records(connection)
             ):
                 return None
             while True:
-                records = repository.staging_records(connection)
+                records = execution_repository.staging_records(connection)
                 if not records or records[0].state != "staged":
                     return None
                 staging = records[0]
                 operation = self._operation(staging)
-                dependencies = collect_dependency_operation_ids(operation)
-                if dependencies:
-                    states = repository.dependency_states(
-                        connection, dependencies
+                inspection = dependency_orchestration.inspect_dependencies(
+                    operation
+                )
+                referenced_operation_ids = (
+                    dependency_orchestration.collect_referenced_operation_ids(
+                        inspection
+                    )
+                )
+                consistency_error: str | None = None
+                if referenced_operation_ids:
+                    states = dependency_repository.dependency_states(
+                        connection, referenced_operation_ids
                     )
                     changed = False
-                    for dependency_id in dependencies:
-                        state = states[dependency_id]
-                        decision = classify_dependency_state(state)
-                        if isinstance(decision, MaterializableDependency):
-                            binding = repository.broadcast_dependency_resolution(
-                                connection, decision.resolution
-                            )
-                            revisions: list[str] = []
-                            if binding.queue_changed:
-                                revisions.append("queue")
-                            if binding.execution_changed:
-                                revisions.append("execution")
-                            if revisions:
-                                repository.bump_revisions(connection, *revisions)
-                            changed = True
-                            break
-                        if not isinstance(decision, WaitingDependency):
-                            repository.terminalize_dependency_failure(
+                    waiting = False
+                    for referenced_operation_id in referenced_operation_ids:
+                        state = states[referenced_operation_id]
+                        decision = dependency_orchestration.classify_state(state)
+                        if isinstance(
+                            decision,
+                            dependency_orchestration.UnavailableDependency,
+                        ):
+                            dependency_repository.terminalize_dependency_failure(
                                 connection,
                                 staging,
-                                producer_operation_id=dependency_id,
+                                producer_operation_id=referenced_operation_id,
                             )
-                            repository.bump_revisions(
+                            repository_metadata.bump_revisions(
                                 connection, "execution", "history"
                             )
                             changed = True
                             break
+                        if isinstance(
+                            decision,
+                            dependency_orchestration.WaitingDependency,
+                        ):
+                            waiting = True
+                            continue
+                        consistency_error = (
+                            "依赖生产者已成功但 staged 引用尚未物化，"
+                            "数据不一致："
+                            f"{referenced_operation_id}"
+                        )
+                        break
                     if changed:
                         continue
-                    return None
+                    if consistency_error is None and waiting:
+                        return None
 
-                preflight_error: str | None = None
+                preflight_error = consistency_error
                 try:
                     assert_safe_to_execute(operation)
                 except OperationSafetyError as exc:
-                    preflight_error = str(exc)
+                    if preflight_error is None:
+                        preflight_error = str(exc)
                 execution_id = new_id("exec")
                 started_at = utc_ms()
-                if not repository.mark_claimed(
+                if not execution_repository.mark_claimed(
                     connection, operation.operation_id, execution_id, started_at
                 ):
                     continue
-                repository.insert_execution(
+                execution_repository.insert_execution(
                     connection,
                     operation,
                     execution_id=execution_id,
                     submission_risk_level=staging.submission_risk_level,
                     started_at=started_at,
                 )
-                repository.bump_revisions(connection, "execution")
+                repository_metadata.bump_revisions(connection, "execution")
                 return ExecutionClaim(
                     execution_id=execution_id,
                     operation=operation,
@@ -124,34 +133,36 @@ class ExecutionService:
         """Persist a worker result and broadcast producer outcomes atomically."""
 
         with transaction() as connection:
-            record = repository.execution_record(connection, execution_id)
+            record = execution_repository.execution_record(connection, execution_id)
             if record is None:
                 raise StoreError("execution record 不存在")
             if record.outcome is not None:
                 if record.outcome == outcome:
-                    residue = repository.staging_record(
+                    residue = execution_repository.staging_record(
                         connection, record.operation_id
                     )
-                    repository.delete_staging_by_execution(
+                    execution_repository.delete_staging_by_execution(
                         connection, execution_id
                     )
                     if residue is not None:
-                        repository.bump_revisions(connection, "execution")
+                        repository_metadata.bump_revisions(connection, "execution")
                     return
                 raise StoreError("execution record 已有不同终态")
             try:
-                dependency_resolution = dependency_resolution_from_result(
-                    producer_operation_id=record.operation_id,
-                    operation_type=record.operation_type,
-                    successful=outcome == "success",
-                    new_issue_key=new_issue_key,
-                    attachment_result=attachment_result,
+                dependency_resolution = (
+                    dependency_orchestration.resolution_from_producer_result(
+                        producer_operation_id=record.operation_id,
+                        operation_type=record.operation_type,
+                        successful=outcome == "success",
+                        new_issue_key=new_issue_key,
+                        attachment_result=attachment_result,
+                    )
                 )
             except DependencyError as exc:
                 raise StoreError(str(exc)) from exc
             if elapsed_ms < 0:
                 raise StoreError("elapsed_ms 不得为负数")
-            if not repository.finish_execution(
+            if not execution_repository.finish_execution(
                 connection,
                 execution_id,
                 finished_at=utc_ms(),
@@ -166,19 +177,21 @@ class ExecutionService:
 
             queue_changed = False
             if dependency_resolution is not None:
-                binding = repository.broadcast_dependency_resolution(
+                binding = dependency_repository.broadcast_dependency_resolution(
                     connection, dependency_resolution
                 )
                 queue_changed = binding.queue_changed
             elif outcome == "failed":
-                repository.terminalize_dependants(
+                dependency_repository.terminalize_dependants(
                     connection, record.operation_id
                 )
-            repository.delete_staging_by_execution(connection, execution_id)
+            execution_repository.delete_staging_by_execution(
+                connection, execution_id
+            )
             names = ["execution", "history"]
             if queue_changed:
                 names.append("queue")
-            repository.bump_revisions(connection, *names)
+            repository_metadata.bump_revisions(connection, *names)
 
     def recover_interrupted(self) -> int:
         """Convert orphaned executing rows to indeterminate and hold later work."""
@@ -187,12 +200,12 @@ class ExecutionService:
             recovered = 0
             execution_changed = False
             history_changed = False
-            for staging in repository.staging_records(
+            for staging in execution_repository.staging_records(
                 connection, {"executing"}
             ):
                 if staging.execution_id is None:
                     raise StoreError("executing staging 缺少 execution ID")
-                record = repository.execution_record(
+                record = execution_repository.execution_record(
                     connection, staging.execution_id
                 )
                 if record is None:
@@ -200,23 +213,23 @@ class ExecutionService:
                         "executing staging 缺少 execution record，拒绝自动恢复"
                     )
                 if record.outcome is not None:
-                    repository.delete_staging_by_operation(
+                    execution_repository.delete_staging_by_operation(
                         connection, staging.operation_id
                     )
                     execution_changed = True
                     continue
                 now = utc_ms()
-                repository.mark_execution_indeterminate(
+                execution_repository.mark_execution_indeterminate(
                     connection, staging.execution_id, now
                 )
-                repository.set_staging_state(
+                execution_repository.set_staging_state(
                     connection,
                     staging.operation_id,
                     state="indeterminate",
                     execution_id=staging.execution_id,
                     started_at=staging.started_at,
                 )
-                repository.hold_later_staging(
+                execution_repository.hold_later_staging(
                     connection,
                     stage_order=staging.stage_order,
                     blocked_by_execution_id=staging.execution_id,
@@ -230,5 +243,5 @@ class ExecutionService:
             if history_changed:
                 names.append("history")
             if names:
-                repository.bump_revisions(connection, *names)
+                repository_metadata.bump_revisions(connection, *names)
             return recovered

@@ -5,11 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from core.operations.dependencies import (
-    MaterializableDependency,
-    classify_dependency_state,
-    dependency_resolution_from_result,
-)
+from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.models import (
     AttachmentDependencyResolution,
     AttachmentResult,
@@ -150,14 +146,14 @@ def test_dependency_state_separates_operation_context_from_results() -> None:
 
 
 def test_dependency_results_project_to_a_discriminated_resolution() -> None:
-    issue = dependency_resolution_from_result(
+    issue = dependency_orchestration.resolution_from_producer_result(
         producer_operation_id="op-" + "a" * 32,
         operation_type="create_issue",
         successful=True,
         new_issue_key="PROJ-10",
         attachment_result=None,
     )
-    attachment = dependency_resolution_from_result(
+    attachment = dependency_orchestration.resolution_from_producer_result(
         producer_operation_id="op-" + "b" * 32,
         operation_type="add_attachment",
         successful=True,
@@ -170,7 +166,7 @@ def test_dependency_results_project_to_a_discriminated_resolution() -> None:
     assert isinstance(attachment, AttachmentDependencyResolution)
     assert attachment.kind == "attachment"
 
-    decision = classify_dependency_state(
+    decision = dependency_orchestration.classify_state(
         DependencyState(
             operation_id=issue.producer_operation_id,
             operation_type="create_issue",
@@ -178,5 +174,32 @@ def test_dependency_results_project_to_a_discriminated_resolution() -> None:
             new_issue_key=issue.issue_key,
         )
     )
-    assert isinstance(decision, MaterializableDependency)
-    assert decision.resolution == issue
+    assert decision == issue
+
+
+def test_reference_ids_use_pre_contract_lifecycle_vocabulary() -> None:
+    producer_operation_id = "op-" + "b" * 32
+    value = operation(
+        issue_key=producer_operation_id,
+        target_issue_key=producer_operation_id,
+    )
+
+    inspection = dependency_orchestration.inspect_dependencies(value)
+
+    assert [
+        reference.referenced_operation_id
+        for reference in inspection.issue_references
+    ] == [producer_operation_id, producer_operation_id]
+    assert dependency_orchestration.collect_referenced_operation_ids(
+        inspection
+    ) == (producer_operation_id,)
+    assert not hasattr(inspection.issue_references[0], "operation_id")
+
+
+def test_merge_referenced_operation_ids_deduplicates_consumer_groups() -> None:
+    first = "op-" + "a" * 32
+    second = "op-" + "b" * 32
+
+    assert dependency_orchestration.merge_referenced_operation_ids(
+        ((first, second), (second,), ())
+    ) == {first, second}

@@ -1,6 +1,8 @@
 """Serial worker, result persistence, and conservative failure behavior."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from core.executing import jira_executor
@@ -213,6 +215,54 @@ def test_executor_reads_both_link_targets_from_top_level(monkeypatch):
             "type": "Relates",
             "inwardIssue": "PROJ-1",
             "outwardIssue": "PROJ-2",
+        }
+    ]
+
+
+def test_create_executor_preserves_only_non_dedicated_extra_fields(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class Client:
+        def create_issue(self, *, fields):
+            calls.append(fields)
+            return SimpleNamespace(key="PROJ-10")
+
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="create_issue",
+        issue_key=None,
+        risk_level="medium",
+        payload={
+            "project_key": "PROJ",
+            "issue_type": "Task",
+            "summary": "new",
+            "description": "details",
+            "priority": "High",
+            "assignee": "alice",
+            "extra_fields": {
+                "labels": ["audit"],
+                "customfield_10001": "kept",
+            },
+        },
+        description="create",
+        source="test",
+        created_at=1,
+    )
+    monkeypatch.setattr(jira_executor.jira_client, "get_client", Client)
+
+    result = jira_executor.execute_operation(operation)
+
+    assert result.new_issue_key == "PROJ-10"
+    assert calls == [
+        {
+            "project": {"key": "PROJ"},
+            "issuetype": {"name": "Task"},
+            "summary": "new",
+            "description": "details",
+            "priority": {"name": "High"},
+            "assignee": {"name": "alice"},
+            "labels": ["audit"],
+            "customfield_10001": "kept",
         }
     ]
 

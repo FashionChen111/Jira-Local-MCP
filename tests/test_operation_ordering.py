@@ -122,7 +122,8 @@ def test_stable_topological_order_preserves_display_priority_and_rejects_cycles(
             op(child, "add_comment", producer, 1),
             op(independent, "add_comment", "PROJ-1", 2),
             op(producer, "create_issue", None, 3),
-        )
+        ),
+        {child: (producer,), independent: (), producer: ()},
     )
     assert [item.operation_id for item in ordered] == [
         independent,
@@ -134,7 +135,8 @@ def test_stable_topological_order_preserves_display_priority_and_rejects_cycles(
             op(producer, "create_issue", None, 1),
             op(child, "add_comment", producer, 2),
             op(independent, "add_comment", "PROJ-1", 3),
-        )
+        ),
+        {producer: (), child: (producer,), independent: ()},
     )
     assert [item.operation_id for item in already_valid] == [
         producer,
@@ -149,5 +151,6 @@ def test_stable_topological_order_preserves_display_priority_and_rejects_cycles(
             (
                 op(left, "add_comment", right, 1),
                 op(right, "add_comment", left, 2),
-            )
+            ),
+            {left: (right,), right: (left,)},
         )

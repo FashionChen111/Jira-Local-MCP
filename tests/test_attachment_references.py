@@ -4,22 +4,30 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
 
 from core.executing import jira_executor
-from core.operations import AttachmentResult, StoreError
-from core.operations.dependencies import (
-    collect_dependency_operation_ids,
-    collect_dependency_references,
-    description_reference_paths,
-    validate_dependency_syntax,
+from core.operations import (
+    AttachmentResult,
+    DependencyConfirmationRequired,
+    StoreError,
 )
+from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.errors import DependencyError
-from core.operations.models import OperationRecord
-from core.operations.rules.safety import OperationSafetyError, assert_safe_to_execute
-from core.operations.services import queue as queue_service_module
+from core.operations.models import (
+    AttachmentDependencyResolution,
+    DependencyState,
+    IssueDependencyResolution,
+    OperationRecord,
+)
+from core.operations.rules.safety import (
+    OperationSafetyError,
+    assert_safe_to_execute,
+    submission_problem,
+)
 from core.operations.services.queue import _snapshot_description_payload
 from core.storage.database import open_database
 from core.textfile_loader import TextFileError, snapshot_text_source
@@ -180,16 +188,22 @@ def test_reference_collection_is_non_throwing_and_syntax_is_explicit() -> None:
         created_at=1,
     )
 
-    references = collect_dependency_references(operation)
+    inspection = dependency_orchestration.inspect_dependencies(operation)
 
-    assert collect_dependency_operation_ids(
-        operation, references=references
-    ) == ()
+    assert inspection.issue_references == ()
+    assert inspection.attachment_inspection.references == ()
+    assert inspection.attachment_inspection.invalid_placeholder_paths == (
+        "body",
+    )
+    assert (
+        dependency_orchestration.collect_referenced_operation_ids(inspection)
+        == ()
+    )
     with pytest.raises(DependencyError, match="附件引用必须使用"):
-        validate_dependency_syntax(
+        dependency_orchestration.validate_reference_syntax(
             operation,
+            inspection,
             allow_unresolved=True,
-            references=references,
         )
 
 
@@ -222,14 +236,57 @@ def test_materialized_jira_attachment_text_passes_execution_syntax() -> None:
         created_at=1,
     )
 
-    validate_dependency_syntax(operation, allow_unresolved=False)
+    inspection = dependency_orchestration.inspect_dependencies(operation)
+    dependency_orchestration.validate_reference_syntax(
+        operation,
+        inspection,
+        allow_unresolved=False,
+    )
+
+
+def test_submission_problem_runs_one_syntax_orchestration(monkeypatch) -> None:
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="add_comment",
+        issue_key="PROJ-1",
+        risk_level="low",
+        payload={"body": "plain"},
+        description="consumer",
+        source="test",
+        created_at=1,
+    )
+    inspection = dependency_orchestration.inspect_dependencies(operation)
+    calls: list[bool] = []
+    original = dependency_orchestration.validate_reference_syntax
+
+    def counted(
+        record: OperationRecord,
+        inspected: dependency_orchestration.DependencyInspection,
+        *,
+        allow_unresolved: bool,
+    ) -> None:
+        calls.append(allow_unresolved)
+        original(
+            record,
+            inspected,
+            allow_unresolved=allow_unresolved,
+        )
+
+    monkeypatch.setattr(
+        dependency_orchestration,
+        "validate_reference_syntax",
+        counted,
+    )
+
+    assert submission_problem(operation, inspection, {}) is None
+    assert calls == [True]
 
 
 def test_enqueue_reuses_one_dependency_reference_scan(
     queue, monkeypatch
 ) -> None:
     scans = 0
-    original = queue_service_module.collect_dependency_references
+    original = dependency_orchestration.inspect_dependencies
 
     def counted(operation: OperationRecord):
         nonlocal scans
@@ -237,7 +294,7 @@ def test_enqueue_reuses_one_dependency_reference_scan(
         return original(operation)
 
     monkeypatch.setattr(
-        queue_service_module, "collect_dependency_references", counted
+        dependency_orchestration, "inspect_dependencies", counted
     )
 
     queue.queue.enqueue(
@@ -245,6 +302,137 @@ def test_enqueue_reuses_one_dependency_reference_scan(
     )
 
     assert scans == 1
+
+
+def test_enqueue_without_available_resolutions_skips_materialization(
+    queue, monkeypatch
+) -> None:
+    def unexpected_materialization(*_args, **_kwargs):
+        raise AssertionError("无可用 resolution 时不应进入物化")
+
+    monkeypatch.setattr(
+        dependency_orchestration,
+        "materialize_references",
+        unexpected_materialization,
+    )
+
+    queue.queue.enqueue(
+        "add_comment", "PROJ-1", {"body": "plain"}, "plain", "test"
+    )
+
+
+def test_query_inspects_each_active_operation_once(queue, monkeypatch) -> None:
+    attachment = _attachment(queue)
+    comment = queue.queue.enqueue(
+        "add_comment",
+        "PROJ-1",
+        {"body": f"[^{{{{attachment:{attachment.operation_id}}}}}]"},
+        "comment",
+        "test",
+    )
+    scanned_operation_ids: list[str] = []
+    original = dependency_orchestration.inspect_dependencies
+
+    def counted(operation: OperationRecord):
+        scanned_operation_ids.append(operation.operation_id)
+        return original(operation)
+
+    monkeypatch.setattr(
+        dependency_orchestration,
+        "inspect_dependencies",
+        counted,
+    )
+
+    queue.query.get_state()
+
+    assert Counter(scanned_operation_ids) == {
+        attachment.operation_id: 1,
+        comment.operation_id: 1,
+    }
+
+
+def test_submission_selection_reuses_one_inspection_per_operation(
+    queue, monkeypatch
+) -> None:
+    attachment = _attachment(queue)
+    comment = queue.queue.enqueue(
+        "add_comment",
+        "PROJ-1",
+        {"body": f"[^{{{{attachment:{attachment.operation_id}}}}}]"},
+        "comment",
+        "test",
+    )
+    scanned_operation_ids: list[str] = []
+    original = dependency_orchestration.inspect_dependencies
+
+    def counted(operation: OperationRecord):
+        scanned_operation_ids.append(operation.operation_id)
+        return original(operation)
+
+    monkeypatch.setattr(
+        dependency_orchestration,
+        "inspect_dependencies",
+        counted,
+    )
+
+    queue.submission.validate_submission(
+        2,
+        [comment.operation_id, attachment.operation_id],
+        False,
+    )
+
+    assert Counter(scanned_operation_ids) == {
+        attachment.operation_id: 1,
+        comment.operation_id: 1,
+    }
+
+
+def test_cancel_builds_dependency_edges_with_one_inspection_each(
+    queue, monkeypatch
+) -> None:
+    producer = queue.queue.enqueue(
+        "create_issue",
+        None,
+        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
+        "create",
+        "test",
+    )
+    child = queue.queue.enqueue(
+        "create_issue",
+        None,
+        {"project_key": "PROJ", "issue_type": "Task", "summary": "child"},
+        "create",
+        "test",
+    )
+    dependant = queue.queue.enqueue(
+        "add_issuelink",
+        producer.operation_id,
+        {"link_type": "Relates"},
+        "link",
+        "test",
+        child.operation_id,
+    )
+    scanned_operation_ids: list[str] = []
+    original = dependency_orchestration.inspect_dependencies
+
+    def counted(operation: OperationRecord):
+        scanned_operation_ids.append(operation.operation_id)
+        return original(operation)
+
+    monkeypatch.setattr(
+        dependency_orchestration,
+        "inspect_dependencies",
+        counted,
+    )
+
+    with pytest.raises(DependencyConfirmationRequired):
+        queue.queue.cancel(3, [producer.operation_id], False)
+
+    assert Counter(scanned_operation_ids) == {
+        producer.operation_id: 1,
+        child.operation_id: 1,
+        dependant.operation_id: 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -301,17 +489,22 @@ def test_create_description_file_is_snapshotted_and_path_removed(
 
 
 def test_description_paths_share_attachment_reference_rules() -> None:
-    assert description_reference_paths("create_issue") == (
-        "description",
-        "extra_fields.description",
-    )
-    assert description_reference_paths("update_field") == (
+    assert dependency_orchestration.attachment_reference_description_paths(
+        "create_issue"
+    ) == ("description",)
+    assert dependency_orchestration.attachment_reference_description_paths(
+        "update_field"
+    ) == (
         "fields.description",
     )
-    assert description_reference_paths("change_type") == (
+    assert dependency_orchestration.attachment_reference_description_paths(
+        "change_type"
+    ) == (
         "fields_mapping.description",
     )
-    assert description_reference_paths("transition_issue") == (
+    assert dependency_orchestration.attachment_reference_description_paths(
+        "transition_issue"
+    ) == (
         "fields.description",
     )
 
@@ -321,10 +514,8 @@ def test_create_description_sources_are_normalized_by_priority(
 ) -> None:
     file_source = tmp_path / "file-source.txt"
     top_source = tmp_path / "top-source.txt"
-    nested_source = tmp_path / "nested-source.txt"
     file_source.write_text("file wins", encoding="utf-8")
     top_source.write_text("top wins", encoding="utf-8")
-    nested_source.write_text("nested wins", encoding="utf-8")
     missing = tmp_path / "must-not-be-read.txt"
 
     first_payload: dict[str, object] = {
@@ -333,10 +524,7 @@ def test_create_description_sources_are_normalized_by_priority(
         "summary": "file",
         "description_file": str(file_source),
         "description": {"file": str(missing)},
-        "extra_fields": {
-            "description": {"file": str(missing)},
-            "labels": ["kept"],
-        },
+        "extra_fields": {"labels": ["kept"]},
     }
     first = queue.queue.enqueue(
         "create_issue", None, first_payload, "file", "test"
@@ -355,31 +543,293 @@ def test_create_description_sources_are_normalized_by_priority(
             "summary": "top",
             "description_file": None,
             "description": {"file": str(top_source)},
-            "extra_fields": {"description": {"file": str(missing)}},
+            "extra_fields": {"components": [{"name": "API"}]},
         },
         "top",
         "test",
     )
     assert second.payload["description"] == "top wins"
-    assert second.payload["extra_fields"] == {}
+    assert second.payload["extra_fields"] == {
+        "components": [{"name": "API"}]
+    }
 
-    third = queue.queue.enqueue(
-        "create_issue",
-        None,
-        {
+
+@pytest.mark.parametrize(
+    "reserved_field",
+    ["project", "issuetype", "summary", "description", "priority", "assignee"],
+)
+def test_create_rejects_every_dedicated_field_in_extra_fields_without_writes(
+    queue, reserved_field: str
+) -> None:
+    with pytest.raises(StoreError, match="extra_fields 不得包含专用字段"):
+        queue.queue.enqueue(
+            "create_issue",
+            None,
+            {
+                "project_key": "PROJ",
+                "issue_type": "Task",
+                "summary": "new",
+                "description": "top-level",
+                "extra_fields": {reserved_field: "shadow"},
+            },
+            "create",
+            "test",
+        )
+
+    assert queue.query.total_active() == 0
+    assert queue.query.get_state().revisions == {
+        "queue": 0,
+        "execution": 0,
+        "history": 0,
+    }
+    connection = open_database("operations")
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM queue_events").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_create_extra_fields_description_alone_is_not_an_input_route(queue) -> None:
+    with pytest.raises(StoreError, match="请使用顶层 description"):
+        queue.queue.enqueue(
+            "create_issue",
+            None,
+            {
+                "project_key": "PROJ",
+                "issue_type": "Task",
+                "summary": "new",
+                "extra_fields": {"description": "nested-only"},
+            },
+            "create",
+            "test",
+        )
+
+
+def test_execution_gate_rejects_legacy_create_field_override() -> None:
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="create_issue",
+        issue_key=None,
+        risk_level="medium",
+        payload={
             "project_key": "PROJ",
             "issue_type": "Task",
-            "summary": "nested",
+            "summary": "new",
             "description": None,
-            "extra_fields": {
-                "description": {"file": str(nested_source)}
-            },
+            "extra_fields": {"description": "legacy"},
         },
-        "nested",
-        "test",
+        description="create",
+        source="test",
+        created_at=1,
     )
-    assert third.payload["description"] == "nested wins"
-    assert third.payload["extra_fields"] == {}
+
+    with pytest.raises(OperationSafetyError, match="extra_fields 不得包含专用字段"):
+        assert_safe_to_execute(operation)
+
+
+def test_batch_materialization_uses_one_typed_resolution_sequence() -> None:
+    issue_producer_id = "op-" + "b" * 32
+    attachment_producer_id = "op-" + "c" * 32
+    marker = f"[^{{{{attachment:{attachment_producer_id}}}}}]"
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="add_comment",
+        issue_key=issue_producer_id,
+        risk_level="low",
+        payload={"body": marker},
+        description="consumer",
+        source="test",
+        created_at=1,
+    )
+    inspection = dependency_orchestration.inspect_dependencies(operation)
+    assert dependency_orchestration.collect_referenced_operation_ids(
+        inspection
+    ) == (issue_producer_id, attachment_producer_id)
+    resolutions = dependency_orchestration.collect_resolutions(
+        inspection,
+        {
+            issue_producer_id: DependencyState(
+                operation_id=issue_producer_id,
+                operation_type="create_issue",
+                state="success",
+                new_issue_key="PROJ-10",
+            ),
+            attachment_producer_id: DependencyState(
+                operation_id=attachment_producer_id,
+                operation_type="add_attachment",
+                state="success",
+                operation_issue_key=issue_producer_id,
+                attachment_result=AttachmentResult(
+                    id="10", filename="a-1.jpg"
+                ),
+            ),
+        },
+    )
+    assert isinstance(resolutions[0], IssueDependencyResolution)
+    assert isinstance(resolutions[1], AttachmentDependencyResolution)
+
+    result = dependency_orchestration.materialize_references(
+        operation, resolutions
+    )
+
+    assert result.operation.issue_key == "PROJ-10"
+    assert result.operation.payload["body"] == "[^a-1.jpg]"
+    assert operation.issue_key == issue_producer_id
+    assert operation.payload["body"] == marker
+    assert [event.action_code for event in result.events] == [
+        "issue_key_resolved",
+        "attachment_resolved",
+    ]
+    assert result.events[0].data["fields"] == ("issue_key",)
+    assert result.events[1].data["paths"] == ("body",)
+    event_data = result.events[1].data
+    attachment_data = event_data["attachment_result"]
+    assert isinstance(attachment_data, dict)
+    attachment_data["id"] = "mutated-copy"
+    assert result.events[1].data["attachment_result"] == {
+        "id": "10",
+        "filename": "a-1.jpg",
+    }
+
+
+def test_materializers_return_original_snapshot_when_no_resolution_matches() -> None:
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="add_comment",
+        issue_key="PROJ-1",
+        risk_level="low",
+        payload={"body": "plain"},
+        description="consumer",
+        source="test",
+        created_at=1,
+    )
+    result = dependency_orchestration.materialize_references(
+        operation,
+        (
+            IssueDependencyResolution(
+                producer_operation_id="op-" + "b" * 32,
+                issue_key="PROJ-2",
+            ),
+            AttachmentDependencyResolution(
+                producer_operation_id="op-" + "c" * 32,
+                attachment_result=AttachmentResult(
+                    id="10", filename="a-1.jpg"
+                ),
+            ),
+        ),
+    )
+
+    assert result.operation is operation
+    assert result.events == ()
+
+
+def test_issue_dual_field_materialization_validates_one_snapshot(
+    monkeypatch,
+) -> None:
+    producer_id = "op-" + "b" * 32
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="add_issuelink",
+        issue_key=producer_id,
+        target_issue_key=producer_id,
+        risk_level="low",
+        payload={"link_type": "Relates"},
+        description="consumer",
+        source="test",
+        created_at=1,
+    )
+    original_validate = OperationRecord.model_validate
+    validation_count = 0
+
+    def counted_validate(cls, value, *args, **kwargs):
+        nonlocal validation_count
+        validation_count += 1
+        return original_validate(value, *args, **kwargs)
+
+    monkeypatch.setattr(
+        OperationRecord,
+        "model_validate",
+        classmethod(counted_validate),
+    )
+
+    result = dependency_orchestration.materialize_references(
+        operation,
+        (
+            IssueDependencyResolution(
+                producer_operation_id=producer_id,
+                issue_key="PROJ-10",
+            ),
+        ),
+    )
+
+    assert validation_count == 1
+    assert result.operation.issue_key == "PROJ-10"
+    assert result.operation.target_issue_key == "PROJ-10"
+    assert result.events[0].data["fields"] == (
+        "issue_key",
+        "target_issue_key",
+    )
+    assert operation.issue_key == producer_id
+    assert operation.target_issue_key == producer_id
+
+
+def test_attachment_multi_path_materialization_validates_one_snapshot(
+    monkeypatch,
+) -> None:
+    producer_id = "op-" + "b" * 32
+    link = f"[^{{{{attachment:{producer_id}}}}}]"
+    image = f"!{{{{attachment:{producer_id}}}}}!"
+    operation = OperationRecord(
+        operation_id="op-" + "a" * 32,
+        operation_type="transition_issue",
+        issue_key="PROJ-1",
+        risk_level="high",
+        payload={
+            "transition_name": "Start",
+            "fields": {"description": f"{link} {link}"},
+            "comment": image,
+        },
+        description="consumer",
+        source="test",
+        created_at=1,
+    )
+    original_validate = OperationRecord.model_validate
+    validation_count = 0
+
+    def counted_validate(cls, value, *args, **kwargs):
+        nonlocal validation_count
+        validation_count += 1
+        return original_validate(value, *args, **kwargs)
+
+    monkeypatch.setattr(
+        OperationRecord,
+        "model_validate",
+        classmethod(counted_validate),
+    )
+
+    result = dependency_orchestration.materialize_references(
+        operation,
+        (
+            AttachmentDependencyResolution(
+                producer_operation_id=producer_id,
+                attachment_result=AttachmentResult(
+                    id="10", filename="a-1.jpg"
+                ),
+            ),
+        ),
+    )
+
+    assert validation_count == 1
+    assert result.operation.payload["fields"] == {
+        "description": "[^a-1.jpg] [^a-1.jpg]"
+    }
+    assert result.operation.payload["comment"] == "!a-1.jpg!"
+    assert result.events[0].data["paths"] == (
+        "fields.description",
+        "comment",
+    )
+    assert operation.payload["fields"] == {"description": f"{link} {link}"}
+    assert operation.payload["comment"] == image
 
 
 def test_description_snapshot_is_copy_on_write(tmp_path) -> None:
@@ -504,7 +954,9 @@ def test_completed_upload_materializes_every_supported_content_path(queue) -> No
     )
 
 
-def test_upload_result_is_persisted_and_broadcast_to_staging(queue) -> None:
+def test_upload_result_is_persisted_and_broadcast_to_staging(
+    queue, monkeypatch
+) -> None:
     attachment = _attachment(queue)
     comment = queue.queue.enqueue(
         "add_comment",
@@ -523,9 +975,26 @@ def test_upload_result_is_persisted_and_broadcast_to_staging(queue) -> None:
     claim = queue.execution.claim_next()
     assert claim is not None
     result = AttachmentResult(id="20002", filename="a-1.jpg")
+    materialized_operation_ids: list[str] = []
+    original_materialize = dependency_orchestration.materialize_references
+
+    def counted_materialize(operation: OperationRecord, resolutions):
+        materialized_operation_ids.append(operation.operation_id)
+        return original_materialize(operation, resolutions)
+
+    monkeypatch.setattr(
+        dependency_orchestration,
+        "materialize_references",
+        counted_materialize,
+    )
     queue.execution.complete_execution(
         claim.execution_id, "success", "uploaded", None, None, 2, result
     )
+
+    assert Counter(materialized_operation_ids) == {
+        attachment.operation_id: 1,
+        comment.operation_id: 1,
+    }
 
     next_claim = queue.execution.claim_next()
     assert next_claim is not None

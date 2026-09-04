@@ -4,17 +4,7 @@ from __future__ import annotations
 
 from pydantic import ValidationError
 
-from core.operations import repository
-from core.operations.dependencies import (
-    collect_dependency_operation_ids,
-    collect_dependency_references,
-    collect_dependency_resolutions,
-    dependency_resolution_events,
-    description_reference_paths,
-    materialize_dependency_references,
-    validate_dependency_contract,
-    validate_dependency_syntax,
-)
+from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.errors import (
     DependencyConfirmationRequired,
     DependencyError,
@@ -22,6 +12,9 @@ from core.operations.errors import (
     StoreError,
 )
 from core.operations.models import OperationDraft, OperationRecord
+from core.operations.repository import dependencies as dependency_repository
+from core.operations.repository import metadata as repository_metadata
+from core.operations.repository import queue as queue_repository
 from core.operations.rules.ordering import automatic_queue
 from core.operations.rules.safety import OperationSafetyError, validate_for_enqueue
 from core.storage.database import new_id, transaction, utc_ms
@@ -48,52 +41,22 @@ def _snapshot_description_payload(
     """Normalize supported descriptions with shallow copy-on-write ownership."""
 
     result = dict(payload)
-    paths = description_reference_paths(operation_type)
     if operation_type == "create_issue":
-        selected = False
-        description: str | None = None
         description_file = result.get("description_file")
         if description_file is not None:
-            description = read_text_file(
+            result["description"] = read_text_file(
                 description_file, field_path="description_file"
             )
-            selected = True
-        elif "description" in result and result["description"] is not None:
-            description = snapshot_text_source(
+        elif "description" in result:
+            result["description"] = snapshot_text_source(
                 result["description"], field_path="description"
             )
-            selected = True
-        else:
-            nested_path = next(
-                (path for path in paths if path != "description"), None
-            )
-            nested = (
-                _nested_description(result, nested_path)
-                if nested_path is not None
-                else None
-            )
-            if nested is not None and nested_path is not None:
-                _, _, nested_value = nested
-                description = snapshot_text_source(
-                    nested_value, field_path=nested_path
-                )
-                selected = True
-            elif "description" in result:
-                description = snapshot_text_source(
-                    result["description"], field_path="description"
-                )
-                selected = True
         result.pop("description_file", None)
-        extra_fields = result.get("extra_fields")
-        if isinstance(extra_fields, dict) and "description" in extra_fields:
-            copied_extra_fields = dict(extra_fields)
-            copied_extra_fields.pop("description")
-            result["extra_fields"] = copied_extra_fields
-        if selected:
-            result["description"] = description
         return result
 
-    for path in paths:
+    for path in dependency_orchestration.attachment_reference_description_paths(
+        operation_type
+    ):
         nested = _nested_description(result, path)
         if nested is None:
             continue
@@ -149,42 +112,54 @@ class QueueService:
             created_at=utc_ms(),
             attempt_no=1,
         )
-        original_operation = operation
         with transaction() as connection:
             try:
-                references = collect_dependency_references(operation)
-                validate_dependency_syntax(
+                inspection = dependency_orchestration.inspect_dependencies(
+                    operation
+                )
+                dependency_orchestration.validate_reference_syntax(
                     operation,
+                    inspection,
                     allow_unresolved=True,
-                    references=references,
                 )
-                states = repository.dependency_states(
+                referenced_operation_ids = (
+                    dependency_orchestration.collect_referenced_operation_ids(
+                        inspection
+                    )
+                )
+                states = dependency_repository.dependency_states(
                     connection,
-                    collect_dependency_operation_ids(
-                        operation, references=references
-                    ),
+                    referenced_operation_ids,
                 )
-                validate_dependency_contract(
-                    operation, states, references=references
+                dependency_orchestration.validate_reference_contract(
+                    operation,
+                    inspection,
+                    states,
                 )
-                resolutions = collect_dependency_resolutions(
-                    operation, states, references=references
+                resolutions = dependency_orchestration.collect_resolutions(
+                    inspection,
+                    states,
                 )
             except DependencyError as exc:
                 raise StoreError(str(exc)) from exc
-            operation = materialize_dependency_references(operation, resolutions)
-            repository.insert_queue(
+            events: tuple[
+                dependency_orchestration.DependencyResolutionEvent, ...
+            ] = ()
+            if resolutions:
+                materialization = dependency_orchestration.materialize_references(
+                    operation,
+                    resolutions,
+                )
+                operation = materialization.operation
+                events = materialization.events
+            queue_repository.insert_queue(
                 connection,
                 operation,
                 action_code="mcp_append",
                 event_data={"source": source, "risk_reason": risk_reason},
             )
-            for event in dependency_resolution_events(
-                original_operation,
-                resolutions,
-                references=references,
-            ):
-                repository.append_event(
+            for event in events:
+                repository_metadata.append_event(
                     connection,
                     operation.operation_id,
                     "internal",
@@ -196,7 +171,7 @@ class QueueService:
                         "resolved_during_enqueue": True,
                     },
                 )
-            repository.bump_revisions(connection, "queue")
+            repository_metadata.bump_revisions(connection, "queue")
         return operation
 
     def cancel(
@@ -214,9 +189,12 @@ class QueueService:
         ):
             raise StoreError("取消 operation ID 必须为 1 至 1000 个且不得重复")
         with transaction() as connection:
-            if repository.revision(connection, "queue") != expected_queue_revision:
+            if (
+                repository_metadata.revision(connection, "queue")
+                != expected_queue_revision
+            ):
                 raise RevisionConflict("队列已更新，请刷新后重新确认取消范围")
-            operations = repository.queue_operations(connection)
+            operations = queue_repository.queue_operations(connection)
             operation_by_id = {
                 operation.operation_id: operation for operation in operations
             }
@@ -228,15 +206,29 @@ class QueueService:
 
             requested = set(operation_ids)
             expanded = set(requested)
-            changed = True
-            while changed:
-                changed = False
-                for operation in operations:
-                    if operation.operation_id in expanded:
+            dependants_by_producer: dict[str, list[str]] = {}
+            for operation in operations:
+                inspection = dependency_orchestration.inspect_dependencies(
+                    operation
+                )
+                for referenced_operation_id in (
+                    dependency_orchestration.collect_referenced_operation_ids(
+                        inspection
+                    )
+                ):
+                    dependants_by_producer.setdefault(
+                        referenced_operation_id, []
+                    ).append(operation.operation_id)
+            pending = list(requested)
+            while pending:
+                producer_operation_id = pending.pop()
+                for dependant_operation_id in dependants_by_producer.get(
+                    producer_operation_id, ()
+                ):
+                    if dependant_operation_id in expanded:
                         continue
-                    if set(collect_dependency_operation_ids(operation)) & expanded:
-                        expanded.add(operation.operation_id)
-                        changed = True
+                    expanded.add(dependant_operation_id)
+                    pending.append(dependant_operation_id)
 
             display = automatic_queue(operations).flattened()
             ordered_ids = [
@@ -251,7 +243,7 @@ class QueueService:
                     ordered_ids,
                 )
             for operation_id in ordered_ids:
-                repository.append_event(
+                repository_metadata.append_event(
                     connection,
                     operation_id,
                     "dequeue",
@@ -262,6 +254,6 @@ class QueueService:
                     ),
                     {"requested_operation_ids": operation_ids},
                 )
-            repository.delete_queue(connection, ordered_ids)
-            repository.bump_revisions(connection, "queue")
-            return ordered_ids, repository.revision(connection, "queue")
+            queue_repository.delete_queue(connection, ordered_ids)
+            repository_metadata.bump_revisions(connection, "queue")
+            return ordered_ids, repository_metadata.revision(connection, "queue")

@@ -72,6 +72,26 @@ def test_all_mounted_tool_docstrings_are_complete_clear_and_chinese(cfg):
         )
 
 
+def test_registered_create_tool_assigns_dedicated_field_ownership(cfg):
+    tool = next(
+        item
+        for item in server.mcp._tool_manager.list_tools()
+        if item.name == "jira_issue_create_append"
+    )
+
+    assert "extra_fields.description" not in tool.description
+    assert "专用参数" in tool.description
+    for field_name in (
+        "project",
+        "issuetype",
+        "summary",
+        "description",
+        "priority",
+        "assignee",
+    ):
+        assert field_name in tool.description
+
+
 def test_all_mounted_resource_and_prompt_docstrings_are_complete_and_chinese(cfg):
     resources = server.mcp._resource_manager.list_resources()
     resource_templates = server.mcp._resource_manager.list_templates()

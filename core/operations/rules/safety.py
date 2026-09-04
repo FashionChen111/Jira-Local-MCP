@@ -9,8 +9,13 @@ from typing import Literal
 
 from pydantic import JsonValue
 
-from core.operations.dependencies import validate_dependency_syntax
-from core.operations.models import OperationDraft, OperationRecord, RiskLevel
+from core.operations.dependencies import orchestration as dependency_orchestration
+from core.operations.models import (
+    DependencyState,
+    OperationDraft,
+    OperationRecord,
+    RiskLevel,
+)
 from core.operations.errors import DependencyError
 
 
@@ -42,6 +47,14 @@ _MEDIUM_RISK = frozenset(
 _CLOSE_KEYWORDS = ("关闭", "解决", "完成", "close", "resolve", "done", "cancel")
 _DELETE_PATTERN = re.compile(r"delete|remove|purge|删除|移除", re.IGNORECASE)
 _CUSTOM_FIELD_PATTERN = re.compile(r"customfield_\d+\Z")
+_CREATE_ISSUE_FIELD_OWNERS: Mapping[str, str] = {
+    "project": "project_key",
+    "issuetype": "issue_type",
+    "summary": "summary",
+    "description": "description 或 description_file",
+    "priority": "priority",
+    "assignee": "assignee",
+}
 
 _PayloadValueKind = Literal[
     "string",
@@ -199,6 +212,21 @@ def assert_valid_payload_shape(
                 + "、".join(invalid)
             )
 
+    if operation_type == "create_issue":
+        extra_fields = payload.get("extra_fields")
+        if not isinstance(extra_fields, dict):
+            return
+        conflicts = sorted(extra_fields.keys() & _CREATE_ISSUE_FIELD_OWNERS.keys())
+        if conflicts:
+            guidance = "、".join(
+                f"{name}（请使用顶层 {_CREATE_ISSUE_FIELD_OWNERS[name]}）"
+                for name in conflicts
+            )
+            raise OperationSafetyError(
+                "create_issue.payload.extra_fields 不得包含专用字段："
+                f"{guidance}"
+            )
+
 
 def classify_base_risk(
     operation_type: str, payload: Mapping[str, JsonValue]
@@ -260,14 +288,28 @@ def validate_for_enqueue(draft: OperationDraft) -> tuple[RiskLevel, str]:
     return classify_base_risk(draft.operation_type, draft.payload)
 
 
-def assert_safe_for_submit(operation: OperationRecord) -> None:
-    """Recheck immutable safety rules while direct dependencies may remain."""
+def submission_problem(
+    operation: OperationRecord,
+    inspection: dependency_orchestration.DependencyInspection,
+    dependency_states: Mapping[str, DependencyState],
+) -> str | None:
+    """Return the first common or dependency safety problem for submission."""
 
-    assert_allowed_and_non_delete(operation.operation_type, operation.payload)
     try:
-        validate_dependency_syntax(operation, allow_unresolved=True)
-    except DependencyError as exc:
-        raise OperationSafetyError(str(exc)) from exc
+        assert_allowed_and_non_delete(operation.operation_type, operation.payload)
+        assert_valid_payload_shape(operation.operation_type, operation.payload)
+        dependency_orchestration.validate_reference_syntax(
+            operation,
+            inspection,
+            allow_unresolved=True,
+        )
+    except (DependencyError, OperationSafetyError) as exc:
+        return str(exc)
+    return dependency_orchestration.submission_reference_problem(
+        operation,
+        inspection,
+        dependency_states,
+    )
 
 
 def classify_submission_risks(
@@ -300,6 +342,11 @@ def assert_safe_to_execute(operation: OperationRecord) -> None:
     assert_allowed_and_non_delete(operation.operation_type, operation.payload)
     assert_valid_payload_shape(operation.operation_type, operation.payload)
     try:
-        validate_dependency_syntax(operation, allow_unresolved=False)
+        inspection = dependency_orchestration.inspect_dependencies(operation)
+        dependency_orchestration.validate_reference_syntax(
+            operation,
+            inspection,
+            allow_unresolved=False,
+        )
     except DependencyError as exc:
         raise OperationSafetyError(str(exc)) from exc

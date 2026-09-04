@@ -1,4 +1,4 @@
-"""Staging and execution-history persistence for one atomic lifecycle."""
+"""Public staging and execution-history persistence capabilities."""
 
 from __future__ import annotations
 

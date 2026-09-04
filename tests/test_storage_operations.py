@@ -9,7 +9,8 @@ import pytest
 from pydantic import ValidationError
 
 from core.operations import ConfirmationRequired, RevisionConflict, StoreError
-from core.operations import repository
+from core.operations.repository import dependencies as dependency_repository
+from core.operations.repository import execution as execution_repository
 from core.storage.database import open_database, transaction
 
 
@@ -42,9 +43,11 @@ def test_repository_terminalizes_one_dependency_failure(queue) -> None:
     operation = enqueue_comment(queue, "PROJ-1")
     queue.submission.submit(1, [operation.operation_id], False)
     with transaction() as connection:
-        staging = repository.staging_record(connection, operation.operation_id)
+        staging = execution_repository.staging_record(
+            connection, operation.operation_id
+        )
         assert staging is not None
-        repository.terminalize_dependency_failure(
+        dependency_repository.terminalize_dependency_failure(
             connection,
             staging,
             producer_operation_id="op-" + "f" * 32,
@@ -79,9 +82,11 @@ def test_dependency_failure_transition_rolls_back_with_outer_transaction(queue) 
     queue.submission.submit(1, [operation.operation_id], False)
     with pytest.raises(RuntimeError, match="rollback dependency transition"):
         with transaction() as connection:
-            staging = repository.staging_record(connection, operation.operation_id)
+            staging = execution_repository.staging_record(
+                connection, operation.operation_id
+            )
             assert staging is not None
-            repository.terminalize_dependency_failure(
+            dependency_repository.terminalize_dependency_failure(
                 connection,
                 staging,
                 producer_operation_id="op-" + "e" * 32,

@@ -1,4 +1,4 @@
-"""Revision, event, and aggregate operations metadata persistence."""
+"""Public revision, event, and aggregate metadata persistence capabilities."""
 
 from __future__ import annotations
 
