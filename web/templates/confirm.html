@@ -49,6 +49,17 @@
         </div>
       </section>
     </main>
+    <dialog id="cancel-scope-dialog" aria-labelledby="cancel-scope-title" aria-describedby="cancel-scope-summary">
+      <h2 id="cancel-scope-title">确认取消范围</h2>
+      <p id="cancel-scope-summary"></p>
+      <p>以下操作将一起从本地审核队列取消，不会写入 Jira。</p>
+      <ol id="cancel-scope-list" aria-label="完整取消范围"></ol>
+      <p id="cancel-scope-error" role="status"></p>
+      <div class="actions">
+        <button id="cancel-scope-back" autofocus>返回</button>
+        <button id="cancel-scope-confirm" class="danger">确认取消全部</button>
+      </div>
+    </dialog>
     <script src="/static/confirm.js" defer></script>
   </body>
 </html>

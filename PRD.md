@@ -105,6 +105,10 @@ Jira Local MCP 是连接通用 Agent 与 Jira Server/Data Center 的本地 MCP �
 
 撤回不接受级联确认 flag。Web 与 MCP 共用依赖闭包校验和取消事务；范围不足时返回 dependency_scope_incomplete、affected_operation_ids 和 missing_operation_ids。版本冲突、范围不足、未知或已离开队列的 ID 均整批拒绝，不写取消事件、不更新 revision。Web 保留人工确认交互，确认后提交完整 ID 范围并沿用首次请求 revision。
 
+局部查询不再先构建 Web 全量状态：队列概览全局排序后仅组装当前页，详情按 ID 批量读取并按请求顺序返回，活动执行状态按 stage_order 在 SQL 中分页。每个查询的记录、依赖事实、总数与 revisions 均来自同一读事务；Web 全量状态复用相同公开记录转换，不拼接跨事务结果。
+
+业务 Tool 由 `core/mcp_tools/` 子包统一公开：`jira_query` 负责 Jira 只读查询，`jira_enqueue` 负责入队，`queue_tool` 负责本地查询、撤回及执行日志。server 通过函数引用统一注册，继续承担审核页面入口、Prompt、Resource 和服务生命周期。
+
 Agent 可通过取消后重新入队修正待审核内容，两步不原子，重新入队失败时旧操作已撤回；依赖链须使用新 ID 重建，不编辑记录或替换依赖。MCP 不开放提交、执行、恢复、编辑或清空 Tool；本次变更不修改数据库 schema。
 
 #### Resource 与 Prompt
@@ -140,7 +144,8 @@ Agent 可通过取消后重新入队修正待审核内容，两步不原子，�
 - 取消与提交均支持多选，并以事务方式保证整批成功或整批不变。
 - 提交选择必须包含仍在队列中的依赖生产者，服务端按依赖拓扑稳定生成 stage order；页面会可见地联动勾选生产者，但后端不会暗中扩大授权。
 - 事务目标引用和附件正文引用由两个对称的领域规则模块解析，通过统一依赖门面参与状态查询、闭包、拓扑排序和失败传播。
-- 取消创建/克隆或附件上传 operation 时，页面明确展示并二次确认仍在队列中的级联依赖范围。
+- 取消范围缺少下游依赖时，本地明细弹窗按后端顺序展示全部受影响操作，标记原选项和新增依赖，列出完整 ID、类型、说明及关联/目标事务；用户一次确认即可取消全部，无需补勾。长列表滚动、长文本换行，支持窄屏、返回及 Escape。
+- 弹窗使用首次请求的展示快照和 revision，轮询不替换确认内容；版本冲突后刷新并重新确认，不自动重试。展示记录缺失时停止预览并刷新，超过单次 1000 项时禁用确认，会话失效时关闭弹窗。同一时间仅允许一个取消流程，网络失败后恢复入口供用户核实状态。
 
 当一次提交中同一事务包含 5 个或更多标准/自定义字段 operation 时，这些条目的提交风险会升级为高风险，并要求二次确认。
 
@@ -178,7 +183,7 @@ Agent 可通过取消后重新入队修正待审核内容，两步不原子，�
 - `mcp_logs.sqlite3`：Tool 调用、Resource 读取和 Prompt 获取的完整 MCP 业务请求/响应及时间信息。
 - `jira_execution.lock`：跨进程 Jira 写入互斥锁。
 
-queue、staging 和 history 都保存自包含的 operation 快照：两个目标 Key 位于独立列，`payload_json` 保存 operation 专属参数和尚未物化的显式附件引用。事务目标与附件正文采用独立的领域解析模块，不使用通用字段 resolver。附件 ID 和最终文件名共同保存在一个 `AttachmentResult` 结构中，并以单个 `attachment_result_json` 字段落库；公共输出统一使用 `dependency_operation_ids` 和 `dependency_states`，物化关系分别记录为 `issue_key_resolved` 与 `attachment_resolved` 事件。
+queue、staging 和 history 都保存自包含的 operation 快照：两个目标 Key 位于独立列，`payload_json` 保存 operation 专属参数和尚未物化的显式附件引用。事务目标与附件正文采用独立的领域解析模块，不使用通用字段 resolver。附件 ID 和最终文件名共同保存在一个 `AttachmentResult` 结构中，并以单个 `attachment_result_json` 字段落库；公共输出统一使用 `dependency_states` 映射表达依赖 operation ID 及生命周期状态（未知为 `unknown`），映射键顺序不代表执行顺序；物化关系分别记录为 `issue_key_resolved` 与 `attachment_resolved` 事件。
 
 SQLite 使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema version。业务队列事务与 MCP 日志相互独立，日志记录失败不会改变 MCP 业务结果。
 2.3.0 使用新的 operations v1 结构身份，不迁移任何旧 operations 数据；检测到身份不符时会拒绝启动并要求人工清除配置所指向的 operations DB 及精确 sidecar。独立的 MCP 日志库无需清除。

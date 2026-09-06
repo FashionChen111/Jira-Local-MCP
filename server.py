@@ -6,15 +6,15 @@ import json
 import os
 import time
 import webbrowser
-from typing import Annotated, Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import mcp.types as mcp_types
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.exceptions import McpError
-from pydantic import Field
 
 from config import SERVICE_VERSION, get_config
 from core.executing import worker as execution_worker
+from core.mcp_tools import TOOLS
 from core.runtime_logger import get_logger, redact
 from core.storage.database import utc_ms
 from core.storage.mcp_logs import record_exchange
@@ -77,15 +77,8 @@ def _install_business_exchange_logging(server: FastMCP) -> None:
 _install_business_exchange_logging(mcp)
 
 
-from core import mcp_tools as _mcp_tools  # noqa: E402
-
-for _name in _mcp_tools.TOOL_NAMES:
-    _function = getattr(_mcp_tools, _name)
-    globals()[_name] = _function
+for _function in TOOLS:
     mcp.tool()(_function)
-
-
-ExecutionLogLimit = Annotated[int, Field(strict=True, ge=1)]
 
 
 @mcp.tool()
@@ -121,33 +114,6 @@ def jira_show_queue() -> str:
         )
     except Exception as exc:
         return f"打开审核页面失败: {redact(type(exc).__name__ + ': ' + str(exc))}"
-
-
-@mcp.tool()
-def jira_get_execution_log(limit: ExecutionLogLimit = 10) -> str:
-    """读取最近持久化的执行尝试及人工对账结果；这是只读工具。
-
-    参数：
-        limit: 最多返回的最近记录数，必须是正整数，默认为 10。
-
-    返回：
-        脱敏后的 JSON 执行与对账历史，或状态/错误信息。本工具不会将操作
-        入队，也不会执行 Jira 写入。
-
-    副作用：
-        无 Jira 写入；只会读取本地持久化的执行历史。
-    """
-    try:
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
-            raise ValueError("limit 必须是大于等于 1 的整数")
-        records = get_services().query.read_execution_log(limit)
-        return (
-            "暂无执行记录。"
-            if not records
-            else redact(json.dumps(records, ensure_ascii=False, indent=2))
-        )
-    except Exception as exc:
-        return f"查询执行日志失败: {redact(type(exc).__name__ + ': ' + str(exc))}"
 
 
 def _read_knowledge(name: str) -> str:

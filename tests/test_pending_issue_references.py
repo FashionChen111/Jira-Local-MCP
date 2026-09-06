@@ -87,9 +87,9 @@ def test_pending_group_and_submission_closure_are_automatic(queue) -> None:
         producer.operation_id,
         child.operation_id,
     ]
-    assert group["operations"][1]["dependency_operation_ids"] == [
-        producer.operation_id
-    ]
+    assert group["operations"][1]["dependency_states"] == {
+        producer.operation_id: "queued"
+    }
 
     with pytest.raises(StoreError, match="缺少依赖"):
         queue.submission.submit(2, [child.operation_id], False)
@@ -111,15 +111,20 @@ def test_link_primary_group_ignores_second_target_dependency(queue) -> None:
     assert [item["operation_id"] for item in state["standalone"]] == [
         link.operation_id
     ]
-    assert state["standalone"][0]["dependency_operation_ids"] == [
-        target.operation_id
-    ]
+    assert state["standalone"][0]["dependency_states"] == {
+        target.operation_id: "queued"
+    }
 
 
 def test_two_link_producers_complete_in_order_before_link_claim(queue) -> None:
     left = enqueue_create(queue, "left")
     right = enqueue_create(queue, "right")
     link = enqueue_link(queue, left.operation_id, right.operation_id)
+    details = queue.query.get_queue_operations([link.operation_id])
+    assert details.items[0].dependency_states == {
+        left.operation_id: "queued", right.operation_id: "queued"
+    }
+    assert "dependency_operation_ids" not in details.items[0].model_dump()
     accepted, _ = queue.submission.submit(
         3, [link.operation_id, right.operation_id, left.operation_id], False
     )
@@ -212,7 +217,7 @@ def test_completed_producer_is_materialized_during_later_enqueue(queue) -> None:
         for group in state["groups"]
         for item in group["operations"]
     ] + state["standalone"]
-    assert all(not item["dependency_operation_ids"] for item in all_items)
+    assert all(not item["dependency_states"] for item in all_items)
 
 
 def test_queue_reclassifies_automatically_after_producer_result(queue) -> None:
@@ -244,6 +249,13 @@ def test_failed_producer_terminalizes_staged_dependants_for_either_key(queue) ->
         [producer.operation_id, primary.operation_id, target.operation_id],
         False,
     )
+    staged = public_state(queue)["execution"]["staged"]
+    for item in staged:
+        assert "dependency_operation_ids" not in item
+        assert item["dependency_states"] == (
+            {} if item["operation_id"] == producer.operation_id
+            else {producer.operation_id: "staged"}
+        )
     claim = queue.execution.claim_next()
     assert claim is not None
     queue.execution.complete_execution(
@@ -256,6 +268,30 @@ def test_failed_producer_terminalizes_staged_dependants_for_either_key(queue) ->
     assert by_id[producer.operation_id]["outcome"] == "failed"
     assert by_id[primary.operation_id]["outcome"] == "dependency_failed"
     assert by_id[target.operation_id]["outcome"] == "dependency_failed"
+    for operation_id in (primary.operation_id, target.operation_id):
+        assert by_id[operation_id]["dependency_states"] == {
+            producer.operation_id: "failed"
+        }
+        assert "dependency_operation_ids" not in by_id[operation_id]
+
+
+def test_public_dependency_mapping_preserves_unknown_references(queue) -> None:
+    missing_id = "op-" + "e" * 32
+    consumer = unresolved_consumer(missing_id)
+    with transaction() as connection:
+        queue_repository.insert_queue(
+            connection, consumer, action_code="mcp_append",
+            event_data={"source": "test"},
+        )
+        repository_metadata.bump_revisions(connection, "queue")
+
+    detail = queue.query.get_queue_operations([consumer.operation_id]).items[0]
+    group = queue.query.get_state().queue.groups[0]
+    assert detail.dependency_states == {missing_id: "unknown"}
+    assert detail.submittable is False
+    assert group.operations == (detail,)
+    assert group.producer_state == "unknown"
+    assert "dependency_operation_ids" not in detail.model_dump()
 
 
 def test_cancel_producer_cascades_through_primary_and_target_references(queue) -> None:

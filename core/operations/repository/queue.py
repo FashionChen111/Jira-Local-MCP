@@ -37,6 +37,24 @@ def queue_operation(
     return operation_from_row(row) if row is not None else None
 
 
+def queue_operations_by_ids(
+    connection: sqlite3.Connection, operation_ids: Sequence[str],
+) -> list[OperationRecord]:
+    """Load only requested queued snapshots; callers determine result order."""
+    records: list[OperationRecord] = []
+    requested = tuple(dict.fromkeys(operation_ids))
+    for start in range(0, len(requested), 400):
+        chunk = requested[start : start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = connection.execute(
+            f"SELECT {OPERATION_COLUMNS} FROM queue_items "
+            f"WHERE operation_id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        records.extend(operation_from_row(row) for row in rows)
+    return records
+
+
 def insert_queue(
     connection: sqlite3.Connection,
     operation: OperationRecord,

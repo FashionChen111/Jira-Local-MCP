@@ -10,6 +10,9 @@ import pytest
 import server
 from core import jira_client, mcp_tools
 from core.operations.repository import queue as queue_repository
+from core.operations.repository import execution as execution_repository
+from core.operations.repository import metadata as repository_metadata
+from core.operations.dependencies import orchestration as dependency_orchestration
 from core.storage.database import open_database
 
 
@@ -156,7 +159,7 @@ def test_execution_snapshots_cover_lifecycle_without_claiming_success(queue):
     remaining = json.loads(mcp_tools.jira_list_execution_state())
     assert remaining["total"] == 2
     assert remaining["revisions"]["execution"] > active["revisions"]["execution"]
-    assert json.loads(server.jira_get_execution_log())[0]["operation_id"] == claim.operation.operation_id
+    assert json.loads(mcp_tools.jira_get_execution_log())[0]["operation_id"] == claim.operation.operation_id
     assert queue.execution.claim_next() is not None
     queue.execution.recover_interrupted()
     interrupted = json.loads(mcp_tools.jira_list_execution_state())
@@ -235,10 +238,10 @@ def test_mcp_output_redacts_credentials_and_internal_errors(queue, monkeypatch):
     assert "SECRET_TOKEN" not in serialized
     assert json.loads(serialized)["items"]
 
-    def broken():
+    def broken(*_args):
         raise RuntimeError("SECRET_TOKEN sensitive failure")
 
-    monkeypatch.setattr(queue.query, "get_state", broken)
+    monkeypatch.setattr(queue.query, "list_queue", broken)
     result = mcp_tools.jira_list_queue()
     assert "SECRET_TOKEN" not in result and "Traceback" not in result
     assert json.loads(result)["code"] == "internal_error"
@@ -284,3 +287,145 @@ def test_registered_queue_schemas_and_protocol_results(queue):
         assert json.loads(structured["result"])["total"] == 0
 
     anyio.run(inspect_protocol)
+
+
+@pytest.mark.parametrize("read_kind", ["queue", "details", "execution"])
+def test_partial_reads_keep_their_own_transaction_snapshot(queue, monkeypatch, read_kind):
+    operation = _comment(queue)
+    if read_kind == "execution":
+        queue.submission.submit(1, [operation.operation_id], False)
+    original = repository_metadata.revisions
+    changed = False
+
+    def revisions_after_concurrent_write(connection):
+        nonlocal changed
+        assert connection.in_transaction
+        if not changed:
+            changed = True
+            if read_kind == "execution":
+                assert queue.execution.claim_next() is not None
+            else:
+                queue.submission.submit(1, [operation.operation_id], False)
+        return original(connection)
+
+    monkeypatch.setattr(repository_metadata, "revisions", revisions_after_concurrent_write)
+    if read_kind == "execution":
+        result = queue.query.list_execution_state()
+        assert result.total == 1
+        assert result.items[0].state == "staged"
+        assert result.revisions == {"queue": 2, "execution": 1, "history": 0}
+        assert queue.query.list_execution_state().items[0].state == "executing"
+    else:
+        result = (
+            queue.query.list_queue() if read_kind == "queue"
+            else queue.query.get_queue_operations([operation.operation_id])
+        )
+        assert result.items[0].operation_id == operation.operation_id
+        assert result.revisions == {"queue": 1, "execution": 0, "history": 0}
+        assert not queue.query.get_queue_operations([operation.operation_id]).items
+
+
+@pytest.mark.parametrize("read_kind", ["queue", "details", "execution"])
+def test_partial_reads_prepare_only_requested_public_records(queue, monkeypatch, read_kind):
+    operations = [_comment(queue, f"PROJ-{index}") for index in range(1, 7)]
+    staged_ids, _ = queue.submission.submit(
+        6, [item.operation_id for item in operations[:3]], False,
+    )
+    inspected: list[str] = []
+    inspect_original = dependency_orchestration.inspect_dependencies
+
+    def inspect(record):
+        inspected.append(record.operation_id)
+        return inspect_original(record)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("A partial query loaded unrelated full state")
+
+    monkeypatch.setattr(dependency_orchestration, "inspect_dependencies", inspect)
+    monkeypatch.setattr(queue.query, "get_state", forbidden)
+    monkeypatch.setattr(execution_repository, "staging_records", forbidden)
+    if read_kind != "queue":
+        monkeypatch.setattr(queue_repository, "queue_operations", forbidden)
+    if read_kind == "queue":
+        result = queue.query.list_queue(page=2, page_size=1)
+        assert result.total == 3
+        assert [item.operation_id for item in result.items] == [operations[4].operation_id]
+    elif read_kind == "details":
+        ids = [operations[5].operation_id, operations[0].operation_id, operations[3].operation_id]
+        result = queue.query.get_queue_operations(ids)
+        assert [item.operation_id for item in result.items] == [ids[0], ids[2]]
+        assert result.missing_operation_ids == (ids[1],)
+    else:
+        result = queue.query.list_execution_state(page=2, page_size=1)
+        assert result.total == 3
+        assert [item.operation_id for item in result.items] == [staged_ids[1]]
+    assert set(inspected) == {item.operation_id for item in result.items}
+    assert len(inspected) == len(result.items)
+
+
+def test_partial_detail_dependency_facts_share_snapshot(queue, monkeypatch):
+    producer = queue.queue.enqueue(
+        "create_issue", None,
+        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"}, "create", "test",
+    )
+    child = _comment(queue, producer.operation_id)
+    original = queue_repository.queue_operations_by_ids
+
+    def read_then_submit(connection, ids):
+        records = original(connection, ids)
+        queue.submission.submit(2, [producer.operation_id, child.operation_id], False)
+        return records
+
+    monkeypatch.setattr(queue_repository, "queue_operations_by_ids", read_then_submit)
+    result = queue.query.get_queue_operations([child.operation_id])
+    assert result.items[0].dependency_states == {producer.operation_id: "queued"}
+    assert result.revisions == {"queue": 2, "execution": 0, "history": 0}
+
+
+def test_repository_pages_decode_only_selected_rows(queue):
+    operations = [_comment(queue, f"PROJ-{index}") for index in (1, 2, 3)]
+    ids, _ = queue.submission.submit(3, [op.operation_id for op in operations], False)
+    queued = [_comment(queue), _comment(queue)]
+    connection = open_database("operations")
+    try:
+        # Unrelated payload corruption must not be decoded by targeted SQL queries.
+        connection.execute(
+            "UPDATE execution_staging SET payload_json='[]' WHERE operation_id=?", (ids[0],),
+        )
+        connection.execute(
+            "UPDATE queue_items SET payload_json='[]' WHERE operation_id=?", (queued[0].operation_id,),
+        )
+    finally:
+        connection.close()
+    result = queue.query.list_execution_state(page=2, page_size=1)
+    assert result.total == 3 and result.items[0].operation_id == ids[1]
+    assert not queue.query.list_execution_state(page=4, page_size=1).items
+    assert queue.query.get_queue_operations([queued[1].operation_id]).items[0].operation_id == queued[1].operation_id
+
+
+def test_execution_page_count_and_rows_share_snapshot(queue, monkeypatch):
+    operation = _comment(queue)
+    queue.submission.submit(1, [operation.operation_id], False)
+    claim = queue.execution.claim_next()
+    assert claim is not None
+    from core.operations.services import query as query_module
+    original = query_module.open_database
+    changed = False
+
+    def open_with_concurrent_completion(kind):
+        connection = original(kind)
+
+        def before_select(statement):
+            nonlocal changed
+            if statement.startswith("SELECT * FROM execution_staging ORDER BY") and not changed:
+                changed = True
+                queue.execution.complete_execution(claim.execution_id, "success", "done", None, None, 1)
+
+        connection.set_trace_callback(before_select)
+        return connection
+
+    monkeypatch.setattr(query_module, "open_database", open_with_concurrent_completion)
+    result = queue.query.list_execution_state()
+    assert changed and result.total == 1 and len(result.items) == 1
+    assert result.items[0].state == "executing"
+    assert not queue.query.list_execution_state().items

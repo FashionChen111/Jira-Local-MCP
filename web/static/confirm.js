@@ -16,6 +16,8 @@ let historyPage = 1;
 let historyPages = 1;
 let lastHistoryRevision = -1;
 let sessionExpired = false;
+let cancellationBusy = false;
+const cancelScopeDialog = document.getElementById("cancel-scope-dialog");
 
 const sessionExpiredMessage =
   "审核会话已失效。页面已停止刷新并禁用审核操作，请重新调用 jira_show_queue。";
@@ -30,7 +32,7 @@ function el(tag, className, text) {
 function button(text, handler, className) {
   const node = el("button", className, text);
   node.type = "button";
-  node.disabled = sessionExpired;
+  node.disabled = sessionExpired || (cancellationBusy && node.classList.contains("queue-cancel"));
   node.addEventListener("click", handler);
   return node;
 }
@@ -44,6 +46,7 @@ function message(text) {
 function expireSession() {
   if (sessionExpired) return;
   sessionExpired = true;
+  if (cancelScopeDialog.open) cancelScopeDialog.close("back");
   clearTimeout(pollTimer);
   document.querySelectorAll("button,input,select").forEach((control) => {
     control.disabled = true;
@@ -70,7 +73,7 @@ function queueOperationMap() {
 }
 
 function dependencyIds(operation) {
-  return operation.dependency_operation_ids || [];
+  return Object.keys(operation.dependency_states || {});
 }
 
 function recomputeSelected() {
@@ -197,7 +200,7 @@ function queueControls(operation) {
       button(
         "取消此项",
         () => cancelOperations([operation.operation_id], state.revisions.queue),
-        "danger",
+        "danger queue-cancel",
       ),
     );
   }
@@ -452,7 +455,80 @@ async function submitSelected(highRiskConfirmed = false) {
   await loadState(true);
 }
 
+function setCancellationBusy(busy) {
+  cancellationBusy = busy;
+  document.querySelectorAll("#cancel-selected, .queue-cancel").forEach((control) => {
+    control.disabled = sessionExpired || busy;
+  });
+}
+
+function cancellationTarget(key) {
+  if (!key) return "尚未生成 Jira Key";
+  return /^op-[a-f0-9]{32}$/.test(key) ? `待创建操作 ${key}` : key;
+}
+
+function confirmCancellationScope(affected, missing, snapshot, requestedCount) {
+  const list = document.getElementById("cancel-scope-list");
+  const confirmButton = document.getElementById("cancel-scope-confirm");
+  const backButton = document.getElementById("cancel-scope-back");
+  const error = document.getElementById("cancel-scope-error");
+  const added = new Set(missing);
+  document.getElementById("cancel-scope-summary").textContent =
+    `原先选择 ${requestedCount} 项，新增依赖 ${missing.length} 项，共 ${affected.length} 项。`;
+  list.replaceChildren(...affected.map((id) => {
+    const operation = snapshot.get(id);
+    const item = el("li", `cancel-scope-item${added.has(id) ? " is-added" : ""}`);
+    item.dataset.cancelOperationId = id;
+    item.append(
+      el("span", "cancel-scope-label", added.has(id) ? "新增依赖" : "原先选择"),
+      el("div", "operation-title", operation.description),
+      el("div", "meta", `操作 ID：${id}`),
+      el("div", "meta", `操作类型：${operation.operation_type}`),
+      el("div", "meta", `关联事务：${cancellationTarget(operation.issue_key)}`),
+    );
+    if (operation.target_issue_key) {
+      item.append(el("div", "meta", `目标事务：${cancellationTarget(operation.target_issue_key)}`));
+    }
+    return item;
+  }));
+  const exceedsLimit = affected.length > 1000;
+  error.textContent = exceedsLimit
+    ? "完整取消范围超过单次 1000 项限制，无法一次取消；请返回并重新选择满足依赖范围的操作。"
+    : "";
+  confirmButton.textContent = `确认取消全部 ${affected.length} 项`;
+  confirmButton.disabled = exceedsLimit;
+  backButton.disabled = false;
+  return new Promise((resolve) => {
+    function accept() {
+      if (sessionExpired || confirmButton.disabled) return;
+      confirmButton.disabled = true;
+      cancelScopeDialog.close("confirmed");
+    }
+    function decline() {
+      cancelScopeDialog.close("back");
+    }
+    function escape(event) {
+      event.preventDefault();
+      decline();
+    }
+    function finish() {
+      confirmButton.removeEventListener("click", accept);
+      backButton.removeEventListener("click", decline);
+      cancelScopeDialog.removeEventListener("cancel", escape);
+      resolve(!sessionExpired && cancelScopeDialog.returnValue === "confirmed");
+    }
+    confirmButton.addEventListener("click", accept);
+    backButton.addEventListener("click", decline);
+    cancelScopeDialog.addEventListener("cancel", escape);
+    cancelScopeDialog.addEventListener("close", finish, { once: true });
+    cancelScopeDialog.returnValue = "back";
+    cancelScopeDialog.showModal();
+    backButton.focus();
+  });
+}
+
 async function cancelSelected() {
+  if (sessionExpired || cancellationBusy) return;
   const ids = [...explicitSelected];
   if (!ids.length) {
     message("请先勾选 operation");
@@ -463,48 +539,79 @@ async function cancelSelected() {
 }
 
 async function cancelOperations(ids, expectedQueueRevision) {
-  if (sessionExpired) return;
-  const response = await reviewFetch("/api/queue/cancel", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      expected_queue_revision: expectedQueueRevision,
-      operation_ids: ids,
-    }),
-  });
-  if (sessionExpired) return;
-  const data = await response.json();
-  if (
-    response.status === 409 &&
-    data.code === "dependency_scope_incomplete"
-  ) {
-    const requested = new Set(ids);
-    const affected = data.affected_operation_ids || [];
-    const dependentCount = affected.filter((id) => !requested.has(id)).length;
-    if (
-      confirm(
-        `所选操作仍有 ${dependentCount} 个队列依赖，将原子取消共 ${affected.length} 个 operation。确认继续？`,
-      )
-    ) {
-      return cancelOperations(affected, expectedQueueRevision);
-    }
-    return;
+  if (sessionExpired || cancellationBusy) return;
+  const trigger = document.activeElement;
+  const triggerOperationId = trigger?.closest("[data-operation-id]")?.dataset.operationId;
+  const requestedIds = [...ids];
+  // Copy only displayed immutable fields before the first asynchronous request.
+  const snapshot = new Map(allQueueOperations().map((operation) => [
+    operation.operation_id,
+    {
+      operation_type: operation.operation_type,
+      description: operation.description,
+      issue_key: operation.issue_key,
+      target_issue_key: operation.target_issue_key,
+    },
+  ]));
+  setCancellationBusy(true);
+  async function send(operationIds) {
+    const response = await reviewFetch("/api/queue/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_queue_revision: expectedQueueRevision,
+        operation_ids: operationIds,
+      }),
+    });
+    return { response, data: sessionExpired ? null : await response.json() };
   }
-  if (!response.ok) {
-    message(data.error || "取消失败");
-    if (data.code === "revision_conflict") {
-      etag = null;
-      await loadState(true);
+  try {
+    let { response, data } = await send(requestedIds);
+    if (sessionExpired) return;
+    if (response.status === 409 && data.code === "dependency_scope_incomplete") {
+      const affected = data.affected_operation_ids;
+      const missing = data.missing_operation_ids;
+      if (!Array.isArray(affected) || !affected.length || !Array.isArray(missing) ||
+          affected.some((id) => !snapshot.has(id))) {
+        message("取消范围的展示记录不完整，请刷新后重新选择并取消。");
+        etag = null;
+        await loadState(true);
+        return;
+      }
+      const confirmed = await confirmCancellationScope(affected, missing, snapshot, requestedIds.length);
+      if (!confirmed || sessionExpired) return;
+      ({ response, data } = await send(affected));
+      if (sessionExpired) return;
     }
-    return;
+    if (!response.ok) {
+      message(data.error || "取消失败");
+      if (data.code === "revision_conflict") {
+        etag = null;
+        await loadState(true);
+      }
+      return;
+    }
+    (data.cancelled_operation_ids || []).forEach((id) => {
+      selected.delete(id);
+      explicitSelected.delete(id);
+    });
+    message("已从本地审核队列取消所选 operation；未写入 Jira。");
+    etag = null;
+    await loadState(true);
+  } catch (_error) {
+    message("取消请求失败，请刷新确认队列状态后重试。");
+  } finally {
+    setCancellationBusy(false);
+    if (!sessionExpired) {
+      const replacement = triggerOperationId
+        ? [...queueContent.querySelectorAll("[data-operation-id]")]
+            .find((card) => card.dataset.operationId === triggerOperationId)
+            ?.querySelector(".queue-cancel")
+        : null;
+      const focusTarget = trigger?.isConnected ? trigger : replacement;
+      (focusTarget || document.getElementById("cancel-selected")).focus();
+    }
   }
-  (data.cancelled_operation_ids || []).forEach((id) => {
-    selected.delete(id);
-    explicitSelected.delete(id);
-  });
-  message("已从本地审核队列取消所选 operation；未写入 Jira。");
-  etag = null;
-  await loadState(true);
 }
 
 async function loadHistory(force = false) {

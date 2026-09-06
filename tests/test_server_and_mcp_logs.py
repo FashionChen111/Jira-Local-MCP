@@ -14,7 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.resources.types import FunctionResource
 
 import server
-from core import mcp_tools
+from core import jira_client, mcp_tools
 from core.storage import mcp_logs
 from core.storage.database import open_database
 from core.storage.mcp_logs import record_exchange
@@ -25,6 +25,20 @@ RequestHandler = Callable[..., Awaitable[mcp_types.ServerResult]]
 
 def _tool_names():
     return {tool.name for tool in server.mcp._tool_manager.list_tools()}
+
+
+def test_business_tools_are_explicitly_exported_and_registered(cfg):
+    from core.mcp_tools import jira_enqueue, jira_query, queue_tool
+
+    expected_modules = {jira_enqueue.__name__, jira_query.__name__, queue_tool.__name__}
+    names = [function.__name__ for function in mcp_tools.TOOLS]
+    assert len(names) == len(set(names))
+    assert set(names) == _tool_names() - {"jira_show_queue"}
+    assert {function.__module__ for function in mcp_tools.TOOLS} == expected_modules
+    for function in mcp_tools.TOOLS:
+        assert getattr(mcp_tools, function.__name__) is function
+        assert not hasattr(server, function.__name__)
+    assert server.jira_show_queue.__module__ == "server"
 
 
 def test_capability_surface_has_only_v2_review_tools(cfg):
@@ -203,7 +217,7 @@ def test_attachment_query_returns_id_with_filename(queue, monkeypatch):
         fields=SimpleNamespace(attachment=[attachment])
     )
     client = SimpleNamespace(issue=lambda _key: issue)
-    monkeypatch.setattr(mcp_tools.jira_client, "get_client", lambda: client)
+    monkeypatch.setattr(jira_client, "get_client", lambda: client)
 
     result = json.loads(mcp_tools.jira_query_attachments("PROJ-1"))
 
@@ -230,10 +244,11 @@ def test_execution_log_reads_terminal_records(queue):
     queue.execution.complete_execution(
         claim.execution_id, "success", "done", None, None, 1
     )
-    response = server.jira_get_execution_log(10)
+    response = mcp_tools.jira_get_execution_log(10)
     assert operation.operation_id in response and '"outcome": "success"' in response
     assert '"target_issue_key": null' in response
-    assert '"dependency_operation_ids": []' in response
+    assert '"dependency_states": {}' in response
+    assert "dependency_operation_ids" not in response
     assert "field_references" not in response
 
 
@@ -381,4 +396,4 @@ def test_business_log_failure_is_strictly_best_effort(cfg, monkeypatch):
 
 @pytest.mark.parametrize("value", [0, -1, True, "1"])
 def test_execution_log_rejects_invalid_limit(cfg, value):
-    assert server.jira_get_execution_log(value).startswith("查询执行日志失败")
+    assert mcp_tools.jira_get_execution_log(value).startswith("查询执行日志失败")

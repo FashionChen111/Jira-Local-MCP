@@ -240,21 +240,28 @@ class DependencyBindingResult(StrictFrozenModel):
         return bool(self.staging_operation_ids)
 
 
-class OperationPublic(StrictFrozenModel):
-    """Stable public operation projection without persistence-only fields."""
+class OperationOverview(StrictFrozenModel):
+    """Common public metadata selected by queue and execution overviews."""
 
     operation_id: str
     operation_type: OperationType
     issue_key: str | None
     target_issue_key: str | None
     risk_level: RiskLevel
-    payload: dict[str, JsonValue]
     description: str
-    source: str
     created_at: int
+
+
+class OperationPublic(OperationOverview):
+    """Stable public operation projection without persistence-only fields."""
+
+    payload: dict[str, JsonValue]
+    source: str
     attempt_no: int
-    dependency_operation_ids: tuple[str, ...] = ()
-    dependency_states: dict[str, ProducerLifecycleState] = Field(default_factory=dict)
+    dependency_states: dict[str, ProducerLifecycleState] = Field(
+        default_factory=dict,
+        description="依赖 operation ID 到生命周期状态的映射；包含 unknown，不表达执行顺序。",
+    )
 
 
 class QueueOperationPublic(OperationPublic):

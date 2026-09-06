@@ -44,6 +44,18 @@ def staging_records(
     return [staging_from_row(row) for row in rows]
 
 
+def staging_page(
+    connection: sqlite3.Connection, *, page: int, page_size: int,
+) -> tuple[list[StagingRecord], int]:
+    """Load one authorized-order page and its total within the caller's snapshot."""
+    total = connection.execute("SELECT COUNT(*) FROM execution_staging").fetchone()[0]
+    rows = connection.execute(
+        "SELECT * FROM execution_staging ORDER BY stage_order LIMIT ? OFFSET ?",
+        (page_size, (page - 1) * page_size),
+    ).fetchall()
+    return [staging_from_row(row) for row in rows], total
+
+
 def staging_record(
     connection: sqlite3.Connection, operation_id: str
 ) -> StagingRecord | None:

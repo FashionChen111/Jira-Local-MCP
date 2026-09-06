@@ -52,7 +52,9 @@ MCP append → queued → Web submit → staged → executing → success/failed
 
 修正通过“读取详情 → 取消旧操作 → 使用现有 append 工具重新入队”完成，依赖链使用新 ID 重建；两步不原子，重新入队失败时旧操作已经撤回。新操作仍须人工 Web 审核提交。执行状态清单中消失不代表成功，实际结果请查 `jira_get_execution_log`。
 
-`move_issue` 仍可入队展示，但 Jira Server/DC REST 不支持时会明确记录失败。创建或克隆 Tool 返回的 operation ID 可直接作为后续修改的 `issue_key`，`add_issuelink.target_issue_key` 也支持相同引用；服务端会在生产者成功后原子物化两个顶层 Key。附件上传 operation ID 可在同一事务的 description、comment 和 worklog 中写成 `[^{{attachment:op-…}}]` 或 `!{{attachment:op-…}}!`；上传成功后，系统使用 Jira 返回的附件 ID 确认身份，并把引用原子替换为最终文件名。创建事务的初始 description 不允许附件引用，应采用“创建 → 上传 → 更新 description”。克隆来源仍必须是真实 Jira Key，也不接受自定义 placeholder。公共输出使用 `dependency_operation_ids` 与 `dependency_states` 表达两类依赖。
+在 Web 页面取消操作时，如果还有依赖项未选中，页面会展示完整取消范围，标记“原先选择”和“新增依赖”，列出操作 ID、说明和关联事务。点击“确认取消全部 N 项”即可，无需逐项补勾；“返回”或 Escape 放弃本次取消。确认期间页面仍会刷新，但确认范围保持不变；若队列已更新，取消会被拒绝并提示重新核对。展示记录不完整或完整范围超过 1000 项时，页面不会发送第二次取消请求；会话失效会关闭确认框。
+
+`move_issue` 仍可入队展示，但 Jira Server/DC REST 不支持时会明确记录失败。创建或克隆 Tool 返回的 operation ID 可直接作为后续修改的 `issue_key`，`add_issuelink.target_issue_key` 也支持相同引用；服务端会在生产者成功后原子物化两个顶层 Key。附件上传 operation ID 可在同一事务的 description、comment 和 worklog 中写成 `[^{{attachment:op-…}}]` 或 `!{{attachment:op-…}}!`；上传成功后，系统使用 Jira 返回的附件 ID 确认身份，并把引用原子替换为最终文件名。创建事务的初始 description 不允许附件引用，应采用“创建 → 上传 → 更新 description”。克隆来源仍必须是真实 Jira Key，也不接受自定义 placeholder。公共输出统一使用 `dependency_states` 表达两类依赖：键为依赖 operation ID，值为生命周期状态（未知为 `unknown`）；映射键顺序不代表执行顺序。
 
 ## 配置与运行
 
@@ -67,6 +69,8 @@ python server.py
 ```
 
 `server.py` 是 STDIO 服务，会等待 JSON-RPC 输入。Web 服务在 `jira_show_queue` 首次调用时延迟启动。stdout 只用于 MCP；运行日志只写脱敏 stderr。
+
+业务 Tool 位于 `core/mcp_tools/` 子包，按 Jira 查询、Jira 入队、本地队列及执行记录分模块，由 server 统一注册；审核页面入口、Prompt 和 Resource 保留在 server。本地状态查询按需读取：队列概览保留全局排序，详情按 ID 批量读取，活动执行状态在数据库中分页；每次请求的数据及 revisions 来自同一读事务。
 
 接入支持 STDIO MCP 的通用 Agent 工具时，可使用下面的 JSON 配置。将 `<JIRA_LOCAL_MCP_PROJECT_DIRECTORY>` 替换为你克隆本项目后的目录；如果 Agent 配置不支持 `cwd`，请改为在项目目录中启动 Agent，或按该 Agent 的配置格式为 `server.py` 指定项目路径。
 

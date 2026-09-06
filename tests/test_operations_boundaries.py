@@ -186,7 +186,7 @@ def test_production_adapters_use_operations_package_api() -> None:
     adapters = [
         Path("server.py"),
         Path("web/app.py"),
-        Path("core/mcp_tools.py"),
+        *sorted(Path("core/mcp_tools").glob("*.py")),
         *sorted(EXECUTING.glob("*.py")),
     ]
     for path in adapters:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import TypedDict
+from dataclasses import dataclass
 
 from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.models import (
@@ -13,6 +13,9 @@ from core.operations.models import (
     ExecutionRecordPublic,
     ExecutionStatePublic,
     OperationRecord,
+    OperationOverview,
+    StrictFrozenModel,
+    RiskLevel,
     OperationsStatePublic,
     QueueGroupPublic,
     QueueOperationPublic,
@@ -21,6 +24,7 @@ from core.operations.models import (
     StagingRecord,
     StagingState,
 )
+from core.operations.repository import DatabaseConnection
 from core.operations.repository import dependencies as dependency_repository
 from core.operations.repository import execution as execution_repository
 from core.operations.repository import metadata as repository_metadata
@@ -31,32 +35,55 @@ from core.operations.rules.safety import submission_problem
 from core.storage.database import open_database
 
 
-_OVERVIEW_FIELDS = {
-    "operation_id", "operation_type", "issue_key", "target_issue_key",
-    "description", "risk_level", "created_at",
-}
-_EXECUTION_OVERVIEW_FIELDS = _OVERVIEW_FIELDS | {
-    "state", "stage_order", "execution_id", "submission_risk_level",
-    "submitted_at", "started_at", "held_reason", "blocked_by_execution_id",
-}
+class ExecutionOperationOverview(OperationOverview):
+    """Authorized execution metadata selected from a public staging record."""
+
+    state: StagingState
+    stage_order: int
+    execution_id: str | None
+    submission_risk_level: RiskLevel
+    submitted_at: int
+    started_at: int | None
+    held_reason: str | None
+    blocked_by_execution_id: str | None
 
 
-class OperationsPage(TypedDict):
-    """A bounded projection of one current operations snapshot."""
+class OperationsPageMetadata(StrictFrozenModel):
+    """Pagination and revisions read from the same transaction as its items."""
 
-    items: list[dict[str, object]]
     total: int
     page: int
     page_size: int
     revisions: dict[str, int]
 
 
-class QueueOperationDetails(TypedDict):
+class QueuePage(OperationsPageMetadata):
+    """Queue overview records in review order."""
+
+    items: tuple[OperationOverview, ...]
+
+
+class ExecutionStatePage(OperationsPageMetadata):
+    """Active execution overview records in authorized order."""
+
+    items: tuple[ExecutionOperationOverview, ...]
+
+
+class QueueOperationDetails(StrictFrozenModel):
     """Full public records and IDs absent from the same queue snapshot."""
 
-    items: list[dict[str, object]]
-    missing_operation_ids: list[str]
+    items: tuple[QueueOperationPublic, ...]
+    missing_operation_ids: tuple[str, ...]
     revisions: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _PreparedDependencies:
+    """Dependency inspections and lifecycle facts for one local batch of records."""
+
+    inspections: Mapping[str, dependency_orchestration.DependencyInspection]
+    referenced_ids: Mapping[str, tuple[str, ...]]
+    states: Mapping[str, DependencyState]
 
 
 def _validate_page(page: int, page_size: int) -> None:
@@ -66,12 +93,6 @@ def _validate_page(page: int, page_size: int) -> None:
         raise ValueError("page_size 必须为 1 至 200 的整数")
 
 
-def _queue_items(state: OperationsStatePublic) -> tuple[QueueOperationPublic, ...]:
-    return tuple(
-        operation for group in state.queue.groups for operation in group.operations
-    ) + state.queue.standalone
-
-
 def _operation_data(
     operation: OperationRecord,
     dependency_states: Mapping[str, DependencyState],
@@ -79,7 +100,6 @@ def _operation_data(
 ) -> dict[str, object]:
     return {
         **operation.model_dump(mode="python"),
-        "dependency_operation_ids": referenced_operation_ids,
         "dependency_states": {
             referenced_operation_id: (
                 state.state
@@ -189,171 +209,158 @@ class QueryService:
             )
         return inspections, referenced_ids
 
+    def _prepare_dependencies(
+        self,
+        connection: DatabaseConnection,
+        records: Iterable[OperationRecord],
+        group_ids: Iterable[str] = (),
+    ) -> _PreparedDependencies:
+        inspections, referenced_ids = self._inspect_records(records)
+        producer_ids = dependency_orchestration.merge_referenced_operation_ids(
+            referenced_ids.values()
+        )
+        producer_ids.update(group_ids)
+        states = dependency_repository.dependency_states(connection, producer_ids)
+        return _PreparedDependencies(inspections, referenced_ids, states)
+
+    @staticmethod
+    def _queue_records_public(
+        records: Iterable[OperationRecord], dependencies: _PreparedDependencies,
+    ) -> tuple[QueueOperationPublic, ...]:
+        return tuple(
+            _queue_operation_public(
+                record, dependencies.states,
+                dependencies.inspections[record.operation_id],
+                dependencies.referenced_ids[record.operation_id],
+            )
+            for record in records
+        )
+
+    @staticmethod
+    def _staging_records_public(
+        records: Iterable[StagingRecord], dependencies: _PreparedDependencies,
+    ) -> tuple[StagingOperationPublic, ...]:
+        return tuple(
+            _staging_operation_public(
+                record, dependencies.states,
+                dependencies.referenced_ids[record.operation_id],
+            )
+            for record in records
+        )
+
     def get_state(self) -> OperationsStatePublic:
         """Return one consistent queue/execution snapshot and its revisions."""
-
         connection = open_database("operations")
         try:
             connection.execute("BEGIN")
             queue_records = queue_repository.queue_operations(connection)
             staging_records = execution_repository.staging_records(connection)
-            inspection_by_operation_id, referenced_ids_by_operation_id = (
-                self._inspect_records((*queue_records, *staging_records))
+            layout = automatic_queue(queue_records)
+            dependencies = self._prepare_dependencies(
+                connection, (*queue_records, *staging_records),
+                (group.group_key for group in layout.groups if group.kind == "pending_issue"),
             )
-            producer_ids = dependency_orchestration.merge_referenced_operation_ids(
-                referenced_ids_by_operation_id.values()
-            )
-            producer_ids.update(
-                group_id
-                for operation in queue_records
-                if (
-                    group_id := dependency_orchestration.pending_issue_group_id(
-                        operation
-                    )
-                )
-                is not None
-            )
-            dependency_states = dependency_repository.dependency_states(
-                connection, producer_ids
-            )
-            layout = automatic_queue(queue_records, dependency_states)
             queue = QueueStatePublic(
                 groups=tuple(
                     QueueGroupPublic(
                         group_key=group.group_key,
                         kind=group.kind,
                         producer_state=(
-                            (
-                                state.state
-                                if (
-                                    state := dependency_states.get(
-                                        group.group_key
-                                    )
-                                )
-                                is not None
-                                else "unknown"
-                            )
-                            if group.kind == "pending_issue"
-                            else None
+                            dependencies.states[group.group_key].state
+                            if group.kind == "pending_issue" else None
                         ),
-                        operations=tuple(
-                            _queue_operation_public(
-                                operation,
-                                dependency_states,
-                                inspection_by_operation_id[
-                                    operation.operation_id
-                                ],
-                                referenced_ids_by_operation_id[
-                                    operation.operation_id
-                                ],
-                            )
-                            for operation in group.operations
-                        ),
+                        operations=self._queue_records_public(group.operations, dependencies),
                     )
                     for group in layout.groups
                 ),
-                standalone=tuple(
-                    _queue_operation_public(
-                        operation,
-                        dependency_states,
-                        inspection_by_operation_id[operation.operation_id],
-                        referenced_ids_by_operation_id[operation.operation_id],
-                    )
-                    for operation in layout.standalone
-                ),
+                standalone=self._queue_records_public(layout.standalone, dependencies),
             )
             execution_parts: dict[StagingState, list[StagingOperationPublic]] = {
-                "staged": [],
-                "executing": [],
-                "indeterminate": [],
-                "held": [],
+                "staged": [], "executing": [], "indeterminate": [], "held": [],
             }
-            for staging in staging_records:
-                execution_parts[staging.state].append(
-                    _staging_operation_public(
-                        staging,
-                        dependency_states,
-                        referenced_ids_by_operation_id[staging.operation_id],
-                    )
-                )
-            execution = ExecutionStatePublic(
-                staged=tuple(execution_parts["staged"]),
-                executing=tuple(execution_parts["executing"]),
-                indeterminate=tuple(execution_parts["indeterminate"]),
-                held=tuple(execution_parts["held"]),
-            )
+            for operation in self._staging_records_public(staging_records, dependencies):
+                execution_parts[operation.state].append(operation)
             return OperationsStatePublic(
                 revisions=repository_metadata.revisions(connection),
                 queue=queue,
-                execution=execution,
+                execution=ExecutionStatePublic(
+                    staged=tuple(execution_parts["staged"]),
+                    executing=tuple(execution_parts["executing"]),
+                    indeterminate=tuple(execution_parts["indeterminate"]),
+                    held=tuple(execution_parts["held"]),
+                ),
             )
         finally:
             connection.close()
 
-    def list_queue(self, page: int = 1, page_size: int = 50) -> OperationsPage:
-        """Project a page of queue records in the Web review order."""
+    def list_queue(self, page: int = 1, page_size: int = 50) -> QueuePage:
+        """Order the queue globally but prepare public records only for this page."""
         _validate_page(page, page_size)
-        state = self.get_state()
-        operations = _queue_items(state)
-        start = (page - 1) * page_size
-        return OperationsPage(
-            items=[
-                operation.model_dump(mode="json", include=_OVERVIEW_FIELDS)
-                for operation in operations[start : start + page_size]
-            ],
-            total=len(operations),
-            page=page,
-            page_size=page_size,
-            revisions=state.revisions,
-        )
+        connection = open_database("operations")
+        try:
+            connection.execute("BEGIN")
+            records = queue_repository.queue_operations(connection)
+            operations = automatic_queue(records).flattened()
+            start = (page - 1) * page_size
+            page_records = operations[start : start + page_size]
+            dependencies = self._prepare_dependencies(connection, page_records)
+            return QueuePage(
+                items=tuple(
+                    OperationOverview.model_validate(
+                        operation.model_dump(include=set(OperationOverview.model_fields))
+                    )
+                    for operation in self._queue_records_public(page_records, dependencies)
+                ),
+                total=len(operations), page=page, page_size=page_size,
+                revisions=repository_metadata.revisions(connection),
+            )
+        finally:
+            connection.close()
 
-    def get_queue_operations(
-        self, operation_ids: list[str],
-    ) -> QueueOperationDetails:
-        """Read complete queued records in request order, identifying absent IDs."""
+    def get_queue_operations(self, operation_ids: list[str]) -> QueueOperationDetails:
+        """Read only requested queued records and their dependencies in request order."""
         validate_operation_ids(operation_ids, maximum=200)
-        state = self.get_state()
-        by_id = {
-            operation.operation_id: operation for operation in _queue_items(state)
-        }
-        return QueueOperationDetails(
-            items=[
-                by_id[operation_id].model_dump(mode="json")
-                for operation_id in operation_ids
-                if operation_id in by_id
-            ],
-            missing_operation_ids=[
-                operation_id for operation_id in operation_ids
-                if operation_id not in by_id
-            ],
-            revisions=state.revisions,
-        )
+        connection = open_database("operations")
+        try:
+            connection.execute("BEGIN")
+            records = queue_repository.queue_operations_by_ids(connection, operation_ids)
+            dependencies = self._prepare_dependencies(connection, records)
+            by_id = {
+                record.operation_id: record
+                for record in self._queue_records_public(records, dependencies)
+            }
+            return QueueOperationDetails(
+                items=tuple(by_id[item] for item in operation_ids if item in by_id),
+                missing_operation_ids=tuple(item for item in operation_ids if item not in by_id),
+                revisions=repository_metadata.revisions(connection),
+            )
+        finally:
+            connection.close()
 
     def list_execution_state(
         self, page: int = 1, page_size: int = 50,
-    ) -> OperationsPage:
-        """Project active execution metadata in authorized execution order."""
+    ) -> ExecutionStatePage:
+        """Read one page of active execution records directly in authorized order."""
         _validate_page(page, page_size)
-        state = self.get_state()
-        execution = state.execution
-        operations = sorted(
-            (
-                *execution.staged, *execution.executing,
-                *execution.indeterminate, *execution.held,
-            ),
-            key=lambda operation: operation.stage_order,
-        )
-        start = (page - 1) * page_size
-        return OperationsPage(
-            items=[
-                operation.model_dump(mode="json", include=_EXECUTION_OVERVIEW_FIELDS)
-                for operation in operations[start : start + page_size]
-            ],
-            total=len(operations),
-            page=page,
-            page_size=page_size,
-            revisions=state.revisions,
-        )
+        connection = open_database("operations")
+        try:
+            connection.execute("BEGIN")
+            records, total = execution_repository.staging_page(
+                connection, page=page, page_size=page_size,
+            )
+            dependencies = self._prepare_dependencies(connection, records)
+            return ExecutionStatePage(
+                items=tuple(
+                    ExecutionOperationOverview.model_validate(
+                        operation.model_dump(include=set(ExecutionOperationOverview.model_fields))
+                    )
+                    for operation in self._staging_records_public(records, dependencies)
+                ),
+                total=total, page=page, page_size=page_size,
+                revisions=repository_metadata.revisions(connection),
+            )
+        finally:
+            connection.close()
 
     def execution_history(
         self,
@@ -399,7 +406,7 @@ class QueryService:
             connection.close()
 
     def read_execution_log(self, limit: int) -> list[dict[str, object]]:
-        """Return recent completed execution records for the MCP resource."""
+        """Return recent completed execution records for the MCP execution-log tool."""
 
         if not 1 <= limit <= 1000:
             raise ValueError("limit 必须在 1 至 1000 之间")

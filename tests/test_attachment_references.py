@@ -78,9 +78,9 @@ def test_attachment_reference_participates_in_closure_and_topological_order(
 
     state = queue.query.get_state().model_dump(mode="json")
     comment_public = state["queue"]["groups"][0]["operations"][1]
-    assert comment_public["dependency_operation_ids"] == [
-        attachment.operation_id
-    ]
+    assert comment_public["dependency_states"] == {
+        attachment.operation_id: "queued"
+    }
     with pytest.raises(StoreError, match="缺少依赖"):
         queue.submission.submit(2, [comment.operation_id], False)
     accepted, _ = queue.submission.submit(
@@ -948,7 +948,7 @@ def test_completed_upload_materializes_every_supported_content_path(queue) -> No
     assert operations[3].payload["body"] == "[^a-1.jpg]"
     assert operations[4].payload["comment"] == "!a-1.jpg!"
     assert all(
-        not item.dependency_operation_ids
+        not item.dependency_states
         for group in queue.query.get_state().queue.groups
         for item in group.operations
     )
