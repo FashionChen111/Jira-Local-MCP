@@ -224,11 +224,11 @@ def res_service_info() -> str:
 
 @mcp.prompt()
 def operation_queue_workflow() -> str:
-    """提供 Jira 写操作从规划、入队到人工审核的标准工作流提示词。
+    """提供 Jira 写操作从规划、入队到协作审查和人工提交的标准工作流提示词。
 
     返回：
-        中文工作流提示词，强调 ``*_append`` 仅入队、集中打开审核页，以及
-        只有持久化终态执行记录才能证明操作结果。
+        中文工作流提示词，说明分页查询、按 ID 读取详情、撤回后重新入队与依赖链重建，
+        强调 ``*_append`` 仅入队，以及只有持久化终态执行记录才能证明操作结果。
 
     边界：
         提示词只指导 Agent 行为，不能代替用户在本地 Web 页面提交授权。
@@ -252,7 +252,7 @@ def create_with_followups_workflow() -> str:
 
 @mcp.prompt()
 def safe_query_guide() -> str:
-    """提供 Jira 只读查询、JQL 分页和大结果集处理的安全提示词。
+    """提供 Jira 只读查询、JQL 分页及本地队列与执行状态渐进查询的安全提示词。
 
     返回：
         中文查询指导，帮助 Agent 控制字段和分页范围，并将 Jira 返回内容视为

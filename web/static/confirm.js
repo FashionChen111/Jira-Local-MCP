@@ -196,7 +196,7 @@ function queueControls(operation) {
     controls.push(
       button(
         "取消此项",
-        () => cancelOperations([operation.operation_id], false),
+        () => cancelOperations([operation.operation_id], state.revisions.queue),
         "danger",
       ),
     );
@@ -459,36 +459,34 @@ async function cancelSelected() {
     return;
   }
   if (!confirm("确认从队列取消选中的 operation？这不会写入 Jira。")) return;
-  await cancelOperations(ids, false);
+  await cancelOperations(ids, state.revisions.queue);
 }
 
-async function cancelOperations(ids, cascadeConfirmed) {
+async function cancelOperations(ids, expectedQueueRevision) {
   if (sessionExpired) return;
   const response = await reviewFetch("/api/queue/cancel", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      expected_queue_revision: state.revisions.queue,
+      expected_queue_revision: expectedQueueRevision,
       operation_ids: ids,
-      cascade_confirmed: cascadeConfirmed,
     }),
   });
   if (sessionExpired) return;
   const data = await response.json();
   if (
     response.status === 409 &&
-    data.code === "dependency_confirmation_required" &&
-    !cascadeConfirmed
+    data.code === "dependency_scope_incomplete"
   ) {
     const requested = new Set(ids);
     const affected = data.affected_operation_ids || [];
     const dependentCount = affected.filter((id) => !requested.has(id)).length;
     if (
       confirm(
-        `所选创建/克隆项仍有 ${dependentCount} 个队列依赖，将原子取消共 ${affected.length} 个 operation。确认继续？`,
+        `所选操作仍有 ${dependentCount} 个队列依赖，将原子取消共 ${affected.length} 个 operation。确认继续？`,
       )
     ) {
-      return cancelOperations(ids, true);
+      return cancelOperations(affected, expectedQueueRevision);
     }
     return;
   }

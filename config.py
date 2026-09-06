@@ -10,7 +10,7 @@ import yaml
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
-SERVICE_VERSION = "2.3.0"
+SERVICE_VERSION = "2.4.0"
 
 
 def _abs_path(path: str) -> str:

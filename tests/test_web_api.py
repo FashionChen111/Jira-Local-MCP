@@ -27,7 +27,6 @@ def test_api_requires_browser_session(cfg):
         json={
             "expected_queue_revision": 0,
             "operation_ids": ["op-" + "a" * 32],
-            "cascade_confirmed": False,
         },
     ).status_code == 403
 
@@ -188,7 +187,6 @@ def test_cancel_and_history_pagination(web_client, queue):
         json={
             "expected_queue_revision": 1,
             "operation_ids": [operation.operation_id],
-            "cascade_confirmed": False,
         },
     )
     assert cancelled.status_code == 200
@@ -198,7 +196,7 @@ def test_cancel_and_history_pagination(web_client, queue):
     assert history.json() == {"items": [], "total": 0, "page": 1, "page_size": 50}
 
 
-def test_cancel_producer_requires_visible_cascade_confirmation(web_client, queue):
+def test_cancel_producer_requires_explicit_dependency_scope(web_client, queue):
     create = queue.queue.enqueue(
         "create_issue",
         None,
@@ -216,22 +214,35 @@ def test_cancel_producer_requires_visible_cascade_confirmation(web_client, queue
     body = {
         "expected_queue_revision": 2,
         "operation_ids": [create.operation_id],
-        "cascade_confirmed": False,
     }
     required = web_client.post("/api/queue/cancel", json=body)
     assert required.status_code == 409
-    assert required.json()["code"] == "dependency_confirmation_required"
+    assert required.json()["code"] == "dependency_scope_incomplete"
+    assert required.json()["missing_operation_ids"] == [child.operation_id]
     assert set(required.json()["affected_operation_ids"]) == {
         create.operation_id,
         child.operation_id,
     }
-    body["cascade_confirmed"] = True
+    body["operation_ids"] = required.json()["affected_operation_ids"]
     cancelled = web_client.post("/api/queue/cancel", json=body)
     assert cancelled.status_code == 200
     assert set(cancelled.json()["cancelled_operation_ids"]) == {
         create.operation_id,
         child.operation_id,
     }
+
+
+def test_cancel_rejects_obsolete_flag_and_publishes_new_schema(web_client, queue):
+    operation = _comment(queue)
+    response = web_client.post("/api/queue/cancel", json={
+        "operation_ids": [operation.operation_id], "expected_queue_revision": 1,
+        "cascade_confirmed": True,
+    })
+    assert response.status_code == 422
+    assert queue.query.total_active() == 1
+    schema = web_client.get("/openapi.json").json()["components"]["schemas"]["CancelRequest"]
+    assert set(schema["properties"]) == {"operation_ids", "expected_queue_revision"}
+    assert schema["additionalProperties"] is False
 
 
 def test_indeterminate_create_resolution_requires_real_key(web_client, queue):

@@ -29,12 +29,17 @@ def _tool_names():
 
 def test_capability_surface_has_only_v2_review_tools(cfg):
     names = _tool_names()
-    assert len(names) == 18
+    assert len(names) == 22
     assert "jira_show_queue" in names
     assert "jira_get_execution_log" in names
     assert "jira_show_pending_queue" not in names
     assert "jira_get_commit_log" not in names
-    assert not any(any(word in name for word in ("commit", "cancel", "resolve", "delete")) for name in names)
+    assert {
+        "jira_list_queue", "jira_get_queue_operations",
+        "jira_list_execution_state", "jira_cancel_queue_operations",
+    } <= names
+    assert not any(any(word in name for word in ("commit", "submit", "resolve", "delete")) for name in names)
+    assert {name for name in names if "cancel" in name} == {"jira_cancel_queue_operations"}
 
 
 def _assert_complete_chinese_description(

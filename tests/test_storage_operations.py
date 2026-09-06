@@ -161,11 +161,11 @@ def test_repository_strictly_rejects_non_finite_persisted_payload(queue) -> None
 def test_cancel_is_revision_guarded_and_all_or_nothing(queue) -> None:
     operation = enqueue_comment(queue, "PROJ-1")
     with pytest.raises(RevisionConflict):
-        queue.queue.cancel(0, [operation.operation_id], False)
+        queue.queue.cancel(0, [operation.operation_id])
     with pytest.raises(StoreError):
-        queue.queue.cancel(1, [operation.operation_id, "op-" + "f" * 32], False)
+        queue.queue.cancel(1, [operation.operation_id, "op-" + "f" * 32])
     assert queue.query.total_active() == 1
-    queue.queue.cancel(1, [operation.operation_id], False)
+    queue.queue.cancel(1, [operation.operation_id])
     assert queue.query.total_active() == 0
 
 

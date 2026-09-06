@@ -1,12 +1,12 @@
 # Jira Local MCP 产品需求文档
 
-更新日期：2026-08-31
+更新日期：2026-09-06
 
-当前实现版本：2.3.0
+当前实现版本：2.4.0
 
 ## 1. 产品定位
 
-Jira Local MCP 是连接通用 Agent 与 Jira Server/Data Center 的本地 MCP 服务。它让 Agent 能直接读取 Jira 信息、批量规划变更，并把所有写操作集中到本地 Web 页面中供用户审核和提交。
+Jira Local MCP 是连接通用 Agent 与 Jira Server/Data Center 的本地 MCP 服务。它让 Agent 能直接读取 Jira 信息、批量规划变更，并把所有 Jira 写操作集中到本地 Web 页面中供用户审核和提交。Agent 可以查询本地队列、解释待审核内容，并通过撤回后重新入队完成修正。
 
 产品的核心价值是：
 
@@ -27,6 +27,7 @@ Jira Local MCP 是连接通用 Agent 与 Jira Server/Data Center 的本地 MCP �
 - 创建或克隆事务，补充描述、优先级、经办人和自定义字段。
 - 为现有事务添加附件、评论、工时或事务链接。
 - 在统一审核页核对系统自动分组与顺序，只提交本次确认的条目。
+- 审核时让 Agent 分页定位、读取完整记录并解释；需要修正时撤回旧操作，以新 ID 重新入队并重建依赖。
 - 查看实际执行结果，并在进程中断后人工确认未知结果和后续任务。
 
 ## 3. 产品工作流
@@ -45,7 +46,7 @@ Jira Local MCP 是连接通用 Agent 与 Jira Server/Data Center 的本地 MCP �
 
 关键交互含义：
 
-- 只读查询会立即访问 Jira。
+- Jira 只读查询立即访问 Jira；本地队列与执行状态查询只读取 SQLite。
 - `*_append` 只表示 operation 已进入本地队列，不代表 Jira 已发生变化。
 - 打开审核页也不代表授权或执行。
 - Web 提交成功表示 operation 已进入 staging；最终结果以持久化执行记录为准。
@@ -56,7 +57,7 @@ Jira Local MCP 是连接通用 Agent 与 Jira Server/Data Center 的本地 MCP �
 
 ### 4.1 MCP 能力面
 
-当前共注册 18 个 Tool、4 个 Resource 和 4 个 Prompt。
+当前共注册 22 个 Tool、4 个 Resource 和 4 个 Prompt。
 
 #### 只读 Tool（5 个）
 
@@ -92,6 +93,19 @@ Jira Local MCP 是连接通用 Agent 与 Jira Server/Data Center 的本地 MCP �
 
 - `jira_show_queue`：按需启动本地 Web 服务并打开默认浏览器；MCP 返回值只报告打开状态，不返回 bootstrap URL 或浏览器会话。
 - `jira_get_execution_log`：读取最近的持久化执行与人工对账记录，不修改 Jira。
+
+#### 本地查询与撤回 Tool（4 个，已实现）
+
+- `jira_list_queue(page=1, page_size=50)`：按 Web 分组与组内顺序展开待审核概览，选取标识、类型、目标、描述、风险及创建时间，不返回 payload。
+- `jira_get_queue_operations(operation_ids)`：读取 1–200 个合法且不重复的 ID，按请求顺序返回完整公开记录及 revisions；不在当前队列中的 ID 返回到 missing_operation_ids，不推断其状态。
+- `jira_list_execution_state(page=1, page_size=50)`：按 stage_order 返回 staged、executing、indeterminate、held 的概览及执行元数据，不返回 payload；完成结果通过现有执行日志查询。
+- `jira_cancel_queue_operations(operation_ids, expected_queue_revision)`：原子撤回 1–1000 个 queued 操作，范围必须显式覆盖全部直接和间接依赖。
+
+两个清单每页最多 200 条，返回 items、total、page、page_size 和 revisions；每次调用是独立的当前快照，相关 revision 变化时不能拼接为同一快照。复用 QueryService 和现有公开模型序列化，概览只选字段、详情不改写或截断正文，仍执行敏感信息脱敏。记录、依赖状态和 revisions 在一个显式 SQLite 读事务中读取，不引入跨请求缓存。
+
+撤回不接受级联确认 flag。Web 与 MCP 共用依赖闭包校验和取消事务；范围不足时返回 dependency_scope_incomplete、affected_operation_ids 和 missing_operation_ids。版本冲突、范围不足、未知或已离开队列的 ID 均整批拒绝，不写取消事件、不更新 revision。Web 保留人工确认交互，确认后提交完整 ID 范围并沿用首次请求 revision。
+
+Agent 可通过取消后重新入队修正待审核内容，两步不原子，重新入队失败时旧操作已撤回；依赖链须使用新 ID 重建，不编辑记录或替换依赖。MCP 不开放提交、执行、恢复、编辑或清空 Tool；本次变更不修改数据库 schema。
 
 #### Resource 与 Prompt
 
@@ -183,7 +197,7 @@ SQLite 使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema versio
 
 ## 5. 当前产品范围说明
 
-以下内容用于说明 2.3.0 的实际行为，不代表永久产品边界：
+以下内容用于说明 2.4.0 的实际行为，不代表永久产品边界：
 
 - 当前部署模型是同一台机器、同一用户、一个 MCP 服务连接一个 Jira 配置。
 - 当前 operation 只覆盖第 4.1 节列出的类型；服务端按现有 allowlist 接受操作。
@@ -224,9 +238,9 @@ SQLite 使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema versio
 
 ## 7. 当前版本验收基线
 
-2.3.0 的功能验收以代码和自动化测试为准，至少应满足：
+2.4.0 的功能验收以代码和自动化测试为准，至少应满足：
 
-- FastMCP 实际注册 18 个 Tool、4 个 Resource 和 4 个 Prompt，且能力描述完整、中文、可被 Agent 理解。
+- FastMCP 实际注册 22 个 Tool、4 个 Resource 和 4 个 Prompt，且能力描述完整、中文、可被 Agent 理解。
 - 5 个只读 Tool 只查询 Jira；11 个 `*_append` Tool 只创建本地 operation。
 - 审核页可以读取自动分组排序的实时状态、取消或提交选择，并处理高风险二次确认；不存在人工排序入口。
 - 创建/克隆 operation ID 可被全部修改 Tool 引用；依赖闭包、拓扑执行、成功 Key 解析、部分提交和级联取消均符合契约。

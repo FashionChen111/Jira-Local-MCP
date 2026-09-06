@@ -6,8 +6,8 @@ from pydantic import ValidationError
 
 from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.errors import (
-    DependencyConfirmationRequired,
     DependencyError,
+    DependencyScopeIncomplete,
     RevisionConflict,
     StoreError,
 )
@@ -15,6 +15,7 @@ from core.operations.models import OperationDraft, OperationRecord
 from core.operations.repository import dependencies as dependency_repository
 from core.operations.repository import metadata as repository_metadata
 from core.operations.repository import queue as queue_repository
+from core.operations.rules.identifiers import validate_operation_ids
 from core.operations.rules.ordering import automatic_queue
 from core.operations.rules.safety import OperationSafetyError, validate_for_enqueue
 from core.storage.database import new_id, transaction, utc_ms
@@ -178,16 +179,15 @@ class QueueService:
         self,
         expected_queue_revision: int,
         operation_ids: list[str],
-        cascade_confirmed: bool,
     ) -> tuple[list[str], int]:
-        """Cancel selected queue entries and their direct-reference closure."""
+        """Cancel an explicit dependency-closed scope in one transaction."""
 
-        if (
-            not operation_ids
-            or len(operation_ids) > 1000
-            or len(operation_ids) != len(set(operation_ids))
-        ):
-            raise StoreError("取消 operation ID 必须为 1 至 1000 个且不得重复")
+        try:
+            validate_operation_ids(operation_ids, maximum=1000)
+        except ValueError as exc:
+            raise StoreError(str(exc)) from exc
+        if type(expected_queue_revision) is not int or expected_queue_revision < 0:
+            raise StoreError("expected_queue_revision 必须为非负整数")
         with transaction() as connection:
             if (
                 repository_metadata.revision(connection, "queue")
@@ -236,22 +236,19 @@ class QueueService:
                 for operation in display
                 if operation.operation_id in expanded
             ]
-            cascaded = [item for item in ordered_ids if item not in requested]
-            if cascaded and not cascade_confirmed:
-                raise DependencyConfirmationRequired(
-                    f"取消生产者将同时取消 {len(cascaded)} 个依赖 operation",
+            missing = [item for item in ordered_ids if item not in requested]
+            if missing:
+                raise DependencyScopeIncomplete(
+                    f"取消范围缺少 {len(missing)} 个依赖 operation；请提交完整范围",
                     ordered_ids,
+                    missing,
                 )
             for operation_id in ordered_ids:
                 repository_metadata.append_event(
                     connection,
                     operation_id,
                     "dequeue",
-                    (
-                        "cancelled_by_user"
-                        if operation_id in requested
-                        else "cascade_cancelled"
-                    ),
+                    "cancelled_by_user",
                     {"requested_operation_ids": operation_ids},
                 )
             queue_repository.delete_queue(connection, ordered_ids)

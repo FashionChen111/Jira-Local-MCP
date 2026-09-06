@@ -97,7 +97,6 @@ def test_etag_304_request_renews_cookie_at_the_60_second_boundary(cfg):
             {
                 "expected_queue_revision": 0,
                 "operation_ids": ["op-" + "c" * 32],
-                "cascade_confirmed": False,
             },
             409,
         ),

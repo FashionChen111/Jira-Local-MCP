@@ -6,6 +6,7 @@ import socket
 import time
 from urllib.parse import parse_qs, urlparse
 
+import pytest
 from playwright.sync_api import expect
 
 from web import app as web_app
@@ -291,6 +292,7 @@ def test_blocked_dependency_is_disabled_but_can_be_cancelled(
     page, cfg, monkeypatch
 ) -> None:
     operation_id = "op-" + "5" * 32
+    requests: list[dict] = []
     producer_id = "op-" + "6" * 32
     operation = _operation(
         operation_id,
@@ -317,6 +319,128 @@ def test_blocked_dependency_is_disabled_but_can_be_cancelled(
         expect(card.locator('input[type="checkbox"]')).to_be_disabled()
         expect(card.locator(".dependency-error")).to_contain_text("已失败")
         expect(card.get_by_role("button", name="取消此项")).to_be_visible()
+
+        def cancel_route(route):
+            requests.append(route.request.post_data_json)
+            state["queue"]["groups"] = []
+            route.fulfill(json={"cancelled_operation_ids": [operation_id], "queue_revision": 3})
+
+        page.route("**/api/queue/cancel", cancel_route)
+        card.get_by_role("button", name="取消此项").click()
+        expect(page.locator("#queue-message")).to_contain_text("已从本地审核队列取消")
+        assert requests == [{"operation_ids": [operation_id], "expected_queue_revision": 2}]
+    finally:
+        _stop()
+
+
+@pytest.mark.parametrize("outcome", ["initial_decline", "scope_decline", "success", "revision_conflict"])
+def test_cancel_scope_confirmation_and_original_revision(page, cfg, monkeypatch, outcome):
+    producer_id = "op-" + "a" * 32
+    child_id = "op-" + "b" * 32
+    state = _pending_state(producer_id, child_id)
+    requests: list[dict] = []
+    dialogs: list[str] = []
+
+    def on_dialog(dialog):
+        dialogs.append(dialog.message)
+        if outcome == "initial_decline" or (outcome == "scope_decline" and len(dialogs) == 2):
+            dialog.dismiss()
+        else:
+            dialog.accept()
+
+    try:
+        base = _serve(page, cfg, monkeypatch, state)
+
+        def cancel_route(route):
+            requests.append(route.request.post_data_json)
+            if len(requests) == 1:
+                if outcome == "revision_conflict":
+                    # Polling can replace global state while cancellation awaits a response.
+                    state["revisions"]["queue"] = 3
+                    page.evaluate("state.revisions.queue = 3")
+                route.fulfill(status=409, json={
+                    "code": "dependency_scope_incomplete", "error": "范围不完整",
+                    "affected_operation_ids": [producer_id, child_id],
+                    "missing_operation_ids": [child_id],
+                })
+            elif outcome == "revision_conflict":
+                route.fulfill(status=409, json={"code": "revision_conflict", "error": "队列已更新"})
+            else:
+                state["queue"]["groups"] = []
+                state["revisions"]["queue"] = 3
+                route.fulfill(json={"cancelled_operation_ids": [producer_id, child_id], "queue_revision": 3})
+
+        page.route("**/api/queue/cancel", cancel_route)
+        page.on("dialog", on_dialog)
+        page.goto(web_app.create_confirmation_url(base))
+        page.locator(f'[data-operation-id="{child_id}"] input[type="checkbox"]').uncheck()
+        expect(page.locator(f'[data-operation-id="{producer_id}"] input[type="checkbox"]')).to_be_checked()
+        if outcome == "initial_decline":
+            page.locator("#cancel-selected").click()
+        else:
+            with page.expect_event("dialog", predicate=lambda dialog: "队列依赖" in dialog.message):
+                page.locator("#cancel-selected").click()
+        if outcome == "initial_decline":
+            assert len(dialogs) == 1 and requests == []
+        else:
+            if outcome == "scope_decline":
+                expect(page.locator(f'[data-operation-id="{producer_id}"]')).to_be_visible()
+            elif outcome == "revision_conflict":
+                expect(page.locator("#queue-message")).to_contain_text("队列已更新")
+                page.wait_for_function("state.revisions.queue === 3")
+            else:
+                expect(page.locator("#queue-message")).to_contain_text("已从本地审核队列取消")
+                expect(page.locator(f'[data-operation-id="{producer_id}"]')).to_have_count(0)
+            assert len(dialogs) == 2
+            assert requests[0] == {"operation_ids": [producer_id], "expected_queue_revision": 2}
+            if outcome == "scope_decline":
+                assert len(requests) == 1
+            else:
+                assert requests[1] == {
+                    "operation_ids": [producer_id, child_id], "expected_queue_revision": 2,
+                }
+                assert len(requests) == 2
+    finally:
+        _stop()
+
+
+def test_browser_cancels_real_queue_dependency_scope(page, queue, cfg, monkeypatch):
+    producer = queue.queue.enqueue(
+        "create_issue", None,
+        {"project_key": "PROJ", "issue_type": "Task", "summary": "review"}, "create", "test",
+    )
+    child = queue.queue.enqueue(
+        "add_comment", producer.operation_id, {"body": "comment"}, "comment", "test",
+    )
+    requests: list[dict] = []
+    dialogs: list[str] = []
+    _stop()
+    cfg.web_port = _free_port()
+    monkeypatch.setattr(web_app.execution_worker, "start_worker", lambda: None)
+
+    def on_request(request):
+        if request.url.endswith("/api/queue/cancel"):
+            requests.append(request.post_data_json)
+
+    def on_dialog(dialog):
+        dialogs.append(dialog.message)
+        dialog.accept()
+
+    try:
+        base = web_app.ensure_started()
+        page.on("request", on_request)
+        page.on("dialog", on_dialog)
+        page.goto(web_app.create_confirmation_url(base))
+        page.locator(f'[data-operation-id="{child.operation_id}"] input[type="checkbox"]').uncheck()
+        page.locator("#cancel-selected").click()
+        expect(page.locator("#queue-message")).to_contain_text("已从本地审核队列取消")
+        expect(page.locator(f'[data-operation-id="{producer.operation_id}"]')).to_have_count(0)
+        assert queue.query.total_active() == 0
+        assert len(dialogs) == len(requests) == 2
+        assert requests[0]["operation_ids"] == [producer.operation_id]
+        assert set(requests[1]["operation_ids"]) == {producer.operation_id, child.operation_id}
+        assert all(request["expected_queue_revision"] == 2 for request in requests)
+        assert all("cascade_confirmed" not in request for request in requests)
     finally:
         _stop()
 

@@ -9,7 +9,7 @@ from collections import Counter
 import pytest
 
 from core.executing import worker as execution_worker
-from core.operations import DependencyConfirmationRequired, StoreError
+from core.operations import DependencyScopeIncomplete, StoreError
 from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.models import OperationExecutionResult, OperationRecord
 from core.operations.repository import execution as execution_repository
@@ -263,15 +263,16 @@ def test_cancel_producer_cascades_through_primary_and_target_references(queue) -
     primary = enqueue_comment(queue, producer.operation_id)
     target = enqueue_link(queue, "PROJ-1", producer.operation_id)
 
-    with pytest.raises(DependencyConfirmationRequired) as exc_info:
-        queue.queue.cancel(3, [producer.operation_id], False)
-    assert set(exc_info.value.operation_ids) == {
+    with pytest.raises(DependencyScopeIncomplete) as exc_info:
+        queue.queue.cancel(3, [producer.operation_id])
+    assert set(exc_info.value.affected_operation_ids) == {
         producer.operation_id,
         primary.operation_id,
         target.operation_id,
     }
-    cancelled, revision = queue.queue.cancel(3, [producer.operation_id], True)
-    assert set(cancelled) == set(exc_info.value.operation_ids)
+    assert set(exc_info.value.missing_operation_ids) == {primary.operation_id, target.operation_id}
+    cancelled, revision = queue.queue.cancel(3, exc_info.value.affected_operation_ids)
+    assert set(cancelled) == set(exc_info.value.affected_operation_ids)
     assert revision == 4
     assert queue.query.total_active() == 0
 

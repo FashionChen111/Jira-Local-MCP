@@ -24,17 +24,14 @@ from pydantic import (
 from config import get_config
 from core import jira_client
 from core.executing import worker as execution_worker
-from core.runtime_logger import get_logger
+from core.runtime_logger import get_logger, redact
 from core.operations import (
     AttachmentResult,
-    ConfirmationRequired,
-    DependencyConfirmationRequired,
-    ExecutionBlocked,
-    RevisionConflict,
     StoreError,
     get_services,
     is_jira_issue_key,
     is_operation_id,
+    store_error_data,
 )
 from web.review_sessions import (
     SESSION_COOKIE,
@@ -88,7 +85,6 @@ class SubmitRequest(IdListModel):
 
 class CancelRequest(IdListModel):
     expected_queue_revision: int = Field(ge=0)
-    cascade_confirmed: bool = False
 
 
 class ResolveIndeterminateRequest(StrictModel):
@@ -131,21 +127,11 @@ def _unauthorized() -> JSONResponse:
 
 
 def _store_error(exc: Exception) -> JSONResponse:
-    extra: dict[str, Any] = {}
-    if isinstance(exc, DependencyConfirmationRequired):
-        code = "dependency_confirmation_required"
-        extra["affected_operation_ids"] = exc.operation_ids
-    elif isinstance(exc, ConfirmationRequired):
-        code = "confirmation_required"
-    elif isinstance(exc, RevisionConflict):
-        code = "revision_conflict"
-    elif isinstance(exc, ExecutionBlocked):
-        code = "execution_blocked"
-    else:
-        code = "state_conflict"
-    return JSONResponse(
-        {"error": str(exc), "code": code, **extra}, status_code=409
-    )
+    data = store_error_data(exc) if isinstance(exc, StoreError) else {
+        "error": str(exc), "code": "state_conflict",
+    }
+    data["error"] = redact(str(data["error"]))
+    return JSONResponse(data, status_code=409)
 
 
 def create_app(
@@ -239,7 +225,6 @@ def create_app(
             cancelled, revision = get_services().queue.cancel(
                 body.expected_queue_revision,
                 body.operation_ids,
-                body.cascade_confirmed,
             )
             return JSONResponse(
                 {

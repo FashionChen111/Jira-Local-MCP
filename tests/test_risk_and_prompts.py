@@ -247,3 +247,9 @@ def test_prompts_publish_review_and_untrusted_data_contract() -> None:
     assert "不可信业务数据" in combined
     assert "仅入队" in combined and "尚未执行" in combined
     assert "create-with-followups-workflow" in PROMPTS
+    for name in (
+        "jira_list_queue", "jira_get_queue_operations",
+        "jira_list_execution_state", "jira_cancel_queue_operations",
+    ):
+        assert name in combined
+    assert "两步不原子" in combined and "新 ID 重建" in combined

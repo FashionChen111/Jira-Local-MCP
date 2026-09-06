@@ -12,7 +12,7 @@ import pytest
 from core.executing import jira_executor
 from core.operations import (
     AttachmentResult,
-    DependencyConfirmationRequired,
+    DependencyScopeIncomplete,
     StoreError,
 )
 from core.operations.dependencies import orchestration as dependency_orchestration
@@ -425,8 +425,8 @@ def test_cancel_builds_dependency_edges_with_one_inspection_each(
         counted,
     )
 
-    with pytest.raises(DependencyConfirmationRequired):
-        queue.queue.cancel(3, [producer.operation_id], False)
+    with pytest.raises(DependencyScopeIncomplete):
+        queue.queue.cancel(3, [producer.operation_id])
 
     assert Counter(scanned_operation_ids) == {
         producer.operation_id: 1,

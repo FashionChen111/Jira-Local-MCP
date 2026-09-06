@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from typing import TypedDict
 
 from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.models import (
@@ -24,9 +25,51 @@ from core.operations.repository import dependencies as dependency_repository
 from core.operations.repository import execution as execution_repository
 from core.operations.repository import metadata as repository_metadata
 from core.operations.repository import queue as queue_repository
+from core.operations.rules.identifiers import validate_operation_ids
 from core.operations.rules.ordering import automatic_queue
 from core.operations.rules.safety import submission_problem
 from core.storage.database import open_database
+
+
+_OVERVIEW_FIELDS = {
+    "operation_id", "operation_type", "issue_key", "target_issue_key",
+    "description", "risk_level", "created_at",
+}
+_EXECUTION_OVERVIEW_FIELDS = _OVERVIEW_FIELDS | {
+    "state", "stage_order", "execution_id", "submission_risk_level",
+    "submitted_at", "started_at", "held_reason", "blocked_by_execution_id",
+}
+
+
+class OperationsPage(TypedDict):
+    """A bounded projection of one current operations snapshot."""
+
+    items: list[dict[str, object]]
+    total: int
+    page: int
+    page_size: int
+    revisions: dict[str, int]
+
+
+class QueueOperationDetails(TypedDict):
+    """Full public records and IDs absent from the same queue snapshot."""
+
+    items: list[dict[str, object]]
+    missing_operation_ids: list[str]
+    revisions: dict[str, int]
+
+
+def _validate_page(page: int, page_size: int) -> None:
+    if type(page) is not int or page < 1:
+        raise ValueError("page 必须为正整数")
+    if type(page_size) is not int or not 1 <= page_size <= 200:
+        raise ValueError("page_size 必须为 1 至 200 的整数")
+
+
+def _queue_items(state: OperationsStatePublic) -> tuple[QueueOperationPublic, ...]:
+    return tuple(
+        operation for group in state.queue.groups for operation in group.operations
+    ) + state.queue.standalone
 
 
 def _operation_data(
@@ -151,6 +194,7 @@ class QueryService:
 
         connection = open_database("operations")
         try:
+            connection.execute("BEGIN")
             queue_records = queue_repository.queue_operations(connection)
             staging_records = execution_repository.staging_records(connection)
             inspection_by_operation_id, referenced_ids_by_operation_id = (
@@ -245,6 +289,71 @@ class QueryService:
             )
         finally:
             connection.close()
+
+    def list_queue(self, page: int = 1, page_size: int = 50) -> OperationsPage:
+        """Project a page of queue records in the Web review order."""
+        _validate_page(page, page_size)
+        state = self.get_state()
+        operations = _queue_items(state)
+        start = (page - 1) * page_size
+        return OperationsPage(
+            items=[
+                operation.model_dump(mode="json", include=_OVERVIEW_FIELDS)
+                for operation in operations[start : start + page_size]
+            ],
+            total=len(operations),
+            page=page,
+            page_size=page_size,
+            revisions=state.revisions,
+        )
+
+    def get_queue_operations(
+        self, operation_ids: list[str],
+    ) -> QueueOperationDetails:
+        """Read complete queued records in request order, identifying absent IDs."""
+        validate_operation_ids(operation_ids, maximum=200)
+        state = self.get_state()
+        by_id = {
+            operation.operation_id: operation for operation in _queue_items(state)
+        }
+        return QueueOperationDetails(
+            items=[
+                by_id[operation_id].model_dump(mode="json")
+                for operation_id in operation_ids
+                if operation_id in by_id
+            ],
+            missing_operation_ids=[
+                operation_id for operation_id in operation_ids
+                if operation_id not in by_id
+            ],
+            revisions=state.revisions,
+        )
+
+    def list_execution_state(
+        self, page: int = 1, page_size: int = 50,
+    ) -> OperationsPage:
+        """Project active execution metadata in authorized execution order."""
+        _validate_page(page, page_size)
+        state = self.get_state()
+        execution = state.execution
+        operations = sorted(
+            (
+                *execution.staged, *execution.executing,
+                *execution.indeterminate, *execution.held,
+            ),
+            key=lambda operation: operation.stage_order,
+        )
+        start = (page - 1) * page_size
+        return OperationsPage(
+            items=[
+                operation.model_dump(mode="json", include=_EXECUTION_OVERVIEW_FIELDS)
+                for operation in operations[start : start + page_size]
+            ],
+            total=len(operations),
+            page=page,
+            page_size=page_size,
+            revisions=state.revisions,
+        )
 
     def execution_history(
         self,

@@ -3,10 +3,11 @@
 from core.operations.container import OperationServices, get_services, reset_services
 from core.operations.errors import (
     ConfirmationRequired,
-    DependencyConfirmationRequired,
+    DependencyScopeIncomplete,
     ExecutionBlocked,
     RevisionConflict,
     StoreError,
+    store_error_data,
 )
 from core.operations.models import (
     AttachmentResult,
@@ -20,7 +21,7 @@ from core.operations.rules.safety import assert_safe_to_execute
 __all__ = [
     "ConfirmationRequired",
     "AttachmentResult",
-    "DependencyConfirmationRequired",
+    "DependencyScopeIncomplete",
     "ExecutionBlocked",
     "ExecutionClaim",
     "OperationRecord",
@@ -33,4 +34,5 @@ __all__ = [
     "is_jira_issue_key",
     "is_operation_id",
     "reset_services",
+    "store_error_data",
 ]
