@@ -11,7 +11,7 @@ from core.operations.dependencies import _issue
 from core.operations.errors import DependencyError
 from core.operations.models import (
     AttachmentDependencyResolution,
-    AttachmentResult,
+    AttachmentIdentity,
     DependencyState,
     OperationRecord,
     OperationType,
@@ -210,7 +210,10 @@ def reference_problem(
                 f"{referenced_operation_id}"
             )
         if state.state == "success":
-            if state.attachment_result is None:
+            if (
+                len(state.attachment_results) != 1
+                or state.attachment_results[0].attachment is None
+            ):
                 return (
                     "引用的附件生产者缺少上传结果："
                     f"{referenced_operation_id}"
@@ -272,11 +275,11 @@ def _replace_payload_texts(
 
 def materialize_references(
     operation: OperationRecord,
-    attachment_results_by_producer: Mapping[str, AttachmentResult],
+    attachments_by_producer: Mapping[str, AttachmentIdentity],
 ) -> tuple[OperationRecord, tuple[tuple[str, tuple[str, ...]], ...]]:
     """Replace attachment placeholders and report actual producer paths."""
 
-    if not attachment_results_by_producer:
+    if not attachments_by_producer:
         return operation, ()
 
     replacements: dict[str, str] = {}
@@ -287,10 +290,10 @@ def materialize_references(
 
         def replacement(match: re.Match[str]) -> str:
             referenced_operation_id = match.group("link") or match.group("image")
-            attachment_result = attachment_results_by_producer.get(
+            attachment = attachments_by_producer.get(
                 referenced_operation_id
             )
-            if attachment_result is None:
+            if attachment is None:
                 return match.group(0)
             producer_paths = paths_by_producer.setdefault(
                 referenced_operation_id, []
@@ -298,8 +301,8 @@ def materialize_references(
             if path not in producer_paths:
                 producer_paths.append(path)
             if match.group("link"):
-                return f"[^{attachment_result.filename}]"
-            return f"!{attachment_result.filename}!"
+                return f"[^{attachment.filename}]"
+            return f"!{attachment.filename}!"
 
         materialized = _REFERENCE_PATTERN.sub(replacement, value)
         if materialized != value:
@@ -313,7 +316,7 @@ def materialize_references(
             producer_operation_id,
             tuple(paths_by_producer[producer_operation_id]),
         )
-        for producer_operation_id in attachment_results_by_producer
+        for producer_operation_id in attachments_by_producer
         if producer_operation_id in paths_by_producer
     )
     return materialized_operation, changes
@@ -327,10 +330,13 @@ def resolution_from_state(
     if (
         is_producer(state.operation_type)
         and state.state == "success"
-        and state.attachment_result is not None
+        and len(state.attachment_results) == 1
+        and state.attachment_results[0].status == "success"
     ):
-        return AttachmentDependencyResolution(
-            producer_operation_id=state.operation_id,
-            attachment_result=state.attachment_result,
-        )
+        attachment = state.attachment_results[0].attachment
+        if attachment is not None:
+            return AttachmentDependencyResolution(
+                producer_operation_id=state.operation_id,
+                attachment=attachment,
+            )
     return None

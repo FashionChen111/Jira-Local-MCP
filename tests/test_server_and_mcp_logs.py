@@ -28,9 +28,9 @@ def _tool_names():
 
 
 def test_business_tools_are_explicitly_exported_and_registered(cfg):
-    from core.mcp_tools import jira_enqueue, jira_query, queue_tool
+    from core.mcp_tools import jira_enqueue, jira_query, queue_tool, jira_metadata
 
-    expected_modules = {jira_enqueue.__name__, jira_query.__name__, queue_tool.__name__}
+    expected_modules = {jira_enqueue.__name__, jira_query.__name__, queue_tool.__name__, jira_metadata.__name__}
     names = [function.__name__ for function in mcp_tools.TOOLS]
     assert len(names) == len(set(names))
     assert set(names) == _tool_names() - {"jira_show_queue"}
@@ -43,7 +43,7 @@ def test_business_tools_are_explicitly_exported_and_registered(cfg):
 
 def test_capability_surface_has_only_v2_review_tools(cfg):
     names = _tool_names()
-    assert len(names) == 22
+    assert len(names) == 33
     assert "jira_show_queue" in names
     assert "jira_get_execution_log" in names
     assert "jira_show_pending_queue" not in names
@@ -54,6 +54,44 @@ def test_capability_surface_has_only_v2_review_tools(cfg):
     } <= names
     assert not any(any(word in name for word in ("commit", "submit", "resolve", "delete")) for name in names)
     assert {name for name in names if "cancel" in name} == {"jira_cancel_queue_operations"}
+    assert "jira_query_local_file" not in names
+
+
+def test_registered_metadata_accepts_strict_context_and_rejects_global_scope(cfg, monkeypatch):
+    from core import jira_metadata
+    from mcp.server.fastmcp.exceptions import ToolError
+    calls = []
+    client = SimpleNamespace(editmeta=lambda key: calls.append(key) or {"fields": {"summary": {"name": "标题"}}})
+    monkeypatch.setattr(jira_metadata, "get_client", lambda: client)
+    tool = server.mcp._tool_manager.get_tool("jira_meta_fields")
+    assert tool is not None
+    assert "context" in tool.parameters["required"]
+    async def run():
+        result = await tool.run({"context": {"kind": "edit", "issue_key": "P-1"}})
+        assert result is not None
+        for arguments in ({}, {"context": {"kind": "edit", "issue_key": "op-" + "a" * 32}},
+                          {"context": {"kind": "edit", "issue_key": "P-1"}, "max_results": 101},
+                          {"context": {"kind": "edit", "issue_key": "P-1"}, "max_results": True}):
+            with pytest.raises(ToolError):
+                await tool.run(arguments)
+    anyio.run(run)
+    assert calls == ["P-1"]
+
+
+def test_actual_metadata_text_block_respects_response_budget(cfg, monkeypatch):
+    from core import jira_metadata
+    client = SimpleNamespace(projects=lambda: [{"id": str(i), "key": f"P{i}", "name": "x" * 300} for i in range(100)])
+    monkeypatch.setattr(jira_metadata, "get_client", lambda: client)
+    tool = server.mcp._tool_manager.get_tool("jira_meta_projects")
+    assert tool is not None
+    async def run():
+        content, structured = await tool.run({"max_results": 100}, convert_result=True)
+        assert len(content) == 1
+        assert isinstance(content[0], mcp_types.TextContent)
+        assert len(content[0].text.encode("utf-8")) <= jira_metadata.MAX_RESPONSE_BYTES
+        assert structured["page"]["has_more"] is True
+        assert all(len(item["name"]) == 300 for item in structured["items"])
+    anyio.run(run)
 
 
 def _assert_complete_chinese_description(
@@ -179,7 +217,7 @@ def test_append_response_exposes_only_operation_identity(queue):
 
 
 def test_create_response_exposes_reference_contract_and_followup_accepts_id(queue):
-    created = mcp_tools.jira_issue_create_append("PROJ", "Task", "new")
+    created = mcp_tools.jira_issue_create_append("PROJ", "10001", "new")
     operation_id_match = re.search(r"op-[0-9a-f]{32}", created)
     assert operation_id_match is not None
     operation_id = operation_id_match.group(0)
@@ -221,8 +259,8 @@ def test_attachment_query_returns_id_with_filename(queue, monkeypatch):
 
     result = json.loads(mcp_tools.jira_query_attachments("PROJ-1"))
 
-    assert result[0]["id"] == "10001"
-    assert result[0]["filename"] == "a.jpg"
+    assert result["items"][0]["id"] == "10001"
+    assert result["items"][0]["filename"] == "a.jpg"
 
 
 def test_show_queue_opens_even_when_empty(cfg, monkeypatch):

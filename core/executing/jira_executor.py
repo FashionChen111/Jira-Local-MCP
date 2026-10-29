@@ -2,25 +2,27 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from io import BytesIO
+from typing import Any, BinaryIO
+
+from jira.exceptions import JIRAError
 
 from core import jira_client
 from core.operations import (
+    AttachmentIdentity,
     AttachmentResult,
     OperationExecutionResult,
     assert_safe_to_execute,
+    parse_aware_datetime,
 )
-
-MOVE_UNSUPPORTED_MSG = (
-    "Jira Server / Data Center REST API 不支持移动事务，请在 Jira 页面人工处理。"
-)
+from core.runtime_logger import redact
 
 
 def _create(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
     fields: dict[str, Any] = {
         "project": {"key": payload["project_key"]},
-        "issuetype": {"name": payload["issue_type"]},
+        "issuetype": {"id": payload["issue_type_id"]},
         "summary": payload["summary"],
     }
     description = payload.get("description")
@@ -31,7 +33,7 @@ def _create(client: Any, task: Any) -> OperationExecutionResult:
     if payload.get("assignee"):
         fields["assignee"] = {"name": payload["assignee"]}
     fields.update(payload.get("extra_fields") or {})
-    issue = client.create_issue(fields=fields)
+    issue = client.create_issue(fields=fields, prefetch=False)
     return OperationExecutionResult(
         summary=f"已创建事务 {issue.key}", new_issue_key=issue.key
     )
@@ -42,55 +44,78 @@ def _clone(client: Any, task: Any) -> OperationExecutionResult:
     source = client.issue(task.issue_key)
     fields: dict[str, Any] = {
         "project": {"key": source.fields.project.key},
-        "issuetype": {"name": source.fields.issuetype.name},
+        "issuetype": {"id": source.fields.issuetype.id},
         "summary": payload.get("summary") or f"[克隆] {source.fields.summary}",
     }
-    if getattr(source.fields, "description", None):
+    if getattr(source.fields, "description", None) is not None:
         fields["description"] = source.fields.description
     if getattr(source.fields, "priority", None):
-        fields["priority"] = {"name": source.fields.priority.name}
-    issue = client.create_issue(fields=fields)
-    notes = []
-    if payload.get("clone_attachments"):
-        try:
-            for attachment in getattr(source.fields, "attachment", []) or []:
-                client.add_attachment(issue=issue.key, attachment=attachment.get(), filename=attachment.filename)
-            notes.append("附件已复制")
-        except Exception as exc:
-            notes.append(f"附件复制失败({type(exc).__name__})")
-    if payload.get("clone_subtasks"):
-        notes.append("子任务克隆需人工核对（未自动执行）")
-    suffix = "；" + "，".join(notes) if notes else ""
-    return OperationExecutionResult(
-        summary=f"已克隆 {task.issue_key} → {issue.key}{suffix}",
-        new_issue_key=issue.key,
+        fields["priority"] = {"id": source.fields.priority.id}
+    if getattr(source.fields.issuetype, "subtask", False):
+        fields["parent"] = {"key": source.fields.parent.key}
+    overrides = payload.get("field_overrides") or {}
+    fields.update(overrides)
+    if "parent" in overrides:
+        parent = client.issue(overrides["parent"]["key"], fields="project,issuetype")
+        if (parent.fields.project.key != source.fields.project.key
+                or getattr(parent.fields.issuetype, "subtask", False)
+                or not getattr(source.fields.issuetype, "subtask", False)):
+            raise ValueError("parent 必须是同项目中的非子任务，且仅能用于克隆子任务")
+    attachments = (
+        list(getattr(source.fields, "attachment", []) or [])
+        if payload.get("clone_attachments") else []
     )
-
-
-def _move(_client: Any, _task: Any) -> OperationExecutionResult:
-    raise RuntimeError(MOVE_UNSUPPORTED_MSG)
+    copies = [
+        AttachmentResult(
+            source_attachment_id=str(item.id), requested_filename=item.filename,
+            status="unattempted",
+        )
+        for item in attachments
+    ]
+    issue = client.create_issue(fields=fields, prefetch=False)
+    for index, attachment in enumerate(attachments):
+        try:
+            content = attachment.get()
+            if not isinstance(content, bytes):
+                raise TypeError("附件下载结果必须为 bytes")
+            with BytesIO(content) as handle:
+                copies[index] = _upload_attachment(
+                    client, issue.key, handle, attachment.filename, str(attachment.id)
+                )
+        except Exception as exc:
+            copies[index] = AttachmentResult(
+                source_attachment_id=str(attachment.id),
+                requested_filename=attachment.filename,
+                status="failed", error=redact(f"{type(exc).__name__}: {exc}"),
+            )
+        if copies[index].status != "success":
+            return OperationExecutionResult(
+                outcome="warning", new_issue_key=issue.key,
+                summary=f"已创建克隆事务 {issue.key}，附件复制未完成；禁止自动重放克隆",
+                attachment_results=tuple(copies),
+            )
+    return OperationExecutionResult(
+        summary=f"已克隆 {task.issue_key} → {issue.key}", new_issue_key=issue.key,
+        attachment_results=tuple(copies),
+    )
 
 
 def _change_type(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
-    fields = {"issuetype": {"name": payload["target_issue_type"]}}
+    fields = {"issuetype": {"id": payload["target_issue_type_id"]}}
     fields.update(payload.get("fields_mapping") or {})
-    try:
-        client.issue(task.issue_key).update(fields=fields)
-    except Exception as exc:
-        raise RuntimeError(f"变更事务类型失败: {type(exc).__name__}") from exc
+    client.issue(task.issue_key).update(fields=fields)
     return OperationExecutionResult(
-        summary=f"{task.issue_key} 类型已变更为 {payload['target_issue_type']}"
+        summary=f"{task.issue_key} 类型已变更为 {payload['target_issue_type_id']}"
     )
 
 
 def _transition(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
     issue = client.issue(task.issue_key)
-    wanted = str(payload["transition_name"]).strip().lower()
-    transition_id = next((item["id"] for item in client.transitions(issue) if item["name"].strip().lower() == wanted), None)
-    if transition_id is None:
-        raise RuntimeError(f"未找到流转「{payload['transition_name']}」")
+    transition_id = payload["transition_id"]
+    if not any(str(item["id"]) == transition_id for item in client.transitions(issue)):
+        raise ValueError(f"流转 ID {transition_id} 当前不可用")
     kwargs: dict[str, Any] = {}
     if payload.get("fields"):
         kwargs["fields"] = dict(payload["fields"])
@@ -98,7 +123,7 @@ def _transition(client: Any, task: Any) -> OperationExecutionResult:
         kwargs["comment"] = payload["comment"]
     client.transition_issue(issue, transition_id, **kwargs)
     return OperationExecutionResult(
-        summary=f"{task.issue_key} 状态已流转：{payload['transition_name']}"
+        summary=f"{task.issue_key} 状态已流转：{payload['transition_id']}"
     )
 
 
@@ -131,14 +156,65 @@ def _resource_value(resource: Any, name: str) -> object:
 def _attachment(client: Any, task: Any) -> OperationExecutionResult:
     payload = task.payload
     path = payload["file_path"]
-    if not os.path.isabs(path) or not os.path.isfile(path):
-        raise RuntimeError(f"附件文件不存在或非绝对路径: {path}")
-    with open(path, "rb") as handle:
-        uploaded = client.add_attachment(
-            issue=task.issue_key,
-            attachment=handle,
-            filename=payload.get("file_name"),
+    requested_filename = payload.get("file_name") or os.path.basename(path)
+    try:
+        if not os.path.isabs(path) or not os.path.isfile(path):
+            raise RuntimeError(f"附件文件不存在或非绝对路径: {path}")
+        with open(path, "rb") as handle:
+            result = _upload_attachment(client, task.issue_key, handle, requested_filename)
+    except Exception as exc:
+        result = AttachmentResult(
+            requested_filename=requested_filename, status="failed",
+            error=redact(f"{type(exc).__name__}: {exc}"),
         )
+    if result.attachment is None:
+        return OperationExecutionResult(
+            outcome="failed", summary=f"{task.issue_key} 附件上传未确认成功",
+            error=result.error, attachment_results=(result,),
+        )
+    return OperationExecutionResult(
+        summary=f"{task.issue_key} 已添加附件 {result.attachment.filename}",
+        attachment_results=(result,),
+    )
+
+
+def _upload_attachment(
+    client: Any, issue_key: str, handle: BinaryIO, requested_filename: str,
+    source_attachment_id: str | None = None,
+) -> AttachmentResult:
+    """Upload once and distinguish rejection from an unconfirmed write."""
+    try:
+        uploaded = client.add_attachment(
+            issue=issue_key, attachment=handle, filename=requested_filename,
+        )
+    except Exception as exc:
+        rejected = (
+            isinstance(exc, JIRAError)
+            and isinstance(exc.status_code, int)
+            and 400 <= exc.status_code < 500
+        )
+        return AttachmentResult(
+            requested_filename=requested_filename,
+            source_attachment_id=source_attachment_id,
+            status="failed" if rejected else "unknown",
+            error=redact(f"{type(exc).__name__}: {exc}"),
+        )
+    try:
+        attachment = _confirmed_attachment(client, uploaded)
+    except Exception as exc:
+        return AttachmentResult(
+            requested_filename=requested_filename,
+            source_attachment_id=source_attachment_id,
+            status="unknown", error=redact(f"{type(exc).__name__}: {exc}"),
+        )
+    return AttachmentResult(
+        requested_filename=requested_filename,
+        source_attachment_id=source_attachment_id,
+        status="success", attachment=attachment,
+    )
+
+
+def _confirmed_attachment(client: Any, uploaded: Any) -> AttachmentIdentity:
     attachment_id = _resource_value(uploaded, "id")
     if attachment_id is None or not str(attachment_id).strip():
         raise RuntimeError("Jira 附件上传响应缺少附件 ID")
@@ -148,12 +224,8 @@ def _attachment(client: Any, task: Any) -> OperationExecutionResult:
         filename = _resource_value(confirmed, "filename")
     if filename is None or not str(filename).strip():
         raise RuntimeError("无法根据 Jira 附件 ID 确认最终文件名")
-    attachment_result = AttachmentResult(
+    return AttachmentIdentity(
         id=str(attachment_id), filename=str(filename)
-    )
-    return OperationExecutionResult(
-        summary=f"{task.issue_key} 已添加附件 {attachment_result.filename}",
-        attachment_result=attachment_result,
     )
 
 
@@ -168,7 +240,12 @@ def _worklog(client: Any, task: Any) -> OperationExecutionResult:
     if payload.get("comment"):
         kwargs["comment"] = payload["comment"]
     if payload.get("started"):
-        kwargs["started"] = payload["started"]
+        kwargs["started"] = parse_aware_datetime(payload["started"])
+    kwargs["adjustEstimate"] = payload.get("adjust_estimate", "auto")
+    if payload.get("new_estimate") is not None:
+        kwargs["newEstimate"] = payload["new_estimate"]
+    if payload.get("reduce_by") is not None:
+        kwargs["reduceBy"] = payload["reduce_by"]
     client.add_worklog(issue=task.issue_key, **kwargs)
     return OperationExecutionResult(
         summary=f"{task.issue_key} 已添加工作日志 {payload['time_spent']}"
@@ -187,7 +264,7 @@ def _link(client: Any, task: Any) -> OperationExecutionResult:
 
 
 _HANDLERS = {
-    "create_issue": _create, "clone_issue": _clone, "move_issue": _move,
+    "create_issue": _create, "clone_issue": _clone,
     "change_type": _change_type, "transition_issue": _transition,
     "update_field": _update_field, "update_custom_field": _update_custom_field,
     "add_attachment": _attachment, "add_comment": _comment, "add_worklog": _worklog,

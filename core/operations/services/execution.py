@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Literal
-
 from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.errors import DependencyError, StoreError
 from core.operations.models import (
     AttachmentResult,
+    OperationExecutionOutcome,
     ExecutionClaim,
     OperationRecord,
     StagingRecord,
@@ -123,12 +122,12 @@ class ExecutionService:
     def complete_execution(
         self,
         execution_id: str,
-        outcome: Literal["success", "failed"],
+        outcome: OperationExecutionOutcome,
         summary: str | None,
         error: str | None,
         new_issue_key: str | None,
         elapsed_ms: int,
-        attachment_result: AttachmentResult | None = None,
+        attachment_results: tuple[AttachmentResult, ...] = (),
     ) -> None:
         """Persist a worker result and broadcast producer outcomes atomically."""
 
@@ -153,9 +152,9 @@ class ExecutionService:
                     dependency_orchestration.resolution_from_producer_result(
                         producer_operation_id=record.operation_id,
                         operation_type=record.operation_type,
-                        successful=outcome == "success",
+                        outcome=outcome,
                         new_issue_key=new_issue_key,
-                        attachment_result=attachment_result,
+                        attachment_results=attachment_results,
                     )
                 )
             except DependencyError as exc:
@@ -170,7 +169,7 @@ class ExecutionService:
                 summary=summary,
                 error=error,
                 new_issue_key=new_issue_key,
-                attachment_result=attachment_result,
+                attachment_results=attachment_results,
                 elapsed_ms=elapsed_ms,
             ):
                 raise StoreError("execution record 终态写入冲突")

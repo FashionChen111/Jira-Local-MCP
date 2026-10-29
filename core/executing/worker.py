@@ -37,8 +37,12 @@ def process_once() -> bool:
                 if claim.preflight_error is not None:
                     raise RuntimeError(claim.preflight_error)
                 result = jira_executor.execute_operation(claim.operation)
-                outcome = "success"
-                error = None
+                outcome = result.outcome
+                error = result.error
+                if outcome == "failed":
+                    get_logger().error(
+                        f"operation {claim.operation.operation_id} 执行失败: {redact(error or '')}"
+                    )
             except Exception as exc:
                 outcome = "failed"
                 result = None
@@ -57,9 +61,9 @@ def process_once() -> bool:
                     result.new_issue_key if result is not None else None,
                     int(elapsed_ms),
                     (
-                        result.attachment_result
+                        result.attachment_results
                         if result is not None
-                        else None
+                        else ()
                     ),
                 )
             except Exception as exc:

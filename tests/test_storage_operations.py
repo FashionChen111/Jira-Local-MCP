@@ -29,13 +29,13 @@ def test_schema_pragmas_and_revisions_initialized(queue) -> None:
     try:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         identity = connection.execute(
             "SELECT value FROM schema_metadata WHERE name='schema_identity'"
         ).fetchone()[0]
     finally:
         connection.close()
-    assert identity == "jira-local-mcp-operations-attachment-dependencies-v1"
+    assert identity == "jira-local-mcp-operations-attachment-results-v3"
     assert state(queue)["revisions"] == {"queue": 0, "execution": 0, "history": 0}
 
 
@@ -316,7 +316,7 @@ def test_high_risk_not_applied_requires_fresh_confirmation(queue) -> None:
     operation = queue.queue.enqueue(
         "transition_issue",
         "PROJ-1",
-        {"transition_name": "Close", "comment": None, "fields": {}},
+        {"transition_id": "10001", "comment": None, "fields": {}},
         "close",
         "test",
     )

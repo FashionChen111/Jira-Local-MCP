@@ -2,28 +2,30 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 from core.operations.dependencies import orchestration as dependency_orchestration
+from core.operations.errors import DependencyError
 from core.operations.models import (
+    AttachmentResult,
     DependencyState,
     OperationDraft,
     OperationRecord,
     RiskLevel,
 )
-from core.operations.errors import DependencyError
+from core.operations.rules.validation import is_jira_issue_key, parse_aware_datetime
 
 
 ALLOWED_OPERATION_TYPES = frozenset(
     {
         "create_issue",
         "clone_issue",
-        "move_issue",
         "change_type",
         "transition_issue",
         "update_field",
@@ -44,12 +46,11 @@ _MEDIUM_RISK = frozenset(
         "add_attachment",
     }
 )
-_CLOSE_KEYWORDS = ("关闭", "解决", "完成", "close", "resolve", "done", "cancel")
 _DELETE_PATTERN = re.compile(r"delete|remove|purge|删除|移除", re.IGNORECASE)
 _CUSTOM_FIELD_PATTERN = re.compile(r"customfield_\d+\Z")
 _CREATE_ISSUE_FIELD_OWNERS: Mapping[str, str] = {
     "project": "project_key",
-    "issuetype": "issue_type",
+    "issuetype": "issue_type_id",
     "summary": "summary",
     "description": "description 或 description_file",
     "priority": "priority",
@@ -77,7 +78,7 @@ _PAYLOAD_SHAPES: Mapping[str, _PayloadShape] = {
     "create_issue": _PayloadShape(
         required={
             "project_key": "string",
-            "issue_type": "string",
+            "issue_type_id": "string",
             "summary": "string",
         },
         optional={
@@ -93,18 +94,15 @@ _PAYLOAD_SHAPES: Mapping[str, _PayloadShape] = {
             "summary": "nullable_string",
             "clone_subtasks": "boolean",
             "clone_attachments": "boolean",
+            "field_overrides": "mapping",
         },
     ),
-    "move_issue": _PayloadShape(
-        required={"target_project_key": "string"},
-        optional={"target_issue_type": "nullable_string"},
-    ),
     "change_type": _PayloadShape(
-        required={"target_issue_type": "string"},
+        required={"target_issue_type_id": "string"},
         optional={"fields_mapping": "mapping"},
     ),
     "transition_issue": _PayloadShape(
-        required={"transition_name": "string"},
+        required={"transition_id": "string"},
         optional={
             "comment": "nullable_string",
             "fields": "mapping",
@@ -131,6 +129,9 @@ _PAYLOAD_SHAPES: Mapping[str, _PayloadShape] = {
         optional={
             "comment": "nullable_string",
             "started": "nullable_string",
+            "adjust_estimate": "string",
+            "new_estimate": "nullable_string",
+            "reduce_by": "nullable_string",
         },
     ),
     "add_issuelink": _PayloadShape(
@@ -167,7 +168,7 @@ def _matches_payload_kind(value: JsonValue, kind: _PayloadValueKind) -> bool:
 def assert_valid_payload_shape(
     operation_type: str, payload: Mapping[str, JsonValue]
 ) -> None:
-    """Validate only the stable local shape consumed by Jira handlers."""
+    """Validate the stable payload shape and local operation constraints."""
 
     shape = _PAYLOAD_SHAPES.get(operation_type)
     if shape is None:
@@ -197,7 +198,82 @@ def assert_valid_payload_shape(
                     f"{_PAYLOAD_KIND_LABELS[kind]}"
                 )
 
-    if operation_type == "update_custom_field":
+    for key in ("issue_type_id", "target_issue_type_id", "transition_id"):
+        if key not in payload:
+            continue
+        value = payload[key]
+        if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
+            raise OperationSafetyError(f"{key} 必须是十进制数字 ID 字符串")
+
+    if operation_type == "change_type":
+        fields_mapping = payload.get("fields_mapping")
+        if isinstance(fields_mapping, dict) and "issuetype" in fields_mapping:
+            raise OperationSafetyError(
+                "fields_mapping 不得覆盖 issuetype，请使用 target_issue_type_id"
+            )
+    elif operation_type == "clone_issue":
+        if payload.get("clone_subtasks"):
+            raise OperationSafetyError("尚不支持子任务递归克隆，未入队")
+        overrides = payload.get("field_overrides")
+        if not isinstance(overrides, dict):
+            return
+        if overrides.keys() & {"project", "issuetype", "summary"}:
+            raise OperationSafetyError(
+                "field_overrides 不得覆盖 project、issuetype、summary"
+            )
+        if "parent" in overrides:
+            parent = overrides["parent"]
+            if (
+                not isinstance(parent, dict)
+                or set(parent) != {"key"}
+                or not is_jira_issue_key(parent["key"])
+            ):
+                raise OperationSafetyError("parent 必须为仅包含真实 Jira Key 的对象")
+        description = overrides.get("description")
+        if isinstance(description, str) and "{{attachment:" in description:
+            raise OperationSafetyError("克隆初始 description 不接受待上传附件引用")
+    elif operation_type == "add_attachment":
+        filename = payload.get("file_name")
+        path = payload["file_path"]
+        if filename is None and isinstance(path, str):
+            filename = os.path.basename(path)
+        try:
+            AttachmentResult.model_validate({
+                "requested_filename": filename, "status": "unattempted",
+            })
+        except ValidationError as exc:
+            raise OperationSafetyError("附件请求文件名无效") from exc
+    elif operation_type == "add_worklog":
+        started = payload.get("started")
+        if isinstance(started, str):
+            try:
+                parse_aware_datetime(started)
+            except ValueError as exc:
+                raise OperationSafetyError(f"started {exc}") from exc
+        estimate_mode = payload.get("adjust_estimate", "auto")
+        if estimate_mode not in ("auto", "leave", "new", "manual"):
+            raise OperationSafetyError("adjust_estimate 必须为 auto、leave、new 或 manual")
+        new_estimate = payload.get("new_estimate")
+        reduce_by = payload.get("reduce_by")
+        if estimate_mode == "new":
+            if (
+                not isinstance(new_estimate, str)
+                or not new_estimate.strip()
+                or reduce_by is not None
+            ):
+                raise OperationSafetyError("new 必须提供 new_estimate，且不能提供 reduce_by")
+        elif estimate_mode == "manual":
+            if (
+                not isinstance(reduce_by, str)
+                or not reduce_by.strip()
+                or new_estimate is not None
+            ):
+                raise OperationSafetyError(
+                    "manual 必须提供 reduce_by，且不能提供 new_estimate"
+                )
+        elif new_estimate is not None or reduce_by is not None:
+            raise OperationSafetyError("auto/leave 不接受 new_estimate 或 reduce_by")
+    elif operation_type == "update_custom_field":
         custom_fields = payload["custom_fields"]
         if not isinstance(custom_fields, dict):
             return
@@ -211,8 +287,7 @@ def assert_valid_payload_shape(
                 "update_custom_field.payload.custom_fields 包含无效字段 ID："
                 + "、".join(invalid)
             )
-
-    if operation_type == "create_issue":
+    elif operation_type == "create_issue":
         extra_fields = payload.get("extra_fields")
         if not isinstance(extra_fields, dict):
             return
@@ -234,14 +309,9 @@ def classify_base_risk(
     """Classify the operation before selection-level escalation."""
 
     if operation_type in _LOW_RISK:
-        return "low", "低风险：仅新增内容，不改动既有数据"
+        return "low", "低风险：新增内容，影响可控"
     if operation_type == "transition_issue":
-        name = str(payload.get("transition_name", ""))
-        if any(keyword in name.lower() for keyword in _CLOSE_KEYWORDS):
-            return "high", f"高风险：状态流转“{name}”可能关闭或解决事务"
-        return "high", f"高风险：状态流转“{name}”会改变工作流状态"
-    if operation_type == "move_issue":
-        return "high", "高风险：移动事务会改变项目归属"
+        return "high", f"高风险：流转 ID {payload.get('transition_id', '')} 会改变工作流状态"
     if operation_type == "change_type":
         return "high", "高风险：变更事务类型可能影响字段和层级"
     if operation_type in _MEDIUM_RISK:

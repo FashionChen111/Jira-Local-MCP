@@ -20,12 +20,11 @@ def op(
     target_issue_key: str | None = None,
 ) -> OperationRecord:
     payloads = {
-        "create_issue": {"project_key": "P", "issue_type": "Task", "summary": "x"},
+        "create_issue": {"project_key": "P", "issue_type_id": "10001", "summary": "x"},
         "update_field": {"fields": {"summary": "x"}},
         "update_custom_field": {"custom_fields": {"customfield_1": "x"}},
-        "transition_issue": {"transition_name": "Start", "fields": {}, "comment": None},
-        "move_issue": {"target_project_key": "OTHER", "target_issue_type": None},
-        "change_type": {"target_issue_type": "Bug", "fields_mapping": {}},
+        "transition_issue": {"transition_id": "10001", "fields": {}, "comment": None},
+        "change_type": {"target_issue_type_id": "10001", "fields_mapping": {}},
         "add_attachment": {"file_path": "C:\\a.txt", "file_name": None},
         "add_comment": {"body": "x"},
         "add_worklog": {"time_spent": "1h", "comment": None, "started": None},
@@ -55,7 +54,6 @@ def test_natural_jira_groups_category_order_and_standalone_last() -> None:
         op("op-" + "4" * 32, "update_custom_field", "PROJ-2", 3),
         op("op-" + "5" * 32, "update_field", "PROJ-2", 5),
         op("op-" + "6" * 32, "add_issuelink", "PROJ-1", 0, target_issue_key="PROJ-2"),
-        op("op-" + "7" * 32, "move_issue", "PROJ-3", 2),
         op("op-" + "8" * 32, "change_type", "PROJ-3", 3),
     ]
 
@@ -70,7 +68,6 @@ def test_natural_jira_groups_category_order_and_standalone_last() -> None:
     ]
     assert [item.operation_type for item in layout.standalone] == [
         "add_issuelink",
-        "move_issue",
         "change_type",
     ]
     assert sorted(["PROJ-10", "PROJ-2", "PROJ-1"], key=natural_issue_key) == [

@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import os
+
 from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.errors import ConfirmationRequired, DependencyError, StoreError
-from core.operations.models import AttachmentResult, OperationRecord, Resolution
+from core.operations.models import (
+    AttachmentIdentity,
+    AttachmentResult,
+    OperationRecord,
+    Resolution,
+)
 from core.operations.repository import dependencies as dependency_repository
 from core.operations.repository import execution as execution_repository
 from core.operations.repository import metadata as repository_metadata
@@ -21,7 +28,7 @@ class RecoveryService:
         resolution: Resolution,
         high_risk_confirmed: bool,
         new_issue_key: str | None = None,
-        attachment_result: AttachmentResult | None = None,
+        attachment: AttachmentIdentity | None = None,
     ) -> dict[str, object]:
         """Record the human conclusion for an indeterminate execution."""
 
@@ -33,14 +40,32 @@ class RecoveryService:
                 raise StoreError("仅允许处置 indeterminate operation")
             if staging.execution_id is None:
                 raise StoreError("indeterminate operation 缺少 execution ID")
+            attachment_results: tuple[AttachmentResult, ...] = ()
+            if attachment is not None:
+                if staging.operation_type != "add_attachment" or resolution != "succeeded":
+                    raise StoreError("仅附件上传的已生效处置允许提供附件身份")
+                path = staging.payload.get("file_path")
+                if not isinstance(path, str):
+                    raise StoreError("附件上传快照缺少文件路径")
+                requested_filename = (
+                    staging.payload.get("file_name") or os.path.basename(path)
+                )
+                if not isinstance(requested_filename, str):
+                    raise StoreError("附件上传快照的文件名无效")
+                attachment_results = (
+                    AttachmentResult(
+                        requested_filename=requested_filename, status="success",
+                        attachment=attachment,
+                    ),
+                )
             try:
                 dependency_resolution = (
                     dependency_orchestration.resolution_from_producer_result(
                         producer_operation_id=operation_id,
                         operation_type=staging.operation_type,
-                        successful=resolution == "succeeded",
+                        outcome="success" if resolution == "succeeded" else "failed",
                         new_issue_key=new_issue_key,
-                        attachment_result=attachment_result,
+                        attachment_results=attachment_results,
                     )
                 )
             except DependencyError as exc:
@@ -59,7 +84,7 @@ class RecoveryService:
                 resolution=resolution,
                 resolved_at=utc_ms(),
                 new_issue_key=new_issue_key,
-                attachment_result=attachment_result,
+                attachment_results=attachment_results,
             ):
                 raise StoreError("execution record 已处置或状态不一致")
             execution_repository.delete_staging_by_operation(
@@ -97,11 +122,9 @@ class RecoveryService:
                 "execution_id": staging.execution_id,
                 "resolution": resolution,
                 "new_issue_key": new_issue_key,
-                "attachment_result": (
-                    attachment_result.model_dump(mode="json")
-                    if attachment_result is not None
-                    else None
-                ),
+                "attachment_results": [
+                    item.model_dump(mode="json") for item in attachment_results
+                ],
             }
 
     def resolve_held(

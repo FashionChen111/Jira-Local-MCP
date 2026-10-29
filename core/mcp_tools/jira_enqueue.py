@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Literal
 
 from core.operations import OperationRecord, get_services
 from core.runtime_logger import redact
@@ -61,7 +61,7 @@ def _enqueue(
 
 def jira_issue_create_append(
     project_key: str,
-    issue_type: str,
+    issue_type_id: str,
     summary: str,
     description: str | None = None,
     description_file: str | None = None,
@@ -73,7 +73,7 @@ def jira_issue_create_append(
 
     参数：
         project_key: Jira 项目 Key。
-        issue_type: 事务类型名称，例如 ``Bug``、``Task`` 或 ``Story``。
+        issue_type_id: 项目创建元数据返回的事务类型 ID。
         summary: 事务标题。
         description: 可选的内联事务描述；未提供文件时使用该值。
         description_file: 可选的本地 ``.txt`` 文件绝对路径；其内容拥有最高
@@ -97,7 +97,7 @@ def jira_issue_create_append(
     """
     payload = {
         "project_key": project_key,
-        "issue_type": issue_type,
+        "issue_type_id": issue_type_id,
         "summary": summary,
         "description": description,
         "description_file": description_file,
@@ -109,7 +109,7 @@ def jira_issue_create_append(
         "create_issue",
         None,
         payload,
-        f"新建 {issue_type}「{summary}」于项目 {project_key}",
+        f"新建 {issue_type_id}「{summary}」于项目 {project_key}",
         "jira_issue_create_append",
     )
 
@@ -119,19 +119,23 @@ def jira_issue_clone_append(
     summary: str | None = None,
     clone_subtasks: bool = False,
     clone_attachments: bool = False,
+    field_overrides: dict | None = None,
 ) -> str:
     """将克隆 Jira 事务操作加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
         issue_key: 源 Jira 事务的真实 Key；克隆来源不接受待创建 operation ID。
         summary: 可选的新事务标题。
-        clone_subtasks: 是否在经审核的操作中克隆子任务，默认为 ``False``。
+        clone_subtasks: 必须为 False；递归克隆子任务不支持，True 立即拒绝且不入队。
         clone_attachments: 是否在经审核的操作中克隆附件，默认为 ``False``。
+        field_overrides: 补充或覆盖创建字段，禁止 project、issuetype、summary；description
+            支持文本文件快照，禁止待上传附件引用；单个子任务默认保留原 parent。
 
     返回：
         已入队的 operation ID、基础风险等级及“尚未执行”提示；执行前必须由
         用户在本地 Web 审核页明确提交。该 operation ID 可立即作为后续修改
-        Tool 的待创建事务引用。
+        Tool 的待创建事务引用。新事务已创建而附件处理异常时，执行日志记录
+        warning 和附件结果列表，仍解析新事务依赖；不得自动重放整个克隆。
 
     副作用：
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
@@ -140,6 +144,7 @@ def jira_issue_clone_append(
         "summary": summary,
         "clone_subtasks": clone_subtasks,
         "clone_attachments": clone_attachments,
+        "field_overrides": field_overrides or {},
     }
     return _enqueue(
         "clone_issue",
@@ -153,43 +158,31 @@ def jira_issue_clone_append(
 def jira_issue_move_append(
     issue_key: str, target_project_key: str, target_issue_type: str | None = None
 ) -> str:
-    """将 Jira 事务移动方案加入本地审核队列；仅入队，不会直接写入 Jira。
-
-    Jira Server/Data Center REST API 不支持移动事务，因此即使用户授权，
-    该操作也会在执行阶段明确失败，不会被伪装成成功。
+    """说明移动事务能力限制，立即拒绝且不入队。
 
     参数：
-        issue_key: 源 Jira 事务 Key，或创建/克隆 operation ID。
-        target_project_key: 目标 Jira 项目 Key。
-        target_issue_type: 可选的目标事务类型。
+        issue_key: 源事务 Key。
+        target_project_key: 目标项目 Key。
+        target_issue_type: 可选的目标事务类型；保留公开签名。
 
     返回：
-        已入队的 operation ID、基础风险等级及“尚未执行”提示。
+        不支持且未入队的明确提示；请在 Jira 页面人工移动。
 
     副作用：
-        仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
+        不修改 Jira，不创建本地记录。其他 append 工具仅入队、尚未执行，
+        需要本地 Web 人工审核提交。
     """
-    payload = {
-        "target_project_key": target_project_key,
-        "target_issue_type": target_issue_type,
-    }
-    return _enqueue(
-        "move_issue",
-        issue_key,
-        payload,
-        f"移动事务 {issue_key} → 项目 {target_project_key}",
-        "jira_issue_move_append",
-    )
+    return "不支持且未入队：Jira Server/Data Center REST API 不支持移动事务，请在 Jira 页面人工处理。"
 
 
 def jira_issue_type_change_append(
-    issue_key: str, target_issue_type: str, fields_mapping: dict | None = None
+    issue_key: str, target_issue_type_id: str, fields_mapping: dict | None = None
 ) -> str:
     """将 Jira 事务类型变更加入本地审核队列；仅入队，不会直接写入 Jira。
 
     参数：
         issue_key: Jira 事务 Key，或创建/克隆 operation ID。
-        target_issue_type: 目标事务类型名称。
+        target_issue_type_id: 项目元数据返回的目标事务类型 ID。
         fields_mapping: 可选的字段映射，用于适配不同事务类型的字段差异。
             其中 description 支持入队时文本文件快照及同事务附件引用语法。
 
@@ -201,21 +194,21 @@ def jira_issue_type_change_append(
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
     """
     payload = {
-        "target_issue_type": target_issue_type,
+        "target_issue_type_id": target_issue_type_id,
         "fields_mapping": fields_mapping or {},
     }
     return _enqueue(
         "change_type",
         issue_key,
         payload,
-        f"变更 {issue_key} 事务类型 → {target_issue_type}",
+        f"变更 {issue_key} 事务类型 → {target_issue_type_id}",
         "jira_issue_type_change_append",
     )
 
 
 def jira_issue_transition_append(
     issue_key: str,
-    transition_name: str,
+    transition_id: str,
     comment: str | None = None,
     fields: dict | None = None,
 ) -> str:
@@ -223,7 +216,7 @@ def jira_issue_transition_append(
 
     参数：
         issue_key: Jira 事务 Key，或创建/克隆 operation ID。
-        transition_name: Jira 工作流流转名称。
+        transition_id: 该真实事务当前可用的工作流流转 ID；执行前重新校验。
         comment: 可选的流转评论，支持同事务附件引用语法。
         fields: 可选的流转字段映射，其中 description 支持入队时文本文件
             快照及同事务附件引用语法。
@@ -236,7 +229,7 @@ def jira_issue_transition_append(
         仅在本地 SQLite 中创建待审核 operation；本次调用不写入 Jira。
     """
     payload = {
-        "transition_name": transition_name,
+        "transition_id": transition_id,
         "comment": comment,
         "fields": fields or {},
     }
@@ -244,7 +237,7 @@ def jira_issue_transition_append(
         "transition_issue",
         issue_key,
         payload,
-        f"{issue_key} 状态流转「{transition_name}」",
+        f"{issue_key} 状态流转「{transition_id}」",
         "jira_issue_transition_append",
     )
 
@@ -310,6 +303,7 @@ def jira_attachment_add_append(
         issue_key: Jira 事务 Key，或创建/克隆 operation ID。
         file_path: 已存在的本地文件绝对路径。
         file_name: 可选的附件显示名称；省略时使用本地文件名。
+            文件名必须为非空白文本，不得包含 NUL，且不超过 1024 个字符。
 
     返回：
         已入队的 operation ID、基础风险等级及“尚未执行”提示。
@@ -367,6 +361,9 @@ def jira_worklog_add_append(
     time_spent: str,
     comment: str | None = None,
     started: str | None = None,
+    adjust_estimate: Literal["auto", "leave", "new", "manual"] = "auto",
+    new_estimate: str | None = None,
+    reduce_by: str | None = None,
 ) -> str:
     """将 Jira 工作日志添加操作加入本地审核队列；仅入队，不会直接写入 Jira。
 
@@ -376,7 +373,10 @@ def jira_worklog_add_append(
         comment: 可选的工作说明。
             可使用 ``[^{{attachment:op-…}}]`` 或 ``!{{attachment:op-…}}!``
             引用同一事务的附件上传 operation。
-        started: 可选的 ISO 格式开始时间；省略时由 Jira 使用当前时间。
+        started: 带明确时区的合法 ISO 开始时间；省略时由 SDK 使用当前时间。
+        adjust_estimate: 剩余估算模式：auto 自动减少、leave 保持、new 重设、manual 指定减少量。
+        new_estimate: 仅 new 模式必须提供的剩余估算，例如 2h。
+        reduce_by: 仅 manual 模式必须提供的减少量，例如 1h；与 new_estimate 互斥。
 
     返回：
         已入队的 operation ID、基础风险等级及“尚未执行”提示；执行前必须由
@@ -389,12 +389,15 @@ def jira_worklog_add_append(
         "time_spent": time_spent,
         "comment": comment,
         "started": started,
+        "adjust_estimate": adjust_estimate,
+        "new_estimate": new_estimate,
+        "reduce_by": reduce_by,
     }
     return _enqueue(
         "add_worklog",
         issue_key,
         payload,
-        f"为 {issue_key} 添加工作日志 {time_spent}",
+        f"为 {issue_key} 添加工作日志 {time_spent}；估算模式 {adjust_estimate}",
         "jira_worklog_add_append",
     )
 

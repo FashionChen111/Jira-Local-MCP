@@ -158,6 +158,18 @@ function operationCard(operation, controls = []) {
     head.append(area);
   }
   card.append(head);
+  const payload = operation.payload || {};
+  for (const key of ["issue_type_id", "target_issue_type_id", "transition_id"]) {
+    if (payload[key]) card.append(el("div", "meta", `${key}：${payload[key]}`));
+  }
+  if (operation.operation_type === "clone_issue") {
+    card.append(el("div", "meta", `克隆覆盖字段：${Object.keys(payload.field_overrides || {}).join("、") || "无"}`));
+  }
+  if (operation.operation_type === "add_worklog") {
+    const mode = payload.adjust_estimate || "auto";
+    const impact = {auto: "自动减少剩余估算", leave: "保持剩余估算", new: "重设剩余估算", manual: "按指定量减少剩余估算"};
+    card.append(el("div", "meta", `估算影响：${impact[mode] || mode} ${payload.new_estimate || payload.reduce_by || ""}`));
+  }
 
   const details = el("details");
   details.open = expanded.has(operation.operation_id);
@@ -344,7 +356,7 @@ async function resolveIndeterminate(operation, resolution) {
     if (!highRiskConfirmed) return;
   }
   let newIssueKey = null;
-  let attachmentResult = null;
+  let attachment = null;
   if (
     resolution === "succeeded" &&
     ["create_issue", "clone_issue"].includes(operation.operation_type)
@@ -371,14 +383,14 @@ async function resolveIndeterminate(operation, resolution) {
       message("附件 ID 和最终文件名均不得为空");
       return;
     }
-    attachmentResult = { id: attachmentId, filename };
+    attachment = { id: attachmentId, filename };
   }
   await mutate("/api/execution/indeterminate/resolve", {
     operation_id: operation.operation_id,
     resolution,
     high_risk_confirmed: highRiskConfirmed,
     new_issue_key: newIssueKey,
-    attachment_result: attachmentResult,
+    attachment,
   });
 }
 
@@ -643,19 +655,19 @@ async function loadHistory(force = false) {
       el(
         "span",
         `status ${item.outcome}`,
-        item.resolution ? `${item.outcome} · ${item.resolution}` : item.outcome,
+        item.resolution
+          ? `${item.outcome} · ${item.resolution}`
+          : item.outcome === "warning" ? "成功（有异常）" : item.outcome,
       ),
     );
     card.append(el("div", "meta", new Date(item.started_at).toLocaleString()));
     if (item.summary) card.append(el("div", "meta", item.summary));
-    if (item.attachment_result) {
-      card.append(
-        el(
-          "div",
-          "meta",
-          `附件结果：${item.attachment_result.filename}（ID ${item.attachment_result.id}）`,
-        ),
-      );
+    if (item.new_issue_key) card.append(el("div", "meta", `已创建事务：${item.new_issue_key}`));
+    const labels = {success: "成功", failed: "失败", unknown: "结果未知", unattempted: "未尝试"};
+    for (const result of item.attachment_results) {
+      const source = result.source_attachment_id ? `（源 ID ${result.source_attachment_id}）` : "";
+      const target = result.attachment ? ` → ${result.attachment.filename}（ID ${result.attachment.id}）` : "";
+      card.append(el("div", "meta", `附件处理：${result.requested_filename}${source}${target}：${labels[result.status]}${result.error ? `；${result.error}` : ""}`));
     }
     if (item.error) card.append(el("div", "meta", item.error));
     historyContent.append(card);

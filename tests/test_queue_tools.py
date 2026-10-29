@@ -175,7 +175,7 @@ def test_execution_snapshots_cover_lifecycle_without_claiming_success(queue):
 def test_cancel_requires_transitive_issue_and_attachment_scope(queue, tmp_path, web_client):
     producer = queue.queue.enqueue(
         "create_issue", None,
-        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"}, "create", "test",
+        {"project_key": "PROJ", "issue_type_id": "10001", "summary": "new"}, "create", "test",
     )
     path = tmp_path / "attachment.txt"
     path.write_text("attachment", encoding="utf-8")
@@ -366,7 +366,7 @@ def test_partial_reads_prepare_only_requested_public_records(queue, monkeypatch,
 def test_partial_detail_dependency_facts_share_snapshot(queue, monkeypatch):
     producer = queue.queue.enqueue(
         "create_issue", None,
-        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"}, "create", "test",
+        {"project_key": "PROJ", "issue_type_id": "10001", "summary": "new"}, "create", "test",
     )
     child = _comment(queue, producer.operation_id)
     original = queue_repository.queue_operations_by_ids

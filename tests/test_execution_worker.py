@@ -80,7 +80,7 @@ def test_failed_producer_never_calls_executor_for_dependants(queue, monkeypatch)
     create = queue.queue.enqueue(
         "create_issue",
         None,
-        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
+        {"project_key": "PROJ", "issue_type_id": "10001", "summary": "new"},
         "create",
         "test",
     )
@@ -223,7 +223,8 @@ def test_create_executor_preserves_only_non_dedicated_extra_fields(monkeypatch):
     calls: list[dict[str, object]] = []
 
     class Client:
-        def create_issue(self, *, fields):
+        def create_issue(self, *, fields, prefetch):
+            assert prefetch is False
             calls.append(fields)
             return SimpleNamespace(key="PROJ-10")
 
@@ -234,7 +235,7 @@ def test_create_executor_preserves_only_non_dedicated_extra_fields(monkeypatch):
         risk_level="medium",
         payload={
             "project_key": "PROJ",
-            "issue_type": "Task",
+            "issue_type_id": "10001",
             "summary": "new",
             "description": "details",
             "priority": "High",
@@ -256,7 +257,7 @@ def test_create_executor_preserves_only_non_dedicated_extra_fields(monkeypatch):
     assert calls == [
         {
             "project": {"key": "PROJ"},
-            "issuetype": {"name": "Task"},
+            "issuetype": {"id": "10001"},
             "summary": "new",
             "description": "details",
             "priority": {"name": "High"},

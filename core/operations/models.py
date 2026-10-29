@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
 
 
 OperationType = Literal[
     "create_issue",
     "clone_issue",
-    "move_issue",
     "change_type",
     "transition_issue",
     "update_field",
@@ -23,7 +29,8 @@ OperationType = Literal[
 RiskLevel = Literal["low", "medium", "high"]
 QueueGroupKind = Literal["jira_issue", "pending_issue"]
 StagingState = Literal["staged", "executing", "indeterminate", "held"]
-ExecutionOutcome = Literal["success", "failed", "indeterminate", "dependency_failed"]
+OperationExecutionOutcome = Literal["success", "warning", "failed"]
+ExecutionOutcome = OperationExecutionOutcome | Literal["indeterminate", "dependency_failed"]
 Resolution = Literal["succeeded", "not_applied", "abandoned"]
 ProducerLifecycleState = Literal[
     "queued",
@@ -33,6 +40,7 @@ ProducerLifecycleState = Literal[
     "held",
     "success",
     "failed",
+    "warning",
     "retry_pending",
     "abandoned",
     "dependency_failed",
@@ -51,7 +59,7 @@ class StrictFrozenModel(BaseModel):
     )
 
 
-class AttachmentResult(StrictFrozenModel):
+class AttachmentIdentity(StrictFrozenModel):
     """Stable identity returned by Jira after one attachment upload."""
 
     id: str = Field(min_length=1, max_length=255)
@@ -67,12 +75,54 @@ class AttachmentResult(StrictFrozenModel):
         return value
 
 
+class AttachmentResult(StrictFrozenModel):
+    """One attachment interaction and its confirmed identity, if successful."""
+
+    requested_filename: str = Field(min_length=1, max_length=1024)
+    status: Literal["success", "failed", "unknown", "unattempted"]
+    source_attachment_id: str | None = Field(
+        default=None, min_length=1, max_length=255
+    )
+    attachment: AttachmentIdentity | None = None
+    error: str | None = None
+
+    @field_validator("requested_filename", "source_attachment_id", "error")
+    @classmethod
+    def nonblank_without_nul(cls, value: str | None) -> str | None:
+        if value is not None and (not value.strip() or "\x00" in value):
+            raise ValueError("附件名称、源 ID 和错误信息不得为空或包含 NUL")
+        return value
+
+    @model_validator(mode="after")
+    def consistent_outcome(self) -> AttachmentResult:
+        if (self.status == "success") != (self.attachment is not None):
+            raise ValueError("仅成功结果允许且必须包含已确认附件身份")
+        if (self.status in ("failed", "unknown")) != (self.error is not None):
+            raise ValueError("失败或结果未知必须包含错误，其余状态不得包含错误")
+        return self
+
+
 class OperationExecutionResult(StrictFrozenModel):
     """Typed Jira handler result persisted by the execution service."""
 
     summary: str
     new_issue_key: str | None = None
-    attachment_result: AttachmentResult | None = None
+    attachment_results: tuple[AttachmentResult, ...] = ()
+    outcome: OperationExecutionOutcome = "success"
+    error: str | None = None
+
+    @model_validator(mode="after")
+    def consistent_outcome(self) -> OperationExecutionResult:
+        if self.outcome == "success" and any(
+            item.status != "success" for item in self.attachment_results
+        ):
+            raise ValueError("附件处理未全部完成，不能返回 success")
+        if self.outcome == "failed":
+            if not self.error or not self.error.strip():
+                raise ValueError("失败结果必须包含错误信息")
+        elif self.error is not None:
+            raise ValueError("仅失败结果允许包含顶层错误")
+        return self
 
 
 class OperationDraft(StrictFrozenModel):
@@ -153,7 +203,7 @@ class ExecutionRecord(OperationRecord):
     summary: str | None = None
     error: str | None = None
     new_issue_key: str | None = None
-    attachment_result: AttachmentResult | None = None
+    attachment_results: tuple[AttachmentResult, ...] = ()
     elapsed_ms: int | None = Field(default=None, ge=0)
     resolution: Resolution | None = None
     resolved_at: int | None = Field(default=None, ge=0)
@@ -184,7 +234,7 @@ class DependencyState(StrictFrozenModel):
     state: ProducerLifecycleState
     operation_issue_key: str | None = None
     new_issue_key: str | None = None
-    attachment_result: AttachmentResult | None = None
+    attachment_results: tuple[AttachmentResult, ...] = ()
 
     @property
     def active(self) -> bool:
@@ -219,7 +269,7 @@ class AttachmentDependencyResolution(StrictFrozenModel):
 
     kind: Literal["attachment"] = "attachment"
     producer_operation_id: str
-    attachment_result: AttachmentResult
+    attachment: AttachmentIdentity
 
 
 DependencyResolution = IssueDependencyResolution | AttachmentDependencyResolution
@@ -295,7 +345,7 @@ class ExecutionRecordPublic(OperationPublic):
     summary: str | None
     error: str | None
     new_issue_key: str | None
-    attachment_result: AttachmentResult | None
+    attachment_results: tuple[AttachmentResult, ...] = ()
     elapsed_ms: int | None
     resolution: Resolution | None
     resolved_at: int | None

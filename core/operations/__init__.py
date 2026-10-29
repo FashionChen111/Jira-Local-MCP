@@ -11,16 +11,22 @@ from core.operations.errors import (
 )
 from core.operations.models import (
     AttachmentResult,
+    AttachmentIdentity,
     ExecutionClaim,
     OperationExecutionResult,
     OperationRecord,
 )
-from core.operations.rules.identifiers import is_jira_issue_key, is_operation_id
 from core.operations.rules.safety import assert_safe_to_execute
+from core.operations.rules.validation import (
+    is_jira_issue_key,
+    is_operation_id,
+    parse_aware_datetime,
+)
 
 __all__ = [
     "ConfirmationRequired",
     "AttachmentResult",
+    "AttachmentIdentity",
     "DependencyScopeIncomplete",
     "ExecutionBlocked",
     "ExecutionClaim",
@@ -33,6 +39,7 @@ __all__ = [
     "get_services",
     "is_jira_issue_key",
     "is_operation_id",
+    "parse_aware_datetime",
     "reset_services",
     "store_error_data",
 ]

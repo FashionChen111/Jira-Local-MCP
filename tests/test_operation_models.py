@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.models import (
     AttachmentDependencyResolution,
+    AttachmentIdentity,
     AttachmentResult,
     DependencyState,
     IssueDependencyResolution,
@@ -107,18 +108,20 @@ def test_staging_model_rejects_unknown_persisted_state() -> None:
         )
 
 
-def test_attachment_result_is_one_strict_frozen_identity_value() -> None:
-    attachment = AttachmentResult(id="10001", filename="a-1.jpg")
+def test_attachment_identity_is_one_strict_frozen_value() -> None:
+    attachment = AttachmentIdentity(id="10001", filename="a-1.jpg")
     result = OperationExecutionResult(
-        summary="uploaded", attachment_result=attachment
+        summary="uploaded", attachment_results=(AttachmentResult(
+            requested_filename="a.jpg", status="success", attachment=attachment,
+        ),)
     )
 
-    assert result.model_dump(mode="json")["attachment_result"] == {
+    assert result.model_dump(mode="json")["attachment_results"][0]["attachment"] == {
         "id": "10001",
         "filename": "a-1.jpg",
     }
     with pytest.raises(ValidationError):
-        AttachmentResult(id="", filename="a.jpg")
+        AttachmentIdentity(id="", filename="a.jpg")
     with pytest.raises(ValidationError):
         attachment.filename = "changed.jpg"  # type: ignore[misc]
 
@@ -133,7 +136,7 @@ def test_dependency_state_separates_operation_context_from_results() -> None:
 
     assert state.operation_issue_key == "PROJ-1"
     assert state.new_issue_key is None
-    assert state.attachment_result is None
+    assert state.attachment_results == ()
     with pytest.raises(ValidationError):
         DependencyState.model_validate(
             {
@@ -149,16 +152,17 @@ def test_dependency_results_project_to_a_discriminated_resolution() -> None:
     issue = dependency_orchestration.resolution_from_producer_result(
         producer_operation_id="op-" + "a" * 32,
         operation_type="create_issue",
-        successful=True,
+        outcome="success",
         new_issue_key="PROJ-10",
-        attachment_result=None,
+        attachment_results=(),
     )
     attachment = dependency_orchestration.resolution_from_producer_result(
         producer_operation_id="op-" + "b" * 32,
         operation_type="add_attachment",
-        successful=True,
+        outcome="success",
         new_issue_key=None,
-        attachment_result=AttachmentResult(id="10", filename="a.jpg"),
+        attachment_results=(AttachmentResult(requested_filename="a.jpg", status="success",
+                                             attachment=AttachmentIdentity(id="10", filename="a.jpg")),),
     )
 
     assert isinstance(issue, IssueDependencyResolution)

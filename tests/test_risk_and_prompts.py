@@ -105,7 +105,7 @@ def test_create_has_no_key_and_payload_cannot_duplicate_targets() -> None:
     draft = OperationDraft(
         operation_type="create_issue",
         issue_key=None,
-        payload={"project_key": "P", "issue_type": "Task", "summary": "x"},
+        payload={"project_key": "P", "issue_type_id": "10001", "summary": "x"},
         description="create",
     )
     risk, _ = validate_for_enqueue(draft)
@@ -126,12 +126,11 @@ def test_create_has_no_key_and_payload_cannot_duplicate_targets() -> None:
     [
         (
             "create_issue",
-            {"project_key": "P", "issue_type": "Task", "summary": "new"},
+            {"project_key": "P", "issue_type_id": "10001", "summary": "new"},
         ),
         ("clone_issue", {}),
-        ("move_issue", {"target_project_key": "OTHER"}),
-        ("change_type", {"target_issue_type": "Bug"}),
-        ("transition_issue", {"transition_name": "Start"}),
+        ("change_type", {"target_issue_type_id": "10001"}),
+        ("transition_issue", {"transition_id": "10001"}),
         ("update_field", {"fields": {"summary": "new"}}),
         (
             "update_custom_field",
@@ -154,13 +153,13 @@ def test_payload_shape_covers_every_operation_without_jira_value_rules(
     [
         (
             "create_issue",
-            {"project_key": "P", "issue_type": "Task"},
+            {"project_key": "P", "issue_type_id": "10001"},
             "缺少必需字段",
         ),
         ("clone_issue", {"clone_subtasks": "false"}, "必须是布尔值"),
         (
             "transition_issue",
-            {"transition_name": "Start", "fields": []},
+            {"transition_id": "10001", "fields": []},
             "必须是对象",
         ),
         ("update_field", {"fields": {}}, "必须是非空对象"),
@@ -193,13 +192,13 @@ def test_payload_shape_rejects_only_handler_relevant_shape_errors(
         (
             "change_type",
             {
-                "target_issue_type": "Bug",
+                "target_issue_type_id": "10001",
                 "fields_mapping": {"description": False},
             },
         ),
         (
             "transition_issue",
-            {"transition_name": "Start", "fields": {"description": 1}},
+            {"transition_id": "10001", "fields": {"description": 1}},
         ),
     ],
 )
@@ -221,7 +220,7 @@ def test_create_payload_shape_rejects_dedicated_field_overrides(
             "create_issue",
             {
                 "project_key": "P",
-                "issue_type": "Task",
+                "issue_type_id": "10001",
                 "summary": "new",
                 "extra_fields": {field_name: "shadow"},
             },

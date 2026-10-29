@@ -12,14 +12,16 @@ from core.operations.dependencies import _attachment, _issue
 from core.operations.errors import DependencyError
 from core.operations.models import (
     AttachmentDependencyResolution,
+    AttachmentIdentity,
     AttachmentResult,
+    OperationExecutionOutcome,
     DependencyResolution,
     DependencyState,
     IssueDependencyResolution,
     OperationRecord,
     OperationType,
 )
-from core.operations.rules.identifiers import is_jira_issue_key
+from core.operations.rules.validation import is_jira_issue_key
 
 
 @dataclass(frozen=True)
@@ -66,8 +68,8 @@ class DependencyResolutionEvent:
             }
         if isinstance(self.resolution, AttachmentDependencyResolution):
             return {
-                "attachment_result": (
-                    self.resolution.attachment_result.model_dump(mode="json")
+                "attachment": (
+                    self.resolution.attachment.model_dump(mode="json")
                 ),
                 "paths": self.reference_paths,
             }
@@ -207,7 +209,7 @@ def materialize_references(
     unique_resolutions: list[DependencyResolution] = []
     seen_producers: set[str] = set()
     issue_keys_by_producer: dict[str, str] = {}
-    attachment_results_by_producer: dict[str, AttachmentResult] = {}
+    attachments_by_producer: dict[str, AttachmentIdentity] = {}
     for resolution in resolutions:
         producer_operation_id = resolution.producer_operation_id
         if producer_operation_id in seen_producers:
@@ -217,8 +219,8 @@ def materialize_references(
         if isinstance(resolution, IssueDependencyResolution):
             issue_keys_by_producer[producer_operation_id] = resolution.issue_key
         elif isinstance(resolution, AttachmentDependencyResolution):
-            attachment_results_by_producer[producer_operation_id] = (
-                resolution.attachment_result
+            attachments_by_producer[producer_operation_id] = (
+                resolution.attachment
             )
         else:
             assert_never(resolution)
@@ -227,7 +229,7 @@ def materialize_references(
         operation, issue_keys_by_producer
     )
     materialized, attachment_changes = _attachment.materialize_references(
-        materialized, attachment_results_by_producer
+        materialized, attachments_by_producer
     )
     changes_by_producer = dict(issue_changes + attachment_changes)
     events = tuple(
@@ -283,19 +285,42 @@ def resolution_from_producer_result(
     *,
     producer_operation_id: str,
     operation_type: OperationType,
-    successful: bool,
+    outcome: OperationExecutionOutcome,
     new_issue_key: str | None,
-    attachment_result: AttachmentResult | None,
+    attachment_results: tuple[AttachmentResult, ...],
 ) -> DependencyResolution | None:
     """Validate one operation result and project any dependency resolution."""
 
-    if not successful:
-        if new_issue_key is not None or attachment_result is not None:
-            raise DependencyError("未成功的 operation 不得包含生产者结果")
+    if attachment_results and operation_type not in {"add_attachment", "clone_issue"}:
+        raise DependencyError("仅附件上传和克隆允许附件处理结果")
+    if operation_type == "clone_issue" and any(
+        item.source_attachment_id is None for item in attachment_results
+    ):
+        raise DependencyError("克隆附件结果必须包含源附件 ID")
+    if operation_type == "add_attachment" and any(
+        item.source_attachment_id is not None for item in attachment_results
+    ):
+        raise DependencyError("本地附件上传不得包含源附件 ID")
+    if outcome == "failed":
+        if new_issue_key is not None or any(
+            item.attachment is not None for item in attachment_results
+        ):
+            raise DependencyError("未成功的 operation 不得包含已确认生产者结果")
+        if attachment_results and (
+            operation_type != "add_attachment"
+            or len(attachment_results) != 1
+            or attachment_results[0].status not in {"failed", "unknown"}
+        ):
+            raise DependencyError("附件上传失败结果只能包含一项失败或未知明细")
         return None
+    if outcome == "warning":
+        if operation_type != "clone_issue" or not any(
+            item.status in {"failed", "unknown"} for item in attachment_results
+        ):
+            raise DependencyError("warning 必须包含克隆附件处理异常明细")
+    elif any(item.status != "success" for item in attachment_results):
+        raise DependencyError("success 不得包含未成功的附件结果")
     if _issue.is_producer(operation_type):
-        if attachment_result is not None:
-            raise DependencyError("创建/克隆 operation 不得包含附件结果")
         if not is_jira_issue_key(new_issue_key):
             raise DependencyError("创建/克隆成功结果必须包含合法的新事务 Key")
         return IssueDependencyResolution(
@@ -305,15 +330,15 @@ def resolution_from_producer_result(
     if _attachment.is_producer(operation_type):
         if new_issue_key is not None:
             raise DependencyError("附件上传 operation 不得包含新事务 Key")
-        if attachment_result is None:
+        if len(attachment_results) != 1 or attachment_results[0].attachment is None:
             raise DependencyError(
                 "附件上传成功结果必须包含附件 ID 和最终文件名"
             )
         return AttachmentDependencyResolution(
             producer_operation_id=producer_operation_id,
-            attachment_result=attachment_result,
+            attachment=attachment_results[0].attachment,
         )
-    if new_issue_key is not None or attachment_result is not None:
+    if new_issue_key is not None:
         raise DependencyError("非生产者 operation 不得包含生产者结果")
     return None
 

@@ -3,52 +3,60 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from core import jira_client
+from core.jira_metadata import IssueContext, error_response, object_value, project_value, selected
 from core.operations import get_services
-from core.runtime_logger import redact
+
+
+DEFAULT_FIELDS = ["summary", "project", "issuetype", "status", "priority", "assignee", "reporter", "labels", "created", "updated", "description"]
 
 
 def _error(prefix: str, exc: Exception) -> str:
-    return f"{prefix}: {redact(type(exc).__name__ + ': ' + str(exc))}"
+    return json.dumps(error_response(exc), ensure_ascii=False)
 
 
-def _reminder() -> str:
+def _response(value: object) -> str:
+    result = object_value(value) if isinstance(value, dict) else {"items": project_value(value)}
     count = get_services().query.total_active()
-    return (
-        ""
-        if count == 0
-        else f"\n\n⚠️ 当前有 {count} 条活动 operation；需要审核时请调用 jira_show_queue。"
-    )
+    if count:
+        result["queue_notice"] = f"当前有 {count} 条活动 operation；需要审核时请调用 jira_show_queue。"
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-def _serialize_issue(issue: Any, fields: list[str] | None) -> dict[str, Any]:
-    source = issue.fields
-    standard = {
-        "summary": getattr(source, "summary", None),
-        "status": getattr(getattr(source, "status", None), "name", None),
-        "issuetype": getattr(getattr(source, "issuetype", None), "name", None),
-        "priority": getattr(getattr(source, "priority", None), "name", None),
-        "assignee": getattr(getattr(source, "assignee", None), "displayName", None),
-        "reporter": getattr(getattr(source, "reporter", None), "displayName", None),
-        "project": getattr(getattr(source, "project", None), "key", None),
-        "labels": getattr(source, "labels", None),
-        "created": getattr(source, "created", None),
-        "updated": getattr(source, "updated", None),
-        "description": getattr(source, "description", None),
-    }
-    result: dict[str, Any] = {"key": issue.key}
-    if fields:
-        for name in fields:
-            result[name] = (
-                standard[name] if name in standard else getattr(source, name, None)
-            )
-    else:
-        result.update(
-            {key: value for key, value in standard.items() if value is not None}
-        )
-    return result
+def _field_names(fields: list[str] | None) -> list[str]:
+    if fields is None:
+        return DEFAULT_FIELDS.copy()
+    if not fields or any(not isinstance(name, str) or not name.strip() for name in fields):
+        raise ValueError("fields 必须是非空字段列表；省略时使用常用摘要字段")
+    if any(any(char in name for char in (",", "*", "-", " ")) for name in fields):
+        raise ValueError("fields 仅接受明确字段 ID，不接受通配符或组合选择表达式")
+    return list(dict.fromkeys(fields))
+
+
+def _serialize_issue(issue: object, fields: list[str]) -> dict[str, object]:
+    raw = object_value(issue)
+    values = object_value(raw.get("fields", {}))
+    result = {}
+    for name in fields:
+        if name not in values:
+            continue
+        value = values[name]
+        if isinstance(value, dict) and name in {"project", "issuetype", "status", "priority", "assignee", "reporter"}:
+            value = selected(value, ("id", "key", "name", "displayName", "active", "subtask"))
+        if name == "issuelinks" and isinstance(value, list):
+            links = []
+            for link in value:
+                raw_link = object_value(link)
+                projected = selected(raw_link, ("id", "type"))
+                for direction in ("inwardIssue", "outwardIssue"):
+                    related = raw_link.get(direction)
+                    if isinstance(related, dict):
+                        projected[direction] = selected(related, ("id", "key"))
+                links.append(projected)
+            value = links
+        result[name] = project_value(value)
+    return {"key": raw.get("key"), "fields": result}
 
 
 def jira_query_issue(issue_key: str, fields: list[str] | None = None) -> str:
@@ -56,7 +64,7 @@ def jira_query_issue(issue_key: str, fields: list[str] | None = None) -> str:
 
     参数：
         issue_key: Jira 事务 Key，例如 ``PROJ-123``。
-        fields: 可选的返回字段名列表；省略时返回常用标准字段。
+        fields: 可选的非空字段 ID 列表；省略时查询常用摘要字段，返回 key 与 fields，用户/类型保留准确身份。
 
     返回：
         JSON 格式的事务字段数据；查询失败时返回经过脱敏的错误信息。
@@ -65,14 +73,10 @@ def jira_query_issue(issue_key: str, fields: list[str] | None = None) -> str:
         无 Jira 写入；只会立即读取 Jira 数据。
     """
     try:
-        return (
-            json.dumps(
-                _serialize_issue(jira_client.get_client().issue(issue_key), fields),
-                ensure_ascii=False,
-                indent=2,
-            )
-            + _reminder()
-        )
+        IssueContext(kind="issue", issue_key=issue_key)
+        names = _field_names(fields)
+        issue = jira_client.get_client().issue(issue_key, fields=",".join(names))
+        return _response(_serialize_issue(issue, names))
     except Exception as exc:
         return _error("查询事务失败", exc)
 
@@ -102,7 +106,7 @@ def jira_query_comments(issue_key: str, limit: int = 20) -> str:
             }
             for item in comments[-limit:]
         ]
-        return json.dumps(values, ensure_ascii=False, indent=2) + _reminder()
+        return _response(values)
     except Exception as exc:
         return _error("查询评论失败", exc)
 
@@ -132,7 +136,7 @@ def jira_query_worklogs(issue_key: str, limit: int = 20) -> str:
             }
             for item in jira_client.get_client().worklogs(issue_key)[-limit:]
         ]
-        return json.dumps(values, ensure_ascii=False, indent=2) + _reminder()
+        return _response(values)
     except Exception as exc:
         return _error("查询工作日志失败", exc)
 
@@ -164,7 +168,7 @@ def jira_query_attachments(issue_key: str) -> str:
             }
             for item in getattr(issue.fields, "attachment", []) or []
         ]
-        return json.dumps(values, ensure_ascii=False, indent=2) + _reminder()
+        return _response(values)
     except Exception as exc:
         return _error("查询附件失败", exc)
 
@@ -188,15 +192,16 @@ def jira_jql_search(
     """
     try:
         max_results = min(max(1, max_results), 100)
+        names = _field_names(fields)
         values = jira_client.get_client().search_issues(
-            jql, startAt=start_at, maxResults=max_results, fields=fields
+            jql, startAt=start_at, maxResults=max_results, fields=names
         )
         result = {
             "total": getattr(values, "total", len(values)),
             "start_at": start_at,
             "count": len(values),
-            "issues": [_serialize_issue(item, fields) for item in values],
+            "issues": [_serialize_issue(item, names) for item in values],
         }
-        return json.dumps(result, ensure_ascii=False, indent=2) + _reminder()
+        return _response(result)
     except Exception as exc:
         return _error("JQL 搜索失败", exc)

@@ -10,7 +10,7 @@ from graphlib import CycleError, TopologicalSorter
 
 from core.operations.dependencies import orchestration as dependency_orchestration
 from core.operations.models import DependencyState, OperationRecord, QueueGroupKind
-from core.operations.rules.identifiers import is_jira_issue_key
+from core.operations.rules.validation import is_jira_issue_key
 
 
 CATEGORY_BY_OPERATION = {

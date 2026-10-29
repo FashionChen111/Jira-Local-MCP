@@ -13,7 +13,7 @@ from core.operations.models import (
     OperationRecord,
     OperationType,
 )
-from core.operations.rules.identifiers import is_jira_issue_key, is_operation_id
+from core.operations.rules.validation import is_jira_issue_key, is_operation_id
 
 
 _PRODUCER_OPERATION_TYPES = frozenset({"create_issue", "clone_issue"})
@@ -109,7 +109,7 @@ def reference_problem(
                 "引用的 operation 不是 create_issue/clone_issue："
                 f"{referenced_operation_id}"
             )
-        if state.state == "success":
+        if state.state in {"success", "warning"}:
             if not is_jira_issue_key(state.new_issue_key):
                 return (
                     "引用的事务生产者缺少有效 Jira Key："
@@ -212,7 +212,7 @@ def resolution_from_state(
 
     if (
         is_producer(state.operation_type)
-        and state.state == "success"
+        and state.state in {"success", "warning"}
         and is_jira_issue_key(state.new_issue_key)
     ):
         return IssueDependencyResolution(

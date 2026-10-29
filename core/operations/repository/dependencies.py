@@ -21,8 +21,8 @@ from core.operations.models import (
 from core.operations.repository import execution as execution_repository
 from core.operations.repository import metadata as repository_metadata
 from core.operations.repository import queue as queue_repository
-from core.operations.repository._records import attachment_result_from_json
-from core.operations.rules.identifiers import is_jira_issue_key
+from core.operations.repository._records import attachment_results_from_json
+from core.operations.rules.validation import is_jira_issue_key
 from core.storage.database import canonical_json, new_id, utc_ms
 
 
@@ -62,7 +62,7 @@ def dependency_states(
             staging_rows = connection.execute(
                 f"""SELECT s.operation_id,s.operation_type,s.issue_key,s.state,
                            r.outcome,r.resolution,r.new_issue_key,
-                           r.attachment_result_json
+                           r.attachment_results_json
                     FROM execution_staging AS s
                     LEFT JOIN execution_records AS r ON r.execution_id=s.execution_id
                     WHERE s.operation_id IN ({marks})""",
@@ -86,7 +86,7 @@ def dependency_states(
             marks = ",".join("?" for _ in remaining)
             history_rows = connection.execute(
                 f"""SELECT operation_id,operation_type,issue_key,outcome,resolution,
-                           new_issue_key,attachment_result_json,
+                           new_issue_key,attachment_results_json,
                            attempt_no,started_at,execution_id
                     FROM execution_records WHERE operation_id IN ({marks})
                     ORDER BY attempt_no DESC,started_at DESC,execution_id DESC""",
@@ -133,8 +133,8 @@ def _dependency_state_from_result(
         state=state,
         operation_issue_key=row["issue_key"],
         new_issue_key=row["new_issue_key"],
-        attachment_result=attachment_result_from_json(
-            row["attachment_result_json"]
+        attachment_results=attachment_results_from_json(
+            row["attachment_results_json"]
         ),
     )
 

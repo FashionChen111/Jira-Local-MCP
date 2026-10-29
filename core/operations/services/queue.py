@@ -15,7 +15,7 @@ from core.operations.models import OperationDraft, OperationRecord
 from core.operations.repository import dependencies as dependency_repository
 from core.operations.repository import metadata as repository_metadata
 from core.operations.repository import queue as queue_repository
-from core.operations.rules.identifiers import validate_operation_ids
+from core.operations.rules.validation import validate_operation_ids
 from core.operations.rules.ordering import automatic_queue
 from core.operations.rules.safety import OperationSafetyError, validate_for_enqueue
 from core.storage.database import new_id, transaction, utc_ms
@@ -42,6 +42,14 @@ def _snapshot_description_payload(
     """Normalize supported descriptions with shallow copy-on-write ownership."""
 
     result = dict(payload)
+    if operation_type == "clone_issue":
+        overrides = result.get("field_overrides")
+        if isinstance(overrides, dict) and "description" in overrides:
+            result["field_overrides"] = {
+                **overrides,
+                "description": snapshot_text_source(overrides["description"], field_path="field_overrides.description"),
+            }
+        return result
     if operation_type == "create_issue":
         description_file = result.get("description_file")
         if description_file is not None:

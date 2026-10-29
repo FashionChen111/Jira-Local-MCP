@@ -11,6 +11,7 @@ import pytest
 
 from core.executing import jira_executor
 from core.operations import (
+    AttachmentIdentity,
     AttachmentResult,
     DependencyScopeIncomplete,
     StoreError,
@@ -43,7 +44,7 @@ def _attachment(queue, issue_key: str = "PROJ-1"):
     )
 
 
-def _finish_attachment(queue, attachment) -> AttachmentResult:
+def _finish_attachment(queue, attachment) -> AttachmentIdentity:
     queue.submission.submit(
         queue.query.get_state().revisions["queue"],
         [attachment.operation_id],
@@ -51,7 +52,7 @@ def _finish_attachment(queue, attachment) -> AttachmentResult:
     )
     claim = queue.execution.claim_next()
     assert claim is not None
-    result = AttachmentResult(id="10001", filename="a-1.jpg")
+    result = AttachmentIdentity(id="10001", filename="a-1.jpg")
     queue.execution.complete_execution(
         claim.execution_id,
         "success",
@@ -59,7 +60,7 @@ def _finish_attachment(queue, attachment) -> AttachmentResult:
         None,
         None,
         1,
-        result,
+        (AttachmentResult(requested_filename="a.jpg", status="success", attachment=result),),
     )
     return result
 
@@ -102,7 +103,7 @@ def test_attachment_reference_requires_same_issue_and_attachment_producer(
     create = queue.queue.enqueue(
         "create_issue",
         None,
-        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
+        {"project_key": "PROJ", "issue_type_id": "10001", "summary": "new"},
         "create",
         "test",
     )
@@ -133,7 +134,7 @@ def test_create_initial_description_rejects_local_attachment_syntax(
             None,
             {
                 "project_key": "PROJ",
-                "issue_type": "Task",
+                "issue_type_id": "10001",
                 "summary": "new",
                 "description": description,
             },
@@ -148,7 +149,7 @@ def test_create_initial_description_allows_external_image_url(queue) -> None:
         None,
         {
             "project_key": "PROJ",
-            "issue_type": "Task",
+            "issue_type_id": "10001",
             "summary": "new",
             "description": "!https://example.com/image.jpg!",
         },
@@ -393,14 +394,14 @@ def test_cancel_builds_dependency_edges_with_one_inspection_each(
     producer = queue.queue.enqueue(
         "create_issue",
         None,
-        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
+        {"project_key": "PROJ", "issue_type_id": "10001", "summary": "new"},
         "create",
         "test",
     )
     child = queue.queue.enqueue(
         "create_issue",
         None,
-        {"project_key": "PROJ", "issue_type": "Task", "summary": "child"},
+        {"project_key": "PROJ", "issue_type_id": "10001", "summary": "child"},
         "create",
         "test",
     )
@@ -452,9 +453,9 @@ def test_description_files_are_snapshotted_during_enqueue(
         container: {"description": {"file": str(path)}}
     }
     if operation_type == "change_type":
-        payload["target_issue_type"] = "Bug"
+        payload["target_issue_type_id"] = "10001"
     if operation_type == "transition_issue":
-        payload["transition_name"] = "开始处理"
+        payload["transition_id"] = "10001"
 
     operation = queue.queue.enqueue(
         operation_type, "PROJ-1", payload, "snapshot", "test"
@@ -476,7 +477,7 @@ def test_create_description_file_is_snapshotted_and_path_removed(
         None,
         {
             "project_key": "PROJ",
-            "issue_type": "Task",
+            "issue_type_id": "10001",
             "summary": "new",
             "description": "inline",
             "description_file": str(path),
@@ -520,7 +521,7 @@ def test_create_description_sources_are_normalized_by_priority(
 
     first_payload: dict[str, object] = {
         "project_key": "PROJ",
-        "issue_type": "Task",
+        "issue_type_id": "10001",
         "summary": "file",
         "description_file": str(file_source),
         "description": {"file": str(missing)},
@@ -539,7 +540,7 @@ def test_create_description_sources_are_normalized_by_priority(
         None,
         {
             "project_key": "PROJ",
-            "issue_type": "Task",
+            "issue_type_id": "10001",
             "summary": "top",
             "description_file": None,
             "description": {"file": str(top_source)},
@@ -567,7 +568,7 @@ def test_create_rejects_every_dedicated_field_in_extra_fields_without_writes(
             None,
             {
                 "project_key": "PROJ",
-                "issue_type": "Task",
+                "issue_type_id": "10001",
                 "summary": "new",
                 "description": "top-level",
                 "extra_fields": {reserved_field: "shadow"},
@@ -596,7 +597,7 @@ def test_create_extra_fields_description_alone_is_not_an_input_route(queue) -> N
             None,
             {
                 "project_key": "PROJ",
-                "issue_type": "Task",
+                "issue_type_id": "10001",
                 "summary": "new",
                 "extra_fields": {"description": "nested-only"},
             },
@@ -613,7 +614,7 @@ def test_execution_gate_rejects_legacy_create_field_override() -> None:
         risk_level="medium",
         payload={
             "project_key": "PROJ",
-            "issue_type": "Task",
+            "issue_type_id": "10001",
             "summary": "new",
             "description": None,
             "extra_fields": {"description": "legacy"},
@@ -659,9 +660,8 @@ def test_batch_materialization_uses_one_typed_resolution_sequence() -> None:
                 operation_type="add_attachment",
                 state="success",
                 operation_issue_key=issue_producer_id,
-                attachment_result=AttachmentResult(
-                    id="10", filename="a-1.jpg"
-                ),
+                attachment_results=(AttachmentResult(requested_filename="a.jpg", status="success",
+                    attachment=AttachmentIdentity(id="10", filename="a-1.jpg")),),
             ),
         },
     )
@@ -683,10 +683,10 @@ def test_batch_materialization_uses_one_typed_resolution_sequence() -> None:
     assert result.events[0].data["fields"] == ("issue_key",)
     assert result.events[1].data["paths"] == ("body",)
     event_data = result.events[1].data
-    attachment_data = event_data["attachment_result"]
+    attachment_data = event_data["attachment"]
     assert isinstance(attachment_data, dict)
     attachment_data["id"] = "mutated-copy"
-    assert result.events[1].data["attachment_result"] == {
+    assert result.events[1].data["attachment"] == {
         "id": "10",
         "filename": "a-1.jpg",
     }
@@ -712,7 +712,7 @@ def test_materializers_return_original_snapshot_when_no_resolution_matches() -> 
             ),
             AttachmentDependencyResolution(
                 producer_operation_id="op-" + "c" * 32,
-                attachment_result=AttachmentResult(
+                attachment=AttachmentIdentity(
                     id="10", filename="a-1.jpg"
                 ),
             ),
@@ -785,7 +785,7 @@ def test_attachment_multi_path_materialization_validates_one_snapshot(
         issue_key="PROJ-1",
         risk_level="high",
         payload={
-            "transition_name": "Start",
+            "transition_id": "10001",
             "fields": {"description": f"{link} {link}"},
             "comment": image,
         },
@@ -812,7 +812,7 @@ def test_attachment_multi_path_materialization_validates_one_snapshot(
         (
             AttachmentDependencyResolution(
                 producer_operation_id=producer_id,
-                attachment_result=AttachmentResult(
+                attachment=AttachmentIdentity(
                     id="10", filename="a-1.jpg"
                 ),
             ),
@@ -902,7 +902,7 @@ def test_completed_upload_materializes_every_supported_content_path(queue) -> No
             "change_type",
             "PROJ-1",
             {
-                "target_issue_type": "Bug",
+                "target_issue_type_id": "10001",
                 "fields_mapping": {"description": image},
             },
             "change",
@@ -912,7 +912,7 @@ def test_completed_upload_materializes_every_supported_content_path(queue) -> No
             "transition_issue",
             "PROJ-1",
             {
-                "transition_name": "开始处理",
+                "transition_id": "10001",
                 "fields": {"description": link},
                 "comment": image,
             },
@@ -974,7 +974,7 @@ def test_upload_result_is_persisted_and_broadcast_to_staging(
     )
     claim = queue.execution.claim_next()
     assert claim is not None
-    result = AttachmentResult(id="20002", filename="a-1.jpg")
+    result = AttachmentIdentity(id="20002", filename="a-1.jpg")
     materialized_operation_ids: list[str] = []
     original_materialize = dependency_orchestration.materialize_references
 
@@ -988,7 +988,8 @@ def test_upload_result_is_persisted_and_broadcast_to_staging(
         counted_materialize,
     )
     queue.execution.complete_execution(
-        claim.execution_id, "success", "uploaded", None, None, 2, result
+        claim.execution_id, "success", "uploaded", None, None, 2,
+        (AttachmentResult(requested_filename="a.jpg", status="success", attachment=result),)
     )
 
     assert Counter(materialized_operation_ids) == {
@@ -1000,7 +1001,7 @@ def test_upload_result_is_persisted_and_broadcast_to_staging(
     assert next_claim is not None
     assert next_claim.operation.payload["body"] == "new !a-1.jpg!"
     history = queue.query.read_execution_log(1)[0]
-    assert history["attachment_result"] == {
+    assert history["attachment_results"][0]["attachment"] == {
         "id": "20002",
         "filename": "a-1.jpg",
     }
@@ -1014,7 +1015,7 @@ def test_upload_result_is_persisted_and_broadcast_to_staging(
     finally:
         connection.close()
     assert event is not None
-    assert json.loads(event["data_json"])["attachment_result"]["id"] == "20002"
+    assert json.loads(event["data_json"])["attachment"]["id"] == "20002"
 
 
 def test_indeterminate_upload_recovery_requires_and_broadcasts_complete_result(
@@ -1041,19 +1042,19 @@ def test_indeterminate_upload_recovery_requires_and_broadcasts_complete_result(
         queue.recovery.resolve_indeterminate(
             attachment.operation_id, "succeeded", False
         )
-    result = AttachmentResult(id="50005", filename="a-1.jpg")
+    result = AttachmentIdentity(id="50005", filename="a-1.jpg")
     response = queue.recovery.resolve_indeterminate(
         attachment.operation_id,
         "succeeded",
         False,
-        attachment_result=result,
+        attachment=result,
     )
 
-    assert response["attachment_result"] == result.model_dump(mode="json")
+    assert response["attachment_results"][0]["attachment"] == result.model_dump(mode="json")
     held = queue.query.get_state().execution.held[0]
     assert held.payload["body"] == "[^a-1.jpg]"
     history = queue.query.read_execution_log(1)[0]
-    assert history["attachment_result"] == result.model_dump(mode="json")
+    assert history["attachment_results"][0]["attachment"] == result.model_dump(mode="json")
 
 
 def test_attachment_broadcast_failure_rolls_back_result_and_revisions(queue) -> None:
@@ -1091,7 +1092,8 @@ def test_attachment_broadcast_failure_rolls_back_result_and_revisions(queue) -> 
             None,
             None,
             1,
-            AttachmentResult(id="60006", filename="a-1.jpg"),
+            (AttachmentResult(requested_filename="a.jpg", status="success",
+                              attachment=AttachmentIdentity(id="60006", filename="a-1.jpg")),),
         )
 
     after = queue.query.get_state()
@@ -1130,7 +1132,7 @@ def test_executor_returns_final_jira_filename_without_list_query(
 
     result = jira_executor.execute_operation(operation)
 
-    assert result.attachment_result == AttachmentResult(
+    assert result.attachment_results[0].attachment == AttachmentIdentity(
         id="30003", filename="a-1.jpg"
     )
     assert attachment_queries == []
@@ -1164,8 +1166,8 @@ def test_executor_falls_back_to_attachment_id_when_filename_is_missing(
 
     result = jira_executor.execute_operation(operation)
 
-    assert result.attachment_result is not None
-    assert result.attachment_result.filename == "a-1.jpg"
+    assert result.attachment_results[0].attachment is not None
+    assert result.attachment_results[0].attachment.filename == "a-1.jpg"
 
 
 def test_executor_fails_when_id_lookup_still_has_no_filename(
@@ -1193,5 +1195,7 @@ def test_executor_fails_when_id_lookup_still_has_no_filename(
     )
     monkeypatch.setattr(jira_executor.jira_client, "get_client", Client)
 
-    with pytest.raises(RuntimeError, match="最终文件名"):
-        jira_executor.execute_operation(operation)
+    result = jira_executor.execute_operation(operation)
+    assert result.outcome == "failed"
+    assert result.attachment_results[0].status == "unknown"
+    assert result.error is not None and "最终文件名" in result.error

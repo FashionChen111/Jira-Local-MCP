@@ -78,7 +78,7 @@ def _pending_state(producer_id: str, child_id: str) -> dict:
         operation_type="create_issue",
         issue_key=None,
         risk_level="medium",
-        payload={"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
+        payload={"project_key": "PROJ", "issue_type_id": "10001", "summary": "new"},
         description="create",
     )
     child = _operation(
@@ -117,6 +117,59 @@ def _serve(page, cfg, monkeypatch, state: dict) -> str:
         ),
     )
     return base
+
+
+def test_warning_clone_history_and_review_metadata_render_as_text(page, cfg, monkeypatch, tmp_path):
+    malicious = '<img src=x onerror="window.injected=true">'
+    clone = _operation("op-" + "a" * 32, operation_type="clone_issue", payload={"field_overrides": {"customfield_1": "value"}})
+    worklog = _operation("op-" + "b" * 32, operation_type="add_worklog", payload={"adjust_estimate": "new", "new_estimate": "3h"})
+    transition = _operation("op-" + "c" * 32, operation_type="transition_issue", payload={"transition_id": "21"})
+    history = {**clone, "outcome": "warning", "new_issue_key": "PROJ-20", "started_at": 1,
+               "attachment_results": [
+                   {"source_attachment_id": "1", "requested_filename": malicious, "status": "failed", "error": malicious, "attachment": None},
+                   {"source_attachment_id": "2", "requested_filename": "later.txt", "status": "unattempted", "error": None, "attachment": None}]}
+    try:
+        base = _serve(page, cfg, monkeypatch, _state([], [clone, worklog, transition]))
+        page.unroute("**/api/execution-history**")
+        page.route("**/api/execution-history**", lambda route: route.fulfill(json={"items": [history], "total": 1, "page": 1, "page_size": 50}))
+        page.goto(web_app.create_confirmation_url(base))
+        expect(page.locator(".status.warning")).to_have_text("成功（有异常）")
+        expect(page.get_by_text("已创建事务：PROJ-20", exact=True)).to_be_visible()
+        expect(page.get_by_text("估算影响：重设剩余估算 3h", exact=True)).to_be_visible()
+        expect(page.get_by_text("transition_id：21", exact=True)).to_be_visible()
+        expect(page.get_by_text("克隆覆盖字段：customfield_1", exact=True).first).to_be_visible()
+        expect(page.get_by_text("附件处理：later.txt（源 ID 2）：未尝试", exact=True)).to_be_visible()
+        assert page.locator("img").count() == 0
+        assert page.evaluate("window.injected") is None
+        screenshot = tmp_path / "warning-clone-review.png"
+        page.screenshot(path=str(screenshot), full_page=True)
+    finally:
+        _stop()
+
+
+def test_attachment_recovery_submits_confirmed_identity(page, cfg, monkeypatch):
+    operation = {
+        **_operation("op-" + "a" * 32, operation_type="add_attachment",
+                     payload={"file_path": "C:\\fixtures\\a.jpg"}),
+        "state": "indeterminate", "execution_id": "exec-test",
+        "submission_risk_level": "medium", "stage_order": 1,
+    }
+    state = _state([])
+    state["execution"]["indeterminate"] = [operation]
+    answers = iter(["55", "a-final.jpg"])
+    try:
+        base = _serve(page, cfg, monkeypatch, state)
+        page.route("**/api/execution/indeterminate/resolve",
+                   lambda route: route.fulfill(json={"attachment_results": []}))
+        page.on("dialog", lambda dialog: dialog.accept(next(answers)))
+        page.goto(web_app.create_confirmation_url(base))
+        with page.expect_request("**/api/execution/indeterminate/resolve") as request:
+            page.get_by_role("button", name="已生效", exact=True).click()
+        body = request.value.post_data_json
+        assert body["attachment"] == {"id": "55", "filename": "a-final.jpg"}
+        assert "attachment_result" not in body
+    finally:
+        _stop()
 
 
 def test_malicious_values_render_inertly_and_queue_has_no_sort_controls(
@@ -260,7 +313,7 @@ def test_high_risk_confirmation_and_history_pagination(page, cfg, monkeypatch) -
         operation_id,
         operation_type="transition_issue",
         risk_level="high",
-        payload={"transition_name": "Done", "fields": {}, "comment": None},
+        payload={"transition_id": "10001", "fields": {}, "comment": None},
     )
     state = _state(
         [
@@ -445,7 +498,7 @@ def test_cancel_scope_confirmation_and_original_revision(page, cfg, monkeypatch,
 def test_browser_cancels_real_queue_dependency_scope(page, queue, cfg, monkeypatch, tmp_path):
     producer = queue.queue.enqueue(
         "create_issue", None,
-        {"project_key": "PROJ", "issue_type": "Task", "summary": "审核附件上传流程"},
+        {"project_key": "PROJ", "issue_type_id": "10001", "summary": "审核附件上传流程"},
         "创建任务：审核附件上传流程", "test",
     )
     attachment_path = tmp_path / "review.txt"
@@ -583,6 +636,7 @@ def test_cancel_preview_limits_and_safe_text(page, cfg, monkeypatch, scenario):
         page.route("**/api/queue/cancel", cancel_route)
         page.goto(web_app.create_confirmation_url(base))
         # Select a producer without thousands of individual checkbox interactions.
+        expect(page.locator(f'[data-operation-id="{producer_id}"]')).to_be_visible()
         page.evaluate("id => { explicitSelected.clear(); setExplicitSelection(id, true); }", producer_id)
         page.on("dialog", lambda dialog: dialog.accept())
         page.locator("#cancel-selected").click()

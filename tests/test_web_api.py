@@ -10,7 +10,7 @@ def _comment(store, risk="low"):
     if risk == "high":
         return store.queue.enqueue(
             "transition_issue", "PROJ-1",
-            {"transition_name": "Close", "fields": {}, "comment": None},
+            {"transition_id": "10001", "fields": {}, "comment": None},
             "close", "test",
         )
     return store.queue.enqueue(
@@ -200,7 +200,7 @@ def test_cancel_producer_requires_explicit_dependency_scope(web_client, queue):
     create = queue.queue.enqueue(
         "create_issue",
         None,
-        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
+        {"project_key": "PROJ", "issue_type_id": "10001", "summary": "new"},
         "create",
         "test",
     )
@@ -249,7 +249,7 @@ def test_indeterminate_create_resolution_requires_real_key(web_client, queue):
     create = queue.queue.enqueue(
         "create_issue",
         None,
-        {"project_key": "PROJ", "issue_type": "Task", "summary": "new"},
+        {"project_key": "PROJ", "issue_type_id": "10001", "summary": "new"},
         "create",
         "test",
     )
@@ -270,7 +270,7 @@ def test_indeterminate_create_resolution_requires_real_key(web_client, queue):
     assert resolved.json()["new_issue_key"] == "PROJ-50"
 
 
-def test_indeterminate_attachment_resolution_uses_nested_result(web_client, queue):
+def test_indeterminate_attachment_resolution_uses_confirmed_identity(web_client, queue):
     attachment = queue.queue.enqueue(
         "add_attachment",
         "PROJ-1",
@@ -286,15 +286,17 @@ def test_indeterminate_attachment_resolution_uses_nested_result(web_client, queu
         "resolution": "succeeded",
         "high_risk_confirmed": False,
         "new_issue_key": None,
-        "attachment_result": {"id": "80008", "filename": "a-1.jpg"},
+        "attachment": {"id": "80008", "filename": "a-1.jpg"},
     }
 
+    legacy = {**body, "attachment_result": body["attachment"]}
+    assert web_client.post("/api/execution/indeterminate/resolve", json=legacy).status_code == 422
     resolved = web_client.post(
         "/api/execution/indeterminate/resolve", json=body
     )
 
     assert resolved.status_code == 200
-    assert resolved.json()["attachment_result"] == body["attachment_result"]
+    assert resolved.json()["attachment_results"][0]["attachment"] == body["attachment"]
 
 
 def test_template_has_only_local_assets_and_no_html_sink(web_client):

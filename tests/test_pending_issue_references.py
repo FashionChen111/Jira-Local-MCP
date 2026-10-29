@@ -26,7 +26,7 @@ def enqueue_create(services, summary: str = "new"):
     return services.queue.enqueue(
         "create_issue",
         None,
-        {"project_key": "PROJ", "issue_type": "Task", "summary": summary},
+        {"project_key": "PROJ", "issue_type_id": "10001", "summary": summary},
         f"create {summary}",
         "test",
     )

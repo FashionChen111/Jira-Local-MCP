@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from core.operations.models import (
     AttachmentResult,
+    OperationExecutionOutcome,
     ExecutionRecord,
     OperationRecord,
     Resolution,
@@ -227,11 +228,11 @@ def finish_execution(
     execution_id: str,
     *,
     finished_at: int,
-    outcome: Literal["success", "failed"],
+    outcome: OperationExecutionOutcome,
     summary: str | None,
     error: str | None,
     new_issue_key: str | None,
-    attachment_result: AttachmentResult | None,
+    attachment_results: tuple[AttachmentResult, ...],
     elapsed_ms: int,
 ) -> bool:
     """Atomically persist one previously unfinished worker result."""
@@ -239,7 +240,7 @@ def finish_execution(
     cursor = connection.execute(
         """UPDATE execution_records
            SET finished_at=?,outcome=?,summary=?,error=?,new_issue_key=?,
-               attachment_result_json=?,elapsed_ms=?
+               attachment_results_json=?,elapsed_ms=?
            WHERE execution_id=? AND outcome IS NULL""",
         (
             finished_at,
@@ -247,11 +248,7 @@ def finish_execution(
             summary,
             error,
             new_issue_key,
-            (
-                canonical_json(attachment_result.model_dump(mode="json"))
-                if attachment_result is not None
-                else None
-            ),
+            canonical_json([item.model_dump(mode="json") for item in attachment_results]),
             elapsed_ms,
             execution_id,
         ),
@@ -295,19 +292,15 @@ def resolve_execution(
     resolution: Resolution,
     resolved_at: int,
     new_issue_key: str | None,
-    attachment_result: AttachmentResult | None,
+    attachment_results: tuple[AttachmentResult, ...],
 ) -> bool:
     """Atomically record one human conclusion for an indeterminate result."""
 
-    attachment_json = (
-        canonical_json(attachment_result.model_dump(mode="json"))
-        if attachment_result is not None
-        else None
-    )
+    attachment_json = canonical_json([item.model_dump(mode="json") for item in attachment_results])
     cursor = connection.execute(
         """UPDATE execution_records
            SET resolution=?,resolved_at=?,new_issue_key=COALESCE(?,new_issue_key),
-               attachment_result_json=COALESCE(?,attachment_result_json)
+               attachment_results_json=?
            WHERE execution_id=? AND outcome='indeterminate' AND resolution IS NULL""",
         (
             resolution,

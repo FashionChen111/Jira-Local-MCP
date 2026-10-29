@@ -19,3 +19,5 @@ button{border:1px solid #d1d5db;background:#fff;border-radius:5px;padding:6px 10
 #cancel-scope-error{color:#b91c1c}
 #cancel-scope-dialog .actions{justify-content:flex-end;margin-bottom:0}
 @media(max-width:650px){#cancel-scope-dialog{padding:14px}.cancel-scope-item{padding:10px}#cancel-scope-dialog .actions button{flex:1}}
+
+.status.warning { color: #9a3412; background: #ffedd5; }

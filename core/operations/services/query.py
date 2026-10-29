@@ -29,7 +29,7 @@ from core.operations.repository import dependencies as dependency_repository
 from core.operations.repository import execution as execution_repository
 from core.operations.repository import metadata as repository_metadata
 from core.operations.repository import queue as queue_repository
-from core.operations.rules.identifiers import validate_operation_ids
+from core.operations.rules.validation import validate_operation_ids
 from core.operations.rules.ordering import automatic_queue
 from core.operations.rules.safety import submission_problem
 from core.storage.database import open_database
@@ -176,7 +176,7 @@ def _execution_record_public(
         "summary",
         "error",
         "new_issue_key",
-        "attachment_result",
+        "attachment_results",
         "elapsed_ms",
         "resolution",
         "resolved_at",

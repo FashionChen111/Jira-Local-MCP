@@ -3,7 +3,7 @@ CREATE TABLE schema_metadata (
     value TEXT NOT NULL
 );
 INSERT INTO schema_metadata(name,value) VALUES (
-    'schema_identity','jira-local-mcp-operations-attachment-dependencies-v1'
+    'schema_identity','jira-local-mcp-operations-attachment-results-v3'
 );
 
 CREATE TABLE revisions (
@@ -92,11 +92,11 @@ CREATE TABLE execution_records (
     created_at INTEGER NOT NULL CHECK (created_at >= 0),
     started_at INTEGER NOT NULL CHECK (started_at >= 0),
     finished_at INTEGER CHECK (finished_at IS NULL OR finished_at >= 0),
-    outcome TEXT CHECK (outcome IN ('success','failed','indeterminate','dependency_failed')),
+    outcome TEXT CHECK (outcome IN ('success','failed','warning','indeterminate','dependency_failed')),
     summary TEXT,
     error TEXT,
     new_issue_key TEXT,
-    attachment_result_json TEXT,
+    attachment_results_json TEXT NOT NULL DEFAULT '[]',
     elapsed_ms INTEGER CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
     resolution TEXT CHECK (resolution IN ('succeeded','not_applied','abandoned')),
     resolved_at INTEGER CHECK (resolved_at IS NULL OR resolved_at >= 0),

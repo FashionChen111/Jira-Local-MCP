@@ -1,5 +1,19 @@
 """显式公开 Jira 查询、入队和本地队列生命周期 Tool，供服务统一注册。"""
 
+from core.mcp_tools.jira_metadata import (
+    jira_meta_server_settings,
+    jira_meta_user,
+    jira_meta_search_users,
+    jira_meta_search_assignable_users,
+    jira_meta_projects,
+    jira_meta_issue_types,
+    jira_meta_issue_transitions,
+    jira_meta_fields,
+    jira_meta_field,
+    jira_meta_link_types,
+    jira_meta_permissions,
+)
+
 from core.mcp_tools.jira_query import (
     jira_query_issue,
     jira_query_comments,
@@ -30,6 +44,18 @@ from core.mcp_tools.queue_tool import (
 
 
 TOOLS = (
+    jira_meta_server_settings,
+    jira_meta_user,
+    jira_meta_search_users,
+    jira_meta_search_assignable_users,
+    jira_meta_projects,
+    jira_meta_issue_types,
+    jira_meta_issue_transitions,
+    jira_meta_fields,
+    jira_meta_field,
+    jira_meta_link_types,
+    jira_meta_permissions,
+
     jira_list_queue,
     jira_get_queue_operations,
     jira_list_execution_state,
@@ -54,6 +80,18 @@ TOOLS = (
 )
 
 __all__ = [
+    "jira_meta_server_settings",
+    "jira_meta_user",
+    "jira_meta_search_users",
+    "jira_meta_search_assignable_users",
+    "jira_meta_projects",
+    "jira_meta_issue_types",
+    "jira_meta_issue_transitions",
+    "jira_meta_fields",
+    "jira_meta_field",
+    "jira_meta_link_types",
+    "jira_meta_permissions",
+
     "TOOLS",
     "jira_list_queue",
     "jira_get_queue_operations",

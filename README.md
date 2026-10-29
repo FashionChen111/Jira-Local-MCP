@@ -1,6 +1,6 @@
 # Jira Local MCP
 
-当前版本：2.4.0。
+当前版本：3.0.0。
 
 Jira Local MCP 是面向 Jira Server/Data Center 的本地 STDIO MCP 安全网关。Jira 只读工具立即查询；`*_append` 工具创建不可编辑的 operation，必须由用户在 `127.0.0.1` 本地审核页提交后，才会被后台串行 worker 执行。Agent 还可以查询本地队列与执行状态，并撤回尚未提交的 queued 操作。
 
@@ -17,7 +17,7 @@ Jira Local MCP 是面向 Jira Server/Data Center 的本地 STDIO MCP 安全网�
 ## 生命周期与持久化
 
 ```text
-MCP append → queued → Web submit → staged → executing → success/failed history
+MCP append → queued → Web submit → staged → executing → success/warning/failed history
                               └→ dependency_failed（依赖生产者失败，未调用 Jira）
                                               └→ indeterminate → 人工对账
                                                     └→ 后序 held
@@ -28,14 +28,14 @@ MCP append → queued → Web submit → staged → executing → success/failed
 - SQLite 是唯一业务状态源；使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema version。完整 schema 初始化按进程和数据库路径执行一次，普通连接不重复获取 schema 写锁。
 - queue、staging 和 history 都保存自包含的 operation 快照。主目标保存在顶层 `issue_key`，仅 `add_issuelink` 使用可空的顶层 `target_issue_key`；`payload_json` 只保存 operation 专属参数，不重复保存这两个 Key。
 - description 文件会在入队时读取为 UTF-8 字符串快照，后续审核和执行不再依赖源文件；附件仍保存本地绝对路径并在执行时读取。
-- 2.3.0 引入新的 operations v1 结构身份，执行记录以单个 `attachment_result_json` 保存附件 ID 与 Jira 最终文件名，不兼容此前的 operations 数据。从更早版本升级时必须先停止 Web/worker，再仅清除配置指向的 `operations.sqlite3` 及其精确匹配的 `-wal`、`-shm` sidecar；`mcp_logs.sqlite3` 使用独立 schema，不得随 operations DB 一并清除。2.4.0 沿用该 schema，从 2.3.0 升级无需清理数据库。
+- 开发阶段任何数据库结构变更都要求清除对应旧库后从零构建，不迁移或兼容旧数据。3.0.0 使用 operations schema 3；不兼容旧库即使为空也拒绝打开。升级前先停止访问该库的所有 MCP、Web 和 worker 进程，再仅清除配置指向的 `operations.sqlite3` 及精确匹配的 `operations.sqlite3-wal`、`operations.sqlite3-shm` 文件，重新启动后创建新库。MCP 日志库结构未变，无需清理；以后其结构变更时同样清库重建。
 
 队列不保存布局或位置。每次读取时都会按确定性规则自动分组和排序：真实 Jira 组按 Key 自然排序，待创建事务组随后按生产者创建时间排序，组内按生产者、标准字段、自定义字段、工作流、附件、评论、worklog、其他类别以及创建时间和 operation ID 排序，零散项最后展示。生产者返回真实 Key 后，下一次读取会自动重新分组；待审队列不提供任何人工排序或锚点。提交后持久化的 `stage_order` 仍代表用户已授权的执行顺序。
 
 ## MCP 能力
 
 - 5 个只读工具：事务、评论、工作日志、附件、JQL。
-- 11 个 `*_append` 写入队工具：创建、克隆、移动、变更类型、流转、字段、附件、评论、工时和链接。
+- 11 个 `*_append` 公开工具：10 个支持入队，移动工具立即拒绝且不入队。创建/类型变更/流转使用 ID 参数。
 - `jira_show_queue`：打开审核页，不返回 URL 或会话凭据。
 - `jira_get_execution_log`：读取实际执行和人工对账历史。
 - `jira_list_queue(page=1, page_size=50)`：分页读取待审核概览，不包含 payload。
@@ -54,7 +54,7 @@ MCP append → queued → Web submit → staged → executing → success/failed
 
 在 Web 页面取消操作时，如果还有依赖项未选中，页面会展示完整取消范围，标记“原先选择”和“新增依赖”，列出操作 ID、说明和关联事务。点击“确认取消全部 N 项”即可，无需逐项补勾；“返回”或 Escape 放弃本次取消。确认期间页面仍会刷新，但确认范围保持不变；若队列已更新，取消会被拒绝并提示重新核对。展示记录不完整或完整范围超过 1000 项时，页面不会发送第二次取消请求；会话失效会关闭确认框。
 
-`move_issue` 仍可入队展示，但 Jira Server/DC REST 不支持时会明确记录失败。创建或克隆 Tool 返回的 operation ID 可直接作为后续修改的 `issue_key`，`add_issuelink.target_issue_key` 也支持相同引用；服务端会在生产者成功后原子物化两个顶层 Key。附件上传 operation ID 可在同一事务的 description、comment 和 worklog 中写成 `[^{{attachment:op-…}}]` 或 `!{{attachment:op-…}}!`；上传成功后，系统使用 Jira 返回的附件 ID 确认身份，并把引用原子替换为最终文件名。创建事务的初始 description 不允许附件引用，应采用“创建 → 上传 → 更新 description”。克隆来源仍必须是真实 Jira Key，也不接受自定义 placeholder。公共输出统一使用 `dependency_states` 表达两类依赖：键为依赖 operation ID，值为生命周期状态（未知为 `unknown`）；映射键顺序不代表执行顺序。
+`jira_issue_move_append` 保留公开签名，立即返回“不支持且未入队”。创建或克隆 Tool 返回的 operation ID 可直接作为后续修改的 `issue_key`，`add_issuelink.target_issue_key` 也支持相同引用；服务端会在生产者成功后原子物化两个顶层 Key。附件上传 operation ID 可在同一事务的 description、comment 和 worklog 中写成 `[^{{attachment:op-…}}]` 或 `!{{attachment:op-…}}!`；上传成功后，系统使用 Jira 返回的附件 ID 确认身份，并把引用原子替换为最终文件名。创建事务的初始 description 不允许附件引用，应采用“创建 → 上传 → 更新 description”。克隆来源仍必须是真实 Jira Key，也不接受自定义 placeholder。公共输出统一使用 `dependency_states` 表达两类依赖：键为依赖 operation ID，值为生命周期状态（未知为 `unknown`）；映射键顺序不代表执行顺序。
 
 ## 配置与运行
 
@@ -93,7 +93,7 @@ python server.py
 - `GET /api/state`：队列、执行区和 revisions，支持 ETag/304。
 - `POST /api/queue/cancel`、`POST /api/queue/submit`；待审队列完全自动排序，不提供 reorder API。
 - cancel 请求只接受 `operation_ids` 与 `expected_queue_revision`，不再接受 `cascade_confirmed`。页面确认依赖范围后重发完整 ID 列表并沿用首次请求 revision；与 MCP 共用依赖校验和取消事务。本次变更不修改数据库 schema。
-- `POST /api/execution/indeterminate/resolve`、`/held/resolve`；不确定的附件上传标记为已生效时，前者要求嵌套提供附件 ID 与最终文件名。
+- `POST /api/execution/indeterminate/resolve`、`/held/resolve`；不确定的附件上传标记为已生效时，前者要求通过 `attachment: {id, filename}` 提供已确认附件身份，返回 `attachment_results` 数组。
 - `GET /api/execution-history`：UTC 时间范围和分页。
 
 审核页面静态资源全部本地化，并启用 CSP、frame 防护、`nosniff`、`no-referrer` 和 `no-store`。
@@ -101,3 +101,23 @@ python server.py
 ## 已知边界
 
 附件目前仍只保存本地路径，没有 staging 或 hash 绑定；审核后文件可能变化。description 文件已在入队时保存内容快照。克隆源和最终规范化 Jira payload 也尚未与审核内容不可变绑定。SQLite 和本地日志不是针对同一 OS 用户恶意篡改的安全存储，因此不要宣称“生产安全”或“完整不可抵赖审计”。
+
+## 3.0 元数据与执行契约
+
+新增 11 个只读 Tool：jira_meta_server_settings、jira_meta_user、jira_meta_search_users、jira_meta_search_assignable_users、jira_meta_projects、jira_meta_issue_types、jira_meta_issue_transitions、jira_meta_fields、jira_meta_field、jira_meta_link_types、jira_meta_permissions。工具适配位于 core/mcp_tools/jira_metadata.py，读取与投影位于 core/jira_metadata.py，不缓存跨请求元数据。
+
+查询按创建（project_key + issue_type_id）、编辑（真实 issue_key）、流转（真实 issue_key + transition_id）限定上下文。字段先摘要再详情，小型级联一次返回；大候选集分页保留归属。项目/用户默认 20，摘要默认 50，最多 100；返回预算 32 KiB。创建字段的分页游标按源位置续读，过滤后空页不表示结束。Jira 错误保留 HTTP 状态和正文并脱敏，本地/SDK/传输错误区分来源。
+
+字段限定用户搜索尚未证实实例过滤语义时明确返回能力限制；不会以普通搜索结果宣称该字段可选。server_settings 的 features 仅返回链接和子任务功能开关。issue_types 的 create 是凭证可见创建元数据，configured 是项目配置，两者不能互相替代。
+
+创建参数 issue_type_id、类型变更 target_issue_type_id、流转 transition_id 都直接使用 ID，不兼容旧名称参数。流转执行前复查 ID 可用性。类型映射不得覆盖 issuetype。
+
+工时 started 接受带时区 ISO 字符串，入队校验、worker 转为 datetime。adjust_estimate 默认 auto；leave 保持估算；new 必须带 new_estimate，manual 必须带 reduce_by；两个配套值互斥，auto/leave 禁止携带。所有估算模式均按低风险处理。
+
+克隆 field_overrides 可补齐创建字段，但禁止覆盖 project、issuetype、summary；description 复用文件快照，禁止初始附件引用。clone_subtasks=true 提前拒绝。附件使用可 seek 的二进制对象复制，首个失败后停止。warning 表示新事务主体已创建但附件处理异常，原子保存新 Key 与统一 attachment_results 列表，保留请求文件名、源附件 ID、已确认身份及成功/失败/结果未知/未尝试明细。warning 仍解析新事务引用并放行后续修改，但不自动重放整个克隆；附件占位符仍只接受单附件上传 operation ID，不从克隆结果列表推测附件。中断和落库失败仍走 indeterminate/held。
+
+本 MCP 不提供本地文件查询工具；Agent 自行取得文件属性，MCP 保留入队/执行边界校验。真实 Jira 验证严格限于读取，写路径以 Mock 和离线 SDK 请求检查覆盖。依赖要求 jira>=3.10.5,<4。
+
+字段限定用户搜索通过固定 groupuserpicker 取得身份建议，候选过滤标记 candidate_validation=unverified；端点可达或返回用户不证明实例过滤生效，不得据此宣称字段合法可选。该建议无 offset 续页，应缩小 query。
+
+普通附件上传成功、失败或结果未知均记录统一附件明细；单独上传未确认成功时整体为 failed，不放行附件依赖且不自动重试。执行历史与 MCP 执行日志查询使用 attachment_results 数组；请求文件名不代替 Jira 最终文件名。请求文件名必须为非空白文本，不得包含 NUL，且不超过 1024 个字符；入队和执行前复用同一模型约束校验。

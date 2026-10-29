@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from pydantic import TypeAdapter
+
 from core.operations.models import (
     AttachmentResult,
     ExecutionRecord,
@@ -30,12 +32,13 @@ def payload_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return payload
 
 
-def attachment_result_from_json(value: str | None) -> AttachmentResult | None:
-    """Decode one optional strict attachment identity."""
+_ATTACHMENT_RESULTS = TypeAdapter(tuple[AttachmentResult, ...])
 
-    if value is None:
-        return None
-    return AttachmentResult.model_validate(parse_json(value))
+
+def attachment_results_from_json(value: str) -> tuple[AttachmentResult, ...]:
+    """Decode a strict collection of attachment outcomes."""
+
+    return _ATTACHMENT_RESULTS.validate_json(value)
 
 
 def operation_from_row(row: sqlite3.Row) -> OperationRecord:
@@ -87,8 +90,8 @@ def execution_from_row(row: sqlite3.Row) -> ExecutionRecord:
         summary=row["summary"],
         error=row["error"],
         new_issue_key=row["new_issue_key"],
-        attachment_result=attachment_result_from_json(
-            row["attachment_result_json"]
+        attachment_results=attachment_results_from_json(
+            row["attachment_results_json"]
         ),
         elapsed_ms=row["elapsed_ms"],
         resolution=row["resolution"],

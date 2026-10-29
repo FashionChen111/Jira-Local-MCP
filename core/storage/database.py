@@ -13,10 +13,10 @@ from typing import Generator, Literal
 
 from config import get_config
 
-OPERATIONS_SCHEMA_VERSION = 1
+OPERATIONS_SCHEMA_VERSION = 3
 MCP_LOG_SCHEMA_VERSION = 1
 OPERATIONS_SCHEMA_IDENTITY = (
-    "jira-local-mcp-operations-attachment-dependencies-v1"
+    "jira-local-mcp-operations-attachment-results-v3"
 )
 BUSY_TIMEOUT_MS = 10_000
 _INITIALIZATION_LOCK = threading.Lock()
@@ -75,7 +75,20 @@ def _ensure_schema(
                 f"{label} schema 版本 {current} 与所需版本 {version} 不兼容；请清理对应 SQLite 文件"
             )
         if current == 0:
-            connection.executescript(schema)
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master LIMIT 1"
+            ).fetchone() is not None:
+                raise RuntimeError(
+                    f"{label} schema 未标记版本且已有结构；请清理对应 SQLite 文件"
+                )
+            statement = ""
+            for line in schema.splitlines(keepends=True):
+                statement += line
+                if sqlite3.complete_statement(statement):
+                    connection.execute(statement)
+                    statement = ""
+            if statement.strip():
+                raise RuntimeError("不完整的 schema SQL")
             connection.execute(f"PRAGMA user_version={version}")
         if schema_identity is not None:
             try:
