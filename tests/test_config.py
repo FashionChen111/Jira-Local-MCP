@@ -15,7 +15,6 @@ def test_load_config_derives_sqlite_paths(tmp_path, monkeypatch):
     cfg = config.load_config(str(write_config(tmp_path)))
     assert cfg.jira.url == 'https://jira.example.com/context'
     assert cfg.jira.token == 'SECRET'
-    assert cfg.jira.auth_type == 'pat'
     assert cfg.jira.verify_ssl is True
     assert cfg.jira.timeout == 30
     assert cfg.web_port == 8766
@@ -26,10 +25,10 @@ def test_load_config_derives_sqlite_paths(tmp_path, monkeypatch):
     assert not hasattr(cfg, 'queue_file') and not hasattr(cfg, 'commit_log_file')
 
 
-def test_basic_and_advanced_values(tmp_path):
-    path = write_config(tmp_path, 'ATLASSIAN_JIRA_AUTH_TYPE=basic\nATLASSIAN_JIRA_USERNAME=user\nATLASSIAN_JIRA_PASSWORD="p # $X"\nATLASSIAN_JIRA_VERIFY_SSL=false\nATLASSIAN_JIRA_TIMEOUT_SECONDS=45\nJIRA_MCP_WEB_PORT=9000\nJIRA_MCP_MAX_TXT_BYTES=512\n')
+def test_pat_and_advanced_values(tmp_path):
+    path = write_config(tmp_path, 'ATLASSIAN_JIRA_PAT="p # $X"\nATLASSIAN_JIRA_VERIFY_SSL=false\nATLASSIAN_JIRA_TIMEOUT_SECONDS=45\nJIRA_MCP_WEB_PORT=9000\nJIRA_MCP_MAX_TXT_BYTES=512\n')
     cfg = config.load_config(str(path))
-    assert (cfg.jira.username, cfg.jira.password) == ('user', 'p # $X')
+    assert cfg.jira.token == 'p # $X'
     assert cfg.jira.verify_ssl is False
     assert (cfg.jira.timeout, cfg.web_port, cfg.max_txt_bytes) == (45, 9000, 512)
 
@@ -67,3 +66,14 @@ def test_missing_env_does_not_fall_back_to_yaml(tmp_path):
 def test_config_repr_and_sensitive_values_do_not_expose_credentials(cfg):
     assert 'SECRET_TOKEN' not in repr(cfg)
     assert 'jira.example.com' in cfg.sensitive_values()
+
+
+def test_existing_pat_selector_remains_readable(tmp_path):
+    assert config.load_config(str(write_config(tmp_path, 'ATLASSIAN_JIRA_AUTH_TYPE=pat\n'))).jira.token == 'SECRET'
+
+
+def test_basic_selector_is_rejected_even_when_all_credentials_are_present(tmp_path):
+    path = write_config(tmp_path, 'ATLASSIAN_JIRA_AUTH_TYPE=basic\nATLASSIAN_JIRA_USERNAME=user\nATLASSIAN_JIRA_PASSWORD=PASSWORD_SECRET\n')
+    with pytest.raises(ValueError, match='PAT') as caught:
+        config.load_config(str(path))
+    assert 'SECRET' not in str(caught.value)

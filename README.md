@@ -64,7 +64,7 @@ MCP append → queued → Web submit → staged → executing → success/warnin
 
 1. 将项目放到准备长期使用的目录。
 2. Windows 双击 `setup.bat`；macOS 双击 `setup.command`。如无执行权限，在终端执行 `chmod +x "/完整路径/setup.command"`。Linux 运行 `python3 scripts/install.py`。
-3. 按提示填写 Jira 地址（含 `/jira` 等实际上下文路径）和认证方式；默认 PAT，也支持 Basic 用户名/密码。凭据输入不显示，不能隐藏输入的终端会被拒绝。
+3. 按提示填写 Jira 地址（含 `/jira` 等实际上下文路径）和 PAT。仅支持 PAT，不需要选择认证方式。凭据输入不显示，不能隐藏输入的终端会被拒绝。
 4. 入口优先使用可用的项目 `.venv` Python；没有可用项目解释器时再选择系统 Python。脚本创建或复用项目 `.venv`，安装受 `constraints.txt` 约束的运行依赖，然后检查 MCP 工具加载及只读 Jira 身份认证。
 5. 全部通过后，脚本生成 `MCP_SETUP.md` 并显示完整路径。将该文件作为附件交给 Agent，让其配置当前客户端。
 
@@ -76,12 +76,7 @@ MCP append → queued → Web submit → staged → executing → success/warnin
 
 ```dotenv
 ATLASSIAN_JIRA_URL=https://jira.example.com/jira
-ATLASSIAN_JIRA_AUTH_TYPE=pat
 ATLASSIAN_JIRA_PAT=YOUR_PERSONAL_ACCESS_TOKEN
-
-# Basic 模式使用以下两项，同时将 AUTH_TYPE 改为 basic
-# ATLASSIAN_JIRA_USERNAME=your_username
-# ATLASSIAN_JIRA_PASSWORD=your_password
 
 # 可选，默认值如下
 # ATLASSIAN_JIRA_VERIFY_SSL=true
@@ -98,7 +93,7 @@ ATLASSIAN_JIRA_PAT=YOUR_PERSONAL_ACCESS_TOKEN
 
 ### 从旧版升级或移动目录
 
-先停止所有访问本项目 `data/` 的 MCP、Web 和 worker 进程。没有 `.env` 但存在旧 `config.yaml` 时，setup 会询问是否导入；只有明确选择 `y` 才导入，保留旧文件。导入需要在已有 PyYAML 的 Python 环境运行，可使用原项目虚拟环境的 Python 执行 `scripts/install.py`；缺少依赖时会给出提示。已有 `.env` 时直接使用它，不合并或覆盖旧 YAML。
+先停止所有访问本项目 `data/` 的 MCP、Web 和 worker 进程。没有 `.env` 但存在旧 `config.yaml` 时，setup 会询问是否导入；只有明确选择 `y` 才导入，保留旧文件。只支持导入 PAT 配置，不复制旧用户名和密码。旧 YAML 使用 Basic 时会明确拒绝；请重新运行 setup，选择不导入，再填写地址和 PAT。已有 `.env` 若显式设置了非 PAT 认证方式，也会拒绝；将 `ATLASSIAN_JIRA_AUTH_TYPE` 改为 `pat` 并填写 `ATLASSIAN_JIRA_PAT` 后重试。旧 `AUTH_TYPE=pat` 可继续读取，新配置不生成该键。导入需要在已有 PyYAML 的 Python 环境运行，可使用原项目虚拟环境的 Python 执行 `scripts/install.py`；缺少依赖时会给出提示。已有 `.env` 时直接使用它，不合并或覆盖旧 YAML。
 
 本次升级没有数据库结构变化，**保留原项目 `data/`，无需清库**。旧文件只用于一次性导入，新版运行时不读取它。迁移完成后旧文件仍含凭据，应自行妥善保管。
 

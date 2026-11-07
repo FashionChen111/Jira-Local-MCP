@@ -18,7 +18,7 @@ def cfg(tmp_path):
     os.makedirs(data_dir, exist_ok=True)
     value = Config(
         jira=JiraConfig(
-            url="https://jira.example.com", auth_type="pat", token="SECRET_TOKEN"
+            url="https://jira.example.com", token="SECRET_TOKEN"
         ),
         web_port=8766,
         max_txt_bytes=1024,

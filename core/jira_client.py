@@ -2,7 +2,7 @@
 
 - 惰性建立连接；读工具与执行引擎共用同一实例。
 - 凭证仅在此处从 config 读取传给 jira 库，绝不外泄到 MCP 返回值 / 日志明文。
-- 认证：pat（Personal Access Token / Bearer）或 basic（用户名+密码）。
+- 认证：仅支持 PAT（Personal Access Token / Bearer）。
 """
 from __future__ import annotations
 
@@ -29,14 +29,7 @@ def _build_client() -> Any:
         "verify": cfg.verify_ssl,
     }
     try:
-        if cfg.auth_type == "pat":
-            client = JIRA(options=options, token_auth=cfg.token, timeout=cfg.timeout)
-        else:
-            client = JIRA(
-                options=options,
-                basic_auth=(cfg.username, cfg.password),
-                timeout=cfg.timeout,
-            )
+        client = JIRA(options=options, token_auth=cfg.token, timeout=cfg.timeout)
     except Exception as e:
         # 不把凭证 / 域名放进异常文本
         raise JiraConnectionError(f"连接 JIRA 失败: {type(e).__name__}") from e

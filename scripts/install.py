@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from env_file import parse_env
-from config import config_from_values
+from config import config_from_values, require_pat_authentication, UnsupportedAuthenticationError
 
 
 def _env_literal(key: str, value: str) -> str:
@@ -159,15 +159,13 @@ def _legacy_values(path: Path) -> dict[str, str]:
     if not isinstance(raw, dict) or not isinstance(raw.get("jira"), dict):
         raise ValueError("旧配置结构不正确")
     jira = raw["jira"]
+    auth_type = jira.get("auth_type", "pat")
+    if not isinstance(auth_type, str):
+        raise ValueError("旧配置字段类型不正确")
+    require_pat_authentication(auth_type)
     values: dict[str, str] = {}
-    for old_key, new_key in (
-        ("url", "ATLASSIAN_JIRA_URL"), ("auth_type", "ATLASSIAN_JIRA_AUTH_TYPE"),
-        ("token", "ATLASSIAN_JIRA_PAT"), ("username", "ATLASSIAN_JIRA_USERNAME"),
-        ("password", "ATLASSIAN_JIRA_PASSWORD"),
-    ):
-        value = jira.get(old_key, "pat" if old_key == "auth_type" else "")
-        if value is None and old_key in ("token", "username", "password"):
-            value = ""
+    for old_key, new_key in (("url", "ATLASSIAN_JIRA_URL"), ("token", "ATLASSIAN_JIRA_PAT")):
+        value = jira.get(old_key, "")
         if not isinstance(value, str):
             raise ValueError("旧配置字段类型不正确")
         values[new_key] = value
@@ -212,6 +210,9 @@ def ensure_configuration(root: Path, *, edit: bool = False) -> bool:
             if choice == "y":
                 try:
                     imported = _legacy_values(root / "config.yaml")
+                except UnsupportedAuthenticationError:
+                    print("旧配置仅能导入 PAT 认证；请重新运行并选择不导入，填写 Jira 地址和 PAT。", file=sys.stderr)
+                    return False
                 except ImportError:
                     print("旧配置导入需要 PyYAML，请先在现有环境安装 requirements.txt 后重试。", file=sys.stderr)
                     return False
@@ -219,33 +220,25 @@ def ensure_configuration(root: Path, *, edit: bool = False) -> bool:
                     print("旧配置无法导入，请检查结构、类型及必填项；原文件未修改。", file=sys.stderr)
                     return False
                 values.update(imported)
+        require_pat_authentication(values.get("ATLASSIAN_JIRA_AUTH_TYPE", "pat"))
         print("====== 更新配置 ======" if edit else "====== Jira 连接配置 ======", flush=True)
         old_url = values.get("ATLASSIAN_JIRA_URL", "")
-        old_auth = values.get("ATLASSIAN_JIRA_AUTH_TYPE", "pat")
         changes = dict(imported)
         changes["ATLASSIAN_JIRA_URL"] = input(
             "Jira 地址（已配置，回车保留）：" if old_url else "Jira 地址（必填）："
         ).strip() or old_url
-        changes["ATLASSIAN_JIRA_AUTH_TYPE"] = input(
-            f"认证方式 [pat/basic，默认 {old_auth}]："
-        ).strip() or old_auth
-        if changes["ATLASSIAN_JIRA_AUTH_TYPE"] == "pat":
-            changes["ATLASSIAN_JIRA_PAT"] = _secret("PAT", values.get("ATLASSIAN_JIRA_PAT", ""))
-        elif changes["ATLASSIAN_JIRA_AUTH_TYPE"] == "basic":
-            old_username = values.get("ATLASSIAN_JIRA_USERNAME", "")
-            changes["ATLASSIAN_JIRA_USERNAME"] = input(
-                "用户名（已配置，回车保留）：" if old_username else "用户名（必填）："
-            ).strip() or old_username
-            changes["ATLASSIAN_JIRA_PASSWORD"] = _secret("密码", values.get("ATLASSIAN_JIRA_PASSWORD", ""))
+        changes["ATLASSIAN_JIRA_PAT"] = _secret("PAT", values.get("ATLASSIAN_JIRA_PAT", ""))
         config_from_values({**values, **changes})
         changes = {key: value for key, value in changes.items()
-                   if value != original_values.get(key, "pat" if key == "ATLASSIAN_JIRA_AUTH_TYPE" else "")}
+                   if value != original_values.get(key, "")}
         if changes or not exists:
             _save_configuration(path, original, changes, create=not exists)
             print("已更新 .env。")
         else:
             print("已保留现有配置。")
         return True
+    except UnsupportedAuthenticationError:
+        print("仅支持 PAT 认证；请将旧 .env 的 ATLASSIAN_JIRA_AUTH_TYPE 改为 pat，填写 ATLASSIAN_JIRA_PAT 后重试。", file=sys.stderr)
     except getpass.GetPassWarning:
         print("当前终端无法隐藏凭据输入，请在系统终端重新运行。", file=sys.stderr)
     except (OSError, UnicodeError, ValueError, EOFError, KeyboardInterrupt):

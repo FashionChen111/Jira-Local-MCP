@@ -194,7 +194,7 @@ SQLite 使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema versio
 
 - Python 3.10+。
 - Jira Server/Data Center。
-- Personal Access Token 或 Basic Auth，由项目根目录 `.env` 统一管理；不使用进程环境变量覆盖，不回退读取旧 YAML。
+- 仅支持 Personal Access Token（PAT），安装直接询问地址和 PAT；由项目根目录 `.env` 统一管理；不使用进程环境变量覆盖，不回退读取旧 YAML。
 - Windows/macOS 安装入口及 Linux Python 安装脚本，创建或复用 `.venv`，只读检查认证并生成本机 `MCP_SETUP.md`。
 - 已有 YAML 仅在 `.env` 不存在且用户同意时导入；保留原配置和 `data/`，本次配置升级不改变数据库结构。
 - 可配置 TLS 证书校验和 Jira 请求超时。

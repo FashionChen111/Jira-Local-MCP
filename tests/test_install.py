@@ -25,26 +25,36 @@ def answers(monkeypatch, inputs, secrets=()):
 
 def test_first_pat_configuration(tmp_path, monkeypatch):
     prepare(tmp_path)
-    answers(monkeypatch, ['https://jira.example.com', ''], ['p # $HOME'])
+    answers(monkeypatch, ['https://jira.example.com'], ['p # $HOME'])
     assert install.ensure_configuration(tmp_path)
     assert config.load_config(str(tmp_path / '.env')).jira.token == 'p # $HOME'
     if os.name != 'nt':
         assert (tmp_path / '.env').stat().st_mode & 0o777 == 0o600
 
 
-def test_basic_configuration(tmp_path, monkeypatch):
+def test_first_install_only_prompts_for_url_and_hidden_pat(tmp_path, monkeypatch):
     prepare(tmp_path)
-    answers(monkeypatch, ['https://jira.example.com', 'basic', 'user'], ['password'])
+    prompts = []; hidden = []
+    def address(prompt):
+        prompts.append(prompt)
+        return 'https://jira.example.com'
+    def pat(prompt):
+        hidden.append(prompt)
+        return 'fake-pat'
+    monkeypatch.setattr('builtins.input', address)
+    monkeypatch.setattr(getpass, 'getpass', pat)
     assert install.ensure_configuration(tmp_path)
-    cfg = config.load_config(str(tmp_path / '.env'))
-    assert (cfg.jira.auth_type, cfg.jira.username, cfg.jira.password) == ('basic', 'user', 'password')
+    assert prompts == ['Jira 地址（必填）：']
+    assert hidden == ['PAT（必填，输入不显示）：']
+    saved = config.load_config(str(tmp_path / '.env'))
+    assert saved.jira.token == 'fake-pat'
 
 
 def test_keep_existing_values_and_advanced_settings(tmp_path, monkeypatch):
     path = tmp_path / '.env'
     original = b'\xef\xbb\xbf# preserved\r\nATLASSIAN_JIRA_URL=https://jira.example.com\r\nATLASSIAN_JIRA_PAT=SECRET\r\nJIRA_MCP_WEB_PORT=9001\r\nOTHER=value\r\n'
     path.write_bytes(original)
-    answers(monkeypatch, ['', ''], [''])
+    answers(monkeypatch, [''], [''])
     assert install.ensure_configuration(tmp_path)
     assert path.read_bytes() == original
 
@@ -54,7 +64,7 @@ def test_hidden_input_failure_keeps_original(tmp_path, monkeypatch, capsys):
     path = tmp_path / '.env'
     path.write_text('ATLASSIAN_JIRA_URL=https://jira.example.com\nATLASSIAN_JIRA_PAT=SECRET\n')
     original = path.read_bytes()
-    answers(monkeypatch, ['', ''])
+    answers(monkeypatch, [''])
     def unsafe(prompt):
         warnings.warn('unsafe', getpass.GetPassWarning)
         return 'LEAK'
@@ -106,7 +116,7 @@ def test_import_yaml_preserves_original_and_data(tmp_path, monkeypatch):
     original = b'jira:\n  url: https://jira.example.com/context\n  token: SECRET\n  verify_ssl: false\n  timeout: 45\nweb:\n  port: 9002\nfiles:\n  max_txt_bytes: 512\n'
     path.write_bytes(original)
     data = tmp_path / 'data'; data.mkdir(); (data / 'operations.sqlite3').write_bytes(b'untouched')
-    answers(monkeypatch, ['y', '', ''], [''])
+    answers(monkeypatch, ['y', ''], [''])
     assert install.ensure_configuration(tmp_path)
     cfg = config.load_config(str(tmp_path / '.env'))
     assert (cfg.jira.timeout, cfg.web_port, cfg.max_txt_bytes) == (45, 9002, 512)
@@ -118,7 +128,7 @@ def test_import_yaml_preserves_original_and_data(tmp_path, monkeypatch):
 def test_declined_yaml_import_uses_new_input(tmp_path, monkeypatch):
     prepare(tmp_path)
     (tmp_path / 'config.yaml').write_text('jira: {token: OLD}')
-    answers(monkeypatch, ['n', 'https://jira.example.com', ''], ['NEW'])
+    answers(monkeypatch, ['n', 'https://jira.example.com'], ['NEW'])
     assert install.ensure_configuration(tmp_path)
     assert config.load_config(str(tmp_path / '.env')).jira.token == 'NEW'
 
@@ -127,7 +137,7 @@ def test_existing_env_never_imports_yaml(tmp_path, monkeypatch):
     prepare(tmp_path)
     (tmp_path / '.env').write_text('ATLASSIAN_JIRA_URL=https://jira.example.com\nATLASSIAN_JIRA_PAT=NEW\n')
     (tmp_path / 'config.yaml').write_text('invalid: [SECRET')
-    answers(monkeypatch, ['', ''], [''])
+    answers(monkeypatch, [''], [''])
     assert install.ensure_configuration(tmp_path)
 
 
@@ -283,7 +293,7 @@ def test_two_setup_writers_cannot_both_replace_same_original(tmp_path, monkeypat
 def test_first_import_save_failure_can_be_retried(tmp_path, monkeypatch):
     prepare(tmp_path)
     (tmp_path / 'config.yaml').write_text('jira: {url: https://jira.example.com, token: SECRET}\n')
-    answers(monkeypatch, ['y', '', ''], [''])
+    answers(monkeypatch, ['y', ''], [''])
     with monkeypatch.context() as patch:
         def fail(*args, **kwargs):
             raise OSError('disk failure')
@@ -291,7 +301,7 @@ def test_first_import_save_failure_can_be_retried(tmp_path, monkeypatch):
         patch.setattr(os, 'link', fail)
         assert not install.ensure_configuration(tmp_path)
     assert not (tmp_path / '.env').exists()
-    answers(monkeypatch, ['y', '', ''], [''])
+    answers(monkeypatch, ['y', ''], [''])
     assert install.ensure_configuration(tmp_path)
     assert config.load_config(str(tmp_path / '.env')).jira.token == 'SECRET'
 
@@ -341,3 +351,43 @@ def test_launcher_preserves_install_and_edit_failure_status(tmp_path, initial, e
     env = {**os.environ, 'PATH': str(bindir) + ':/usr/bin:/bin', 'JIRA_TEST_CALLS': str(root / 'calls'), 'JIRA_TEST_INSTALL_STATUS': str(initial), 'JIRA_TEST_EDIT_STATUS': str(edit)}
     result = subprocess.run(['/bin/sh', str(command)], input='E\n\n', text=True, capture_output=True, env=env)
     assert result.returncode == expected, result.stdout + result.stderr
+
+
+def test_basic_env_is_rejected_without_changing_file(tmp_path, monkeypatch, capsys):
+    path = tmp_path / '.env'
+    original = b'ATLASSIAN_JIRA_URL=https://jira.example.com\nATLASSIAN_JIRA_AUTH_TYPE=basic\nATLASSIAN_JIRA_USERNAME=user\nATLASSIAN_JIRA_PASSWORD=PASSWORD_SECRET\nATLASSIAN_JIRA_PAT=PAT_SECRET\n'
+    path.write_bytes(original)
+    def forbidden(prompt):
+        pytest.fail('Basic configuration should be rejected before asking for input')
+    monkeypatch.setattr('builtins.input', forbidden)
+    assert not install.ensure_configuration(tmp_path)
+    assert path.read_bytes() == original
+    output = capsys.readouterr()
+    assert 'PAT' in output.err
+    assert 'SECRET' not in output.out + output.err
+
+
+def test_basic_yaml_import_is_rejected_without_creating_env(tmp_path, monkeypatch, capsys):
+    prepare(tmp_path)
+    legacy = tmp_path / 'config.yaml'
+    original = 'jira: {url: https://jira.example.com, auth_type: basic, username: user, password: PASSWORD_SECRET, token: PAT_SECRET}\n'
+    legacy.write_text(original)
+    answers(monkeypatch, ['y'])
+    assert not install.ensure_configuration(tmp_path)
+    assert not (tmp_path / '.env').exists()
+    assert legacy.read_text() == original
+    output = capsys.readouterr()
+    assert 'PAT' in output.err
+    assert 'SECRET' not in output.out + output.err
+
+
+def test_pat_yaml_import_does_not_copy_inactive_basic_credentials(tmp_path, monkeypatch):
+    prepare(tmp_path)
+    (tmp_path / 'config.yaml').write_text('jira: {url: https://jira.example.com, auth_type: pat, token: PAT_SECRET, username: old-user, password: OLD_PASSWORD}\n')
+    answers(monkeypatch, ['y', ''], [''])
+    assert install.ensure_configuration(tmp_path)
+    values = parse_env((tmp_path / '.env').read_text())
+    assert values['ATLASSIAN_JIRA_PAT'] == 'PAT_SECRET'
+    assert 'ATLASSIAN_JIRA_AUTH_TYPE' not in values
+    assert 'ATLASSIAN_JIRA_USERNAME' not in values
+    assert 'ATLASSIAN_JIRA_PASSWORD' not in values

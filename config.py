@@ -20,15 +20,12 @@ def _abs_path(path: str) -> str:
 @dataclass
 class JiraConfig:
     url: str
-    auth_type: str
     token: str = ""
-    username: str = ""
-    password: str = ""
     verify_ssl: bool = True
     timeout: int = 30
 
     def __repr__(self) -> str:
-        return f"JiraConfig(url=***, auth_type={self.auth_type!r})"
+        return "JiraConfig(url=***, token=***)"
 
 
 @dataclass
@@ -41,7 +38,7 @@ class Config:
     execution_lock_file: str = ""
 
     def sensitive_values(self) -> list[str]:
-        values = [self.jira.token, self.jira.password, self.jira.username]
+        values = [self.jira.token]
         if self.jira.url:
             values.append(self.jira.url.split("://")[-1].split("/")[0])
         return [value for value in values if value]
@@ -72,6 +69,17 @@ def load_config(path: str | None = None) -> Config:
     return config_from_values(raw)
 
 
+class UnsupportedAuthenticationError(ValueError):
+    """A legacy configuration explicitly requests an unsupported authentication mode."""
+
+
+def require_pat_authentication(auth_type: str) -> None:
+    if auth_type != "pat":
+        raise UnsupportedAuthenticationError(
+            "ATLASSIAN_JIRA_AUTH_TYPE：仅支持 PAT 认证，请重新配置 Jira 地址和 PAT。"
+        )
+
+
 def config_from_values(raw: dict[str, str]) -> Config:
     """Validate configuration before the installer writes it to disk."""
     url = raw.get("ATLASSIAN_JIRA_URL", "").strip().rstrip("/")
@@ -88,23 +96,15 @@ def config_from_values(raw: dict[str, str]) -> Config:
         valid_url = False
     if not valid_url:
         raise ValueError("ATLASSIAN_JIRA_URL 必须是有效的 http(s) 地址，不能含凭据、查询或片段")
-    auth_type = raw.get("ATLASSIAN_JIRA_AUTH_TYPE", "pat")
-    if auth_type not in ("pat", "basic"):
-        raise ValueError("ATLASSIAN_JIRA_AUTH_TYPE 必须是 pat 或 basic")
-    required = ("ATLASSIAN_JIRA_PAT",) if auth_type == "pat" else (
-        "ATLASSIAN_JIRA_USERNAME", "ATLASSIAN_JIRA_PASSWORD",
-    )
-    for key in required:
-        if not raw.get(key, "").strip():
-            raise ValueError(f"缺少 {key}")
+    require_pat_authentication(raw.get("ATLASSIAN_JIRA_AUTH_TYPE", "pat"))
+    if not raw.get("ATLASSIAN_JIRA_PAT", "").strip():
+        raise ValueError("缺少 ATLASSIAN_JIRA_PAT")
     verify = raw.get("ATLASSIAN_JIRA_VERIFY_SSL", "true").lower()
     if verify not in ("true", "false"):
         raise ValueError("ATLASSIAN_JIRA_VERIFY_SSL 必须是 true 或 false")
     jira = JiraConfig(
-        url=url, auth_type=auth_type,
+        url=url,
         token=raw.get("ATLASSIAN_JIRA_PAT", ""),
-        username=raw.get("ATLASSIAN_JIRA_USERNAME", ""),
-        password=raw.get("ATLASSIAN_JIRA_PASSWORD", ""),
         verify_ssl=verify == "true",
         timeout=_positive_integer(raw, "ATLASSIAN_JIRA_TIMEOUT_SECONDS", 30),
     )

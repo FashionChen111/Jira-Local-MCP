@@ -18,8 +18,7 @@ def verify_jira_connection(cfg: JiraConfig) -> None:
     try:
         client = JIRA(
             options={"server": cfg.url, "verify": cfg.verify_ssl},
-            token_auth=cfg.token if cfg.auth_type == "pat" else None,
-            basic_auth=(cfg.username, cfg.password) if cfg.auth_type == "basic" else None,
+            token_auth=cfg.token,
             timeout=cfg.timeout, get_server_info=False, max_retries=0,
             logging=False,
         )
@@ -35,7 +34,7 @@ def verify_jira_connection(cfg: JiraConfig) -> None:
         raise
     except JIRAError as exc:
         if exc.status_code == 401:
-            message = "Jira 认证失败，请检查认证方式和凭据。"
+            message = "Jira 认证失败，请检查 PAT。"
         elif exc.status_code == 403:
             message = "Jira 拒绝访问，请检查账号权限或认证策略。"
         else:

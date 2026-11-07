@@ -23,23 +23,18 @@ class IdentityClient:
         self.closed = True
 
 
-@pytest.mark.parametrize('auth_type', ['pat', 'basic'])
-def test_identity_check_uses_readonly_options_and_closes(monkeypatch, auth_type):
+def test_identity_check_uses_readonly_options_and_closes(monkeypatch):
     client = IdentityClient()
     def factory(**kwargs):
         assert kwargs['get_server_info'] is False
         assert kwargs['max_retries'] == 0
         assert kwargs['options'] == {'server': 'https://jira.example.com', 'verify': True}
         assert kwargs['timeout'] == 30
-        if auth_type == 'pat':
-            assert kwargs['token_auth'] == 'SECRET'
-            assert kwargs['basic_auth'] is None
-        else:
-            assert kwargs['basic_auth'] == ('user', 'SECRET')
-            assert kwargs['token_auth'] is None
+        assert kwargs['token_auth'] == 'SECRET'
+        assert 'basic_auth' not in kwargs
         return client
     monkeypatch.setattr(healthcheck, 'JIRA', factory)
-    healthcheck.verify_jira_connection(JiraConfig(url='https://jira.example.com', auth_type=auth_type, token='SECRET', username='user', password='SECRET'))
+    healthcheck.verify_jira_connection(JiraConfig(url='https://jira.example.com', token='SECRET'))
     assert client.reads == 1
     assert client.closed
 
@@ -49,7 +44,7 @@ def test_unconfirmed_identity_fails_and_closes(monkeypatch, identity):
     client = IdentityClient(); client.identity = identity
     monkeypatch.setattr(healthcheck, 'JIRA', lambda **kwargs: client)
     with pytest.raises(healthcheck.JiraHealthcheckError):
-        healthcheck.verify_jira_connection(JiraConfig(url='https://jira.example.com', auth_type='pat', token='SECRET'))
+        healthcheck.verify_jira_connection(JiraConfig(url='https://jira.example.com', token='SECRET'))
     assert client.closed
 
 
@@ -63,7 +58,7 @@ def test_error_is_classified_without_secret_and_client_closed(monkeypatch, error
     client = IdentityClient(error=error)
     monkeypatch.setattr(healthcheck, 'JIRA', lambda **kwargs: client)
     with pytest.raises(healthcheck.JiraHealthcheckError) as caught:
-        healthcheck.verify_jira_connection(JiraConfig(url='https://jira.example.com', auth_type='pat', token='SECRET'))
+        healthcheck.verify_jira_connection(JiraConfig(url='https://jira.example.com', token='SECRET'))
     assert category in str(caught.value)
     assert 'SECRET' not in str(caught.value)
     assert client.closed
@@ -74,5 +69,5 @@ def test_constructor_failure_is_sanitized(monkeypatch):
         raise ConnectionError('SECRET')
     monkeypatch.setattr(healthcheck, 'JIRA', fail)
     with pytest.raises(healthcheck.JiraHealthcheckError, match='连接') as caught:
-        healthcheck.verify_jira_connection(JiraConfig(url='https://jira.example.com', auth_type='pat', token='SECRET'))
+        healthcheck.verify_jira_connection(JiraConfig(url='https://jira.example.com', token='SECRET'))
     assert 'SECRET' not in str(caught.value)
