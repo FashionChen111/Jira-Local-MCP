@@ -69,6 +69,11 @@ def load_config(path: str | None = None) -> Config:
         raise FileNotFoundError("未找到项目 .env，请运行 setup.bat / setup.command 或 scripts/install.py。")
     with open(cfg_path, "r", encoding="utf-8-sig") as handle:
         raw = parse_env(handle.read())
+    return config_from_values(raw)
+
+
+def config_from_values(raw: dict[str, str]) -> Config:
+    """Validate configuration before the installer writes it to disk."""
     url = raw.get("ATLASSIAN_JIRA_URL", "").strip().rstrip("/")
     try:
         parts = urlsplit(url)
