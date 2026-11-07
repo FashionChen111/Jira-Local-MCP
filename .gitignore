@@ -31,3 +31,9 @@ plan.*.md
 
 # --- custom ---
 config.md
+
+# Local configuration and generated machine paths
+.env
+.env.*
+!.env.example
+/MCP_SETUP.md

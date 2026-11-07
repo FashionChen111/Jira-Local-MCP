@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from urllib.parse import urlsplit
 
-import yaml
+from env_file import parse_env
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
+CONFIG_PATH = os.path.join(BASE_DIR, ".env")
 SERVICE_VERSION = "3.0.0"
 
 
@@ -53,48 +53,61 @@ class Config:
 _config: Config | None = None
 
 
-def _validate(raw: dict[str, Any]) -> None:
-    if "jira" not in raw or not isinstance(raw["jira"], dict):
-        raise ValueError("config.yaml 缺少 [jira] 配置段")
-    jira = raw["jira"]
-    if not jira.get("url"):
-        raise ValueError("config.yaml 缺少 jira.url")
-    auth_type = jira.get("auth_type", "pat")
-    if auth_type not in ("pat", "basic"):
-        raise ValueError("jira.auth_type 必须是 pat 或 basic")
-    if auth_type == "pat" and not jira.get("token"):
-        raise ValueError("auth_type=pat 时必须提供 jira.token")
-    if auth_type == "basic" and not (jira.get("username") and jira.get("password")):
-        raise ValueError("auth_type=basic 时必须提供 jira.username 和 jira.password")
+def _positive_integer(raw: dict[str, str], key: str, default: int, maximum: int | None = None) -> int:
+    value = raw.get(key, str(default))
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError(f"{key} 必须是正整数")
+    result = int(value)
+    if result < 1 or (maximum is not None and result > maximum):
+        raise ValueError(f"{key} 超出允许范围")
+    return result
 
 
 def load_config(path: str | None = None) -> Config:
     cfg_path = path or CONFIG_PATH
     if not os.path.exists(cfg_path):
-        raise FileNotFoundError(
-            f"未找到配置文件 {cfg_path}，请复制 config.example.yaml 为 config.yaml 并填写。"
+        raise FileNotFoundError("未找到项目 .env，请运行 setup.bat / setup.command 或 scripts/install.py。")
+    with open(cfg_path, "r", encoding="utf-8-sig") as handle:
+        raw = parse_env(handle.read())
+    url = raw.get("ATLASSIAN_JIRA_URL", "").strip().rstrip("/")
+    try:
+        parts = urlsplit(url)
+        valid_url = (
+            parts.scheme in ("http", "https") and bool(parts.hostname)
+            and parts.username is None and parts.password is None
+            and not parts.query and not parts.fragment
+            and not any(char.isspace() for char in url)
         )
-    with open(cfg_path, "r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle) or {}
-    _validate(raw)
-    jira_raw = raw["jira"]
-    jira = JiraConfig(
-        url=jira_raw["url"].rstrip("/"),
-        auth_type=jira_raw.get("auth_type", "pat"),
-        token=jira_raw.get("token", "") or "",
-        username=jira_raw.get("username", "") or "",
-        password=jira_raw.get("password", "") or "",
-        verify_ssl=bool(jira_raw.get("verify_ssl", True)),
-        timeout=int(jira_raw.get("timeout", 30)),
+        parts.port
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise ValueError("ATLASSIAN_JIRA_URL 必须是有效的 http(s) 地址，不能含凭据、查询或片段")
+    auth_type = raw.get("ATLASSIAN_JIRA_AUTH_TYPE", "pat")
+    if auth_type not in ("pat", "basic"):
+        raise ValueError("ATLASSIAN_JIRA_AUTH_TYPE 必须是 pat 或 basic")
+    required = ("ATLASSIAN_JIRA_PAT",) if auth_type == "pat" else (
+        "ATLASSIAN_JIRA_USERNAME", "ATLASSIAN_JIRA_PASSWORD",
     )
-    web = raw.get("web", {}) or {}
-    files = raw.get("files", {}) or {}
+    for key in required:
+        if not raw.get(key, "").strip():
+            raise ValueError(f"缺少 {key}")
+    verify = raw.get("ATLASSIAN_JIRA_VERIFY_SSL", "true").lower()
+    if verify not in ("true", "false"):
+        raise ValueError("ATLASSIAN_JIRA_VERIFY_SSL 必须是 true 或 false")
+    jira = JiraConfig(
+        url=url, auth_type=auth_type,
+        token=raw.get("ATLASSIAN_JIRA_PAT", ""),
+        username=raw.get("ATLASSIAN_JIRA_USERNAME", ""),
+        password=raw.get("ATLASSIAN_JIRA_PASSWORD", ""),
+        verify_ssl=verify == "true",
+        timeout=_positive_integer(raw, "ATLASSIAN_JIRA_TIMEOUT_SECONDS", 30),
+    )
+    web_port = _positive_integer(raw, "JIRA_MCP_WEB_PORT", 8766, 65535)
+    max_txt_bytes = _positive_integer(raw, "JIRA_MCP_MAX_TXT_BYTES", 262144)
     data_dir = _abs_path("data")
-    os.makedirs(data_dir, exist_ok=True)
     return Config(
-        jira=jira,
-        web_port=int(web.get("port", 8766)),
-        max_txt_bytes=int(files.get("max_txt_bytes", 262144)),
+        jira=jira, web_port=web_port, max_txt_bytes=max_txt_bytes,
         operations_db_file=os.path.join(data_dir, "operations.sqlite3"),
         mcp_logs_db_file=os.path.join(data_dir, "mcp_logs.sqlite3"),
         execution_lock_file=os.path.join(data_dir, "jira_execution.lock"),
