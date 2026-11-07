@@ -832,7 +832,7 @@ def test_attachment_multi_path_materialization_validates_one_snapshot(
     assert operation.payload["comment"] == image
 
 
-def test_description_snapshot_is_copy_on_write(tmp_path) -> None:
+def test_description_snapshot_is_copy_on_write(tmp_path, cfg) -> None:
     path = tmp_path / "description.txt"
     path.write_text("snapshot", encoding="utf-8")
     untouched = {"labels": ["same"]}
@@ -863,7 +863,7 @@ def test_inline_description_snapshot_reuses_untouched_container() -> None:
     assert snapped["fields"] is fields
 
 
-def test_text_source_shape_is_strict_and_field_aware(tmp_path) -> None:
+def test_text_source_shape_is_strict_and_field_aware(tmp_path, cfg) -> None:
     path = tmp_path / "source.txt"
     path.write_text("text", encoding="utf-8")
     assert snapshot_text_source("inline", field_path="fields.description") == "inline"
@@ -1171,7 +1171,7 @@ def test_executor_falls_back_to_attachment_id_when_filename_is_missing(
 
 
 def test_executor_fails_when_id_lookup_still_has_no_filename(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, cfg
 ) -> None:
     path = tmp_path / "a.jpg"
     path.write_bytes(b"new")

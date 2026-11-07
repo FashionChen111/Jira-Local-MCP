@@ -16,13 +16,12 @@ class JiraHealthcheckError(RuntimeError):
 def verify_jira_connection(cfg: JiraConfig) -> None:
     client = None
     try:
-        authentication = {"token_auth": cfg.token} if cfg.auth_type == "pat" else {
-            "basic_auth": (cfg.username, cfg.password),
-        }
         client = JIRA(
             options={"server": cfg.url, "verify": cfg.verify_ssl},
+            token_auth=cfg.token if cfg.auth_type == "pat" else None,
+            basic_auth=(cfg.username, cfg.password) if cfg.auth_type == "basic" else None,
             timeout=cfg.timeout, get_server_info=False, max_retries=0,
-            logging=False, **authentication,
+            logging=False,
         )
         user = client.myself()
         if not isinstance(user, dict) or user.get("active") is False or not any(

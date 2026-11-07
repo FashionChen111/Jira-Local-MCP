@@ -194,7 +194,9 @@ SQLite 使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema versio
 
 - Python 3.10+。
 - Jira Server/Data Center。
-- Personal Access Token 或 Basic Auth。
+- Personal Access Token 或 Basic Auth，由项目根目录 `.env` 统一管理；不使用进程环境变量覆盖，不回退读取旧 YAML。
+- Windows/macOS 安装入口及 Linux Python 安装脚本，创建或复用 `.venv`，只读检查认证并生成本机 `MCP_SETUP.md`。
+- 已有 YAML 仅在 `.env` 不存在且用户同意时导入；保留原配置和 `data/`，本次配置升级不改变数据库结构。
 - 可配置 TLS 证书校验和 Jira 请求超时。
 - 可配置 Web 起始端口；端口占用时在后续 99 个端口内自动寻找可用项。
 - 可配置本地 `.txt` 描述文件大小上限，默认 256 KiB。
@@ -262,7 +264,7 @@ SQLite 使用 WAL、`synchronous=FULL`、外键、busy timeout 和 schema versio
 
 - 当前已实现行为：以代码与测试为准。
 - 产品定位和后续方向：以本 PRD 为准。
-- 安装、配置和 MCP Client 接入：以 `README.md` 与 `config.example.yaml` 为准。
+- 安装、配置和 MCP Client 接入：以 `README.md`、`.env.example` 与安装生成的 `MCP_SETUP.md` 为准。
 - Agent 开发约束与修改检查项：以 `AGENTS.md` 为准。
 
 ## 3.0 元数据与执行契约

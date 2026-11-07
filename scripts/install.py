@@ -9,6 +9,7 @@ import sys
 import tempfile
 import warnings
 from pathlib import Path
+from string import Template
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -292,3 +293,25 @@ def main() -> int:
         print("Usage: install.py [--edit]", file=sys.stderr)
         return 2
     return run_install(PROJECT_ROOT)
+
+
+def _write_agent_setup(root: Path, venv_python: Path) -> Path:
+    root = root.resolve()
+    command = str(venv_python.absolute())
+    args = [str(root / "server.py")]
+    config = {"mcpServers": {"jira-local-mcp": {"command": command, "args": args}}}
+    template = Template((root / "MCP_SETUP.template.md").read_text(encoding="utf-8"))
+    document = template.substitute(
+        SYSTEM={"win32": "Windows", "darwin": "macOS", "linux": "Linux"}.get(sys.platform, sys.platform),
+        PROJECT_DIR=json.dumps(str(root), ensure_ascii=False),
+        MCP_CONFIG=json.dumps(config, ensure_ascii=False, indent=2),
+        PYTHON_COMMAND=json.dumps(command, ensure_ascii=False),
+        SERVER_ARGS=json.dumps(args, ensure_ascii=False),
+    )
+    output = root / "MCP_SETUP.md"
+    output.write_text(document, encoding="utf-8", newline="\n")
+    return output
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

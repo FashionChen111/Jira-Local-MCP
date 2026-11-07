@@ -201,18 +201,49 @@ def test_invalid_existing_environment_not_deleted(tmp_path, monkeypatch):
 
 
 def test_tool_discovery_check_does_not_start_worker(tmp_path, monkeypatch, cfg):
+    import subprocess
+    real_run = subprocess.run
     environment(tmp_path)
     monkeypatch.setattr(install, 'ensure_configuration', lambda root: True)
     commands = []
     monkeypatch.setattr(install.subprocess, 'run', lambda command, **kwargs: commands.append(command))
     monkeypatch.setattr(install, '_write_agent_setup', lambda root, python: root / 'MCP_SETUP.md', raising=False)
     assert install.run_install(tmp_path) == 0
-    from core.executing import worker
-    def forbidden():
-        pytest.fail('tool discovery started execution worker')
-    monkeypatch.setattr(worker, 'start_worker', forbidden)
-    import sys
-    before = sys.modules.get('__main__')
-    # Execute the generated check itself, not a textual assertion about it.
-    exec(commands[2][2], {'__name__': '__main__'})
-    assert sys.modules.get('__main__') is before
+    # Run the emitted code in the same process boundary used by the installer.
+    import subprocess
+    source = Path(__file__).resolve().parents[1]
+    guard = (
+        "from core.executing import worker\n"
+        "def forbidden():\n"
+        "    raise AssertionError('tool discovery started execution worker')\n"
+        "worker.start_worker = forbidden\n"
+    )
+    result = real_run([install.sys.executable, "-c", guard + commands[2][2]], cwd=source, capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+def test_generated_document_contains_exact_absolute_json_without_reading_credentials(tmp_path):
+    import json
+    import re
+    root = tmp_path / '中文 Jira "path" with spaces'; root.mkdir()
+    source = Path(__file__).resolve().parents[1]
+    (root / 'MCP_SETUP.template.md').write_bytes((source / 'MCP_SETUP.template.md').read_bytes())
+    python = root / '.venv/bin/python'
+    (root / '.env').write_text('THIS FILE IS NOT VALID ENV SECRET')
+    document = install._write_agent_setup(root, python)
+    text = document.read_text()
+    configs = [json.loads(block) for block in re.findall(r'```json\n(.*?)\n```', text, re.S)]
+    config = next(value for value in configs if isinstance(value, dict) and 'mcpServers' in value)
+    entry = config['mcpServers']['jira-local-mcp']
+    assert entry['command'] == str(python.absolute())
+    assert entry['args'] == [str(root / 'server.py')]
+    assert 'SECRET' not in text
+    assert 'cwd' not in entry
+
+
+def test_missing_template_fails_install(tmp_path, monkeypatch):
+    environment(tmp_path)
+    monkeypatch.setattr(install, 'ensure_configuration', lambda root: True)
+    monkeypatch.setattr(install.subprocess, 'run', lambda *args, **kwargs: None)
+    assert install.run_install(tmp_path) == 1
+    assert not (tmp_path / 'MCP_SETUP.md').exists()

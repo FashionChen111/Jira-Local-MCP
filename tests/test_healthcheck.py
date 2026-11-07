@@ -33,10 +33,10 @@ def test_identity_check_uses_readonly_options_and_closes(monkeypatch, auth_type)
         assert kwargs['timeout'] == 30
         if auth_type == 'pat':
             assert kwargs['token_auth'] == 'SECRET'
-            assert 'basic_auth' not in kwargs
+            assert kwargs['basic_auth'] is None
         else:
             assert kwargs['basic_auth'] == ('user', 'SECRET')
-            assert 'token_auth' not in kwargs
+            assert kwargs['token_auth'] is None
         return client
     monkeypatch.setattr(healthcheck, 'JIRA', factory)
     healthcheck.verify_jira_connection(JiraConfig(url='https://jira.example.com', auth_type=auth_type, token='SECRET', username='user', password='SECRET'))

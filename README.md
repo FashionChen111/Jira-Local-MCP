@@ -56,35 +56,94 @@ MCP append → queued → Web submit → staged → executing → success/warnin
 
 `jira_issue_move_append` 保留公开签名，立即返回“不支持且未入队”。创建或克隆 Tool 返回的 operation ID 可直接作为后续修改的 `issue_key`，`add_issuelink.target_issue_key` 也支持相同引用；服务端会在生产者成功后原子物化两个顶层 Key。附件上传 operation ID 可在同一事务的 description、comment 和 worklog 中写成 `[^{{attachment:op-…}}]` 或 `!{{attachment:op-…}}!`；上传成功后，系统使用 Jira 返回的附件 ID 确认身份，并把引用原子替换为最终文件名。创建事务的初始 description 不允许附件引用，应采用“创建 → 上传 → 更新 description”。克隆来源仍必须是真实 Jira Key，也不接受自定义 placeholder。公共输出统一使用 `dependency_states` 表达两类依赖：键为依赖 operation ID，值为生命周期状态（未知为 `unknown`）；映射键顺序不代表执行顺序。
 
-## 配置与运行
+## 安装与配置
 
-要求 Python 3.10+。请先进入项目目录，并在你自己的 Python 环境中执行：
+要求 Python 3.10+，并能访问 Jira Server/Data Center。首次安装需要访问 Python 软件源。流程为：准备地址和凭据 → 运行 setup → 检查环境及认证 → 把生成的接入文档交给 Agent。
 
-```powershell
-python -m pip install -r requirements.txt
-python -m playwright install chromium
-Copy-Item config.example.yaml config.yaml
-python -m pytest tests/ -q
-python server.py
+### 首次安装
+
+1. 将项目放到准备长期使用的目录。
+2. Windows 双击 `setup.bat`；macOS 双击 `setup.command`。如无执行权限，在终端执行 `chmod +x "/完整路径/setup.command"`。Linux 运行 `python3 scripts/install.py`。
+3. 按提示填写 Jira 地址（含 `/jira` 等实际上下文路径）和认证方式；默认 PAT，也支持 Basic 用户名/密码。凭据输入不显示，不能隐藏输入的终端会被拒绝。
+4. 脚本创建或复用项目 `.venv`，安装受 `constraints.txt` 约束的运行依赖，然后检查 MCP 工具加载及只读 Jira 身份认证。
+5. 全部通过后，脚本生成 `MCP_SETUP.md` 并显示完整路径。将该文件作为附件交给 Agent，让其配置当前客户端。
+
+安装不需要 Playwright 或 Chromium。审核页通过系统默认浏览器打开。`.venv` 不可用时脚本会停止并提示，不自动删除环境；各阶段失败以非零退出码结束。认证检查只读取当前用户，不启动执行 worker，也不代表该账号对所有项目都有权限。
+
+### 配置文件
+
+连接信息仅从项目根目录 `.env` 读取，不从进程环境变量覆盖，也不回退读取 `config.yaml`。`.env.example` 是无凭据模板；不存在 `.env` 时由 setup 创建，已有文件不会被模板覆盖。
+
+```dotenv
+ATLASSIAN_JIRA_URL=https://jira.example.com/jira
+ATLASSIAN_JIRA_AUTH_TYPE=pat
+ATLASSIAN_JIRA_PAT=YOUR_PERSONAL_ACCESS_TOKEN
+
+# Basic 模式使用以下两项，同时将 AUTH_TYPE 改为 basic
+# ATLASSIAN_JIRA_USERNAME=your_username
+# ATLASSIAN_JIRA_PASSWORD=your_password
+
+# 可选，默认值如下
+# ATLASSIAN_JIRA_VERIFY_SSL=true
+# ATLASSIAN_JIRA_TIMEOUT_SECONDS=30
+# JIRA_MCP_WEB_PORT=8766
+# JIRA_MCP_MAX_TXT_BYTES=262144
 ```
 
-`server.py` 是 STDIO 服务，会等待 JSON-RPC 输入。Web 服务在 `jira_show_queue` 首次调用时延迟启动。stdout 只用于 MCP；运行日志只写脱敏 stderr。
+支持 UTF-8（含 BOM）、CRLF、注释和 `export KEY=value`。值不执行变量替换；单引号保留字面内容，双引号支持 JSON 转义（例如 `\\` 表示一个反斜线）。包含空格或 `#` 的凭据建议通过 setup 保存。TLS 默认校验，企业证书请按组织要求配置系统或 Requests 信任；不要为解决证书报错直接关闭校验。
 
-业务 Tool 位于 `core/mcp_tools/` 子包，按 Jira 查询、Jira 入队、本地队列及执行记录分模块，由 server 统一注册；审核页面入口、Prompt 和 Resource 保留在 server。本地状态查询按需读取：队列概览保留全局排序，详情按 ID 批量读取，活动执行状态在数据库中分页；每次请求的数据及 revisions 来自同一读事务。
+`.env` 中凭据为明文，请勿分享、提交或上传到对话；客户端配置不保存凭据。重复运行 setup 时按 Enter 保留已有值，凭据只提示“已配置”。仅编辑连接信息可执行 `python scripts/install.py --edit`；高级设置直接编辑 `.env`。修改后重启 MCP 和正在运行的审核服务，再运行 setup 或 `healthcheck.py` 检查。
 
-接入支持 STDIO MCP 的通用 Agent 工具时，可使用下面的 JSON 配置。将 `<JIRA_LOCAL_MCP_PROJECT_DIRECTORY>` 替换为你克隆本项目后的目录；如果 Agent 配置不支持 `cwd`，请改为在项目目录中启动 Agent，或按该 Agent 的配置格式为 `server.py` 指定项目路径。
+### 从旧版升级或移动目录
+
+先停止所有访问本项目 `data/` 的 MCP、Web 和 worker 进程。没有 `.env` 但存在旧 `config.yaml` 时，setup 会询问是否导入；只有明确选择 `y` 才导入，保留旧文件。导入需要在已有 PyYAML 的 Python 环境运行，可使用原项目虚拟环境的 Python 执行 `scripts/install.py`；缺少依赖时会给出提示。已有 `.env` 时直接使用它，不合并或覆盖旧 YAML。
+
+本次升级没有数据库结构变化，**保留原项目 `data/`，无需清库**。旧文件只用于一次性导入，新版运行时不读取它。迁移完成后旧文件仍含凭据，应自行妥善保管。
+
+如需换目录，在停止所有相关进程后保留 `.env` 和完整 `data/`（包括存在的 SQLite sidecar 文件），不要用空目录覆盖；不要跨电脑或操作系统复制 `.venv`。新目录重新运行 setup 并更新客户端启动路径。Windows 路径过长或移动后环境不可用时，由用户处理旧 `.venv` 后重装，脚本不自动删除。
+
+### 手动接入及检查
+
+生成的 `MCP_SETUP.md` 包含本机真实路径和客户端接入说明，不包含凭据。也可手动配置以下 JSON，将两处路径替换为当前电脑的绝对路径（Windows Python 使用 `.venv\\Scripts\\python.exe`，JSON 中反斜线需要转义）：
 
 ```json
 {
   "mcpServers": {
-    "jira-local": {
-      "command": "python",
-      "args": ["server.py"],
-      "cwd": "<JIRA_LOCAL_MCP_PROJECT_DIRECTORY>"
+    "jira-local-mcp": {
+      "command": "/absolute/path/Jira-Local-MCP/.venv/bin/python",
+      "args": ["/absolute/path/Jira-Local-MCP/server.py"]
     }
   }
 }
 ```
+
+无需设置 `cwd`。`server.py` 是 STDIO 服务，会等待 JSON-RPC 输入；直接启动它不表示连接检查完成。Web 在调用 `jira_show_queue` 时延迟启动，stdout 只用于 MCP，运行日志写脱敏 stderr。
+
+手动安装（先在项目目录自行创建 `.env`，已有文件不要覆盖）：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -c constraints.txt -r requirements.txt
+.venv/bin/python healthcheck.py
+```
+
+Windows 对应 `.venv\Scripts\python.exe`。纯手动安装后，可重新运行 setup 检查并生成接入文档。
+
+### 开发与验证
+
+使用已有环境；仅开发者需要额外安装检查和浏览器测试依赖：
+
+```bash
+.venv/bin/python -m pip install -c constraints.txt -r requirements-dev.txt
+.venv/bin/python -m playwright install chromium
+.venv/bin/python -m pytest tests/ --ignore=tests/test_web_browser.py -q
+.venv/bin/python -m pytest tests/test_web_browser.py -q
+.venv/bin/python -m pyright config.py env_file.py healthcheck.py scripts/install.py
+```
+
+浏览器与后端分别运行，避免当前 Playwright/AnyIO 在同一 pytest 进程中产生事件循环冲突。已有 Google Chrome 时可为浏览器测试添加 `--browser-channel=chrome`。
+
+业务 Tool 仍位于 `core/mcp_tools/`；本次配置与安装改造不调整业务调用链。依赖锁定快照来自 macOS Python 3.13 环境；其他系统和 Python 版本的实际安装需分别验证。
 
 ## Web API
 
