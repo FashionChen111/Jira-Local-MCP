@@ -221,3 +221,74 @@ def ensure_configuration(root: Path, *, edit: bool = False) -> bool:
     except (OSError, UnicodeError, ValueError, EOFError, KeyboardInterrupt):
         print("无法读取或保存配置，请检查 .env 的格式、必填项和目录权限；现有配置未覆盖。", file=sys.stderr)
     return False
+
+
+def run_install(root: Path) -> int:
+    if sys.version_info < (3, 10):
+        print("需要 Python 3.10 或更高版本。", file=sys.stderr)
+        return 1
+    if not ensure_configuration(root):
+        return 1
+    print("\n====== 环境配置 ======", flush=True)
+    child_env = os.environ.copy()
+    for name in ("PYTHONPATH", "PYTHONHOME"):
+        child_env.pop(name, None)
+    venv = root / ".venv"
+    venv_python = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    if not venv.exists():
+        print("正在创建虚拟环境，请稍候...", flush=True)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "venv", str(venv)], cwd=root, check=True, env=child_env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            print("创建虚拟环境失败，请检查 Python 和目录权限；现有环境未删除。", file=sys.stderr)
+            return 1
+    if not venv_python.is_file():
+        print("现有 .venv 不可用，请检查环境；脚本不会自动删除。", file=sys.stderr)
+        return 1
+    local_check = (
+        "import asyncio\n"
+        "from server import mcp\n"
+        "names = {tool.name for tool in asyncio.run(mcp.list_tools())}\n"
+        "assert {'jira_query_issue', 'jira_jql_search', 'jira_show_queue'} <= names, 'Required MCP tools are unavailable'\n"
+    )
+    steps = (
+        ("检查 pip", [str(venv_python), "-m", "pip", "--version"]),
+        ("安装依赖", [str(venv_python), "-m", "pip", "install", "-c", str(root / "constraints.txt"), "-r", str(root / "requirements.txt")]),
+        ("检查 MCP 工具", [str(venv_python), "-c", local_check]),
+        ("检查 Jira 认证", [str(venv_python), str(root / "healthcheck.py")]),
+    )
+    for label, command in steps:
+        print(f"{label}中，请稍候...", flush=True)
+        quiet = label in ("检查 pip", "安装依赖")
+        try:
+            subprocess.run(
+                command, cwd=root, check=True, env=child_env,
+                stdout=subprocess.DEVNULL if quiet else None,
+                stderr=subprocess.STDOUT if quiet else None,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            print(f"{label}失败，请检查网络、依赖源或项目环境；现有配置和环境保留。", file=sys.stderr)
+            return 1
+        print(f"{label}完成。", flush=True)
+    try:
+        document = _write_agent_setup(root, venv_python)
+    except (OSError, ValueError, KeyError):
+        print("生成接入文档失败，请检查 MCP_SETUP.template.md 和目录权限。", file=sys.stderr)
+        return 1
+    print(f"请将 {document} 发给 Agent 完成 MCP 配置。")
+    return 0
+
+
+def main() -> int:
+    if sys.argv[1:] == ["--edit"]:
+        if ensure_configuration(PROJECT_ROOT, edit=True):
+            print("配置处理完成，请重启 MCP 和审核服务；可重新运行安装检查。")
+            return 0
+        return 1
+    if sys.argv[1:]:
+        print("Usage: install.py [--edit]", file=sys.stderr)
+        return 2
+    return run_install(PROJECT_ROOT)

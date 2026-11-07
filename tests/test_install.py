@@ -140,3 +140,79 @@ def test_invalid_yaml_import_leaves_env_absent(tmp_path, monkeypatch, capsys, ya
     assert not (tmp_path / '.env').exists()
     output = capsys.readouterr()
     assert 'SECRET' not in output.out + output.err
+
+
+def environment(root):
+    executable = root / '.venv' / ('Scripts/python.exe' if install.sys.platform == 'win32' else 'bin/python')
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    return executable
+
+
+def test_install_reuses_environment_and_runs_safe_stages(tmp_path, monkeypatch):
+    executable = environment(tmp_path)
+    monkeypatch.setattr(install, 'ensure_configuration', lambda root: True)
+    commands = []
+    def run(command, **kwargs):
+        assert kwargs['cwd'] == tmp_path
+        assert kwargs['check'] is True
+        assert 'PYTHONPATH' not in kwargs['env']
+        commands.append(command)
+    monkeypatch.setenv('PYTHONPATH', 'unrelated')
+    monkeypatch.setattr(install.subprocess, 'run', run)
+    generated = []
+    monkeypatch.setattr(install, '_write_agent_setup', lambda root, python: generated.append((root, python)) or root / 'MCP_SETUP.md', raising=False)
+    assert install.run_install(tmp_path) == 0
+    assert len(commands) == 4
+    assert all(command[0] == str(executable) for command in commands)
+    assert commands[0][1:] == ['-m', 'pip', '--version']
+    assert commands[1][1:] == ['-m', 'pip', 'install', '-c', str(tmp_path / 'constraints.txt'), '-r', str(tmp_path / 'requirements.txt')]
+    assert commands[2][1] == '-c'
+    assert commands[3][1:] == [str(tmp_path / 'healthcheck.py')]
+    assert not any('playwright' in str(command) for command in commands)
+    assert generated == [(tmp_path, executable)]
+
+
+@pytest.mark.parametrize('failed_stage', range(4))
+def test_install_stops_at_failed_stage_without_document(tmp_path, monkeypatch, capsys, failed_stage):
+    environment(tmp_path)
+    monkeypatch.setattr(install, 'ensure_configuration', lambda root: True)
+    commands = []
+    def run(command, **kwargs):
+        commands.append(command)
+        if len(commands) == failed_stage + 1:
+            raise install.subprocess.CalledProcessError(3, command, stderr='SECRET')
+    monkeypatch.setattr(install.subprocess, 'run', run)
+    def unexpected(*args):
+        pytest.fail('document generated after failed check')
+    monkeypatch.setattr(install, '_write_agent_setup', unexpected, raising=False)
+    assert install.run_install(tmp_path) == 1
+    assert len(commands) == failed_stage + 1
+    output = capsys.readouterr()
+    assert 'SECRET' not in output.out + output.err
+
+
+def test_invalid_existing_environment_not_deleted(tmp_path, monkeypatch):
+    (tmp_path / '.venv').mkdir()
+    (tmp_path / '.venv/keep').write_bytes(b'keep')
+    monkeypatch.setattr(install, 'ensure_configuration', lambda root: True)
+    assert install.run_install(tmp_path) == 1
+    assert (tmp_path / '.venv/keep').read_bytes() == b'keep'
+
+
+def test_tool_discovery_check_does_not_start_worker(tmp_path, monkeypatch, cfg):
+    environment(tmp_path)
+    monkeypatch.setattr(install, 'ensure_configuration', lambda root: True)
+    commands = []
+    monkeypatch.setattr(install.subprocess, 'run', lambda command, **kwargs: commands.append(command))
+    monkeypatch.setattr(install, '_write_agent_setup', lambda root, python: root / 'MCP_SETUP.md', raising=False)
+    assert install.run_install(tmp_path) == 0
+    from core.executing import worker
+    def forbidden():
+        pytest.fail('tool discovery started execution worker')
+    monkeypatch.setattr(worker, 'start_worker', forbidden)
+    import sys
+    before = sys.modules.get('__main__')
+    # Execute the generated check itself, not a textual assertion about it.
+    exec(commands[2][2], {'__name__': '__main__'})
+    assert sys.modules.get('__main__') is before
