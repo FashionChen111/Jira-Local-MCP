@@ -67,3 +67,26 @@
 
 ## Execution Notes
 PYTHON 指原项目已有 .venv/bin/python 的绝对路径；不重建开发环境。每任务 task-start/task-done 保留记录。最终使用一次独立审查；不合并、不推送。本机 Windows 和真实账号未验证必须明确说明。
+
+## 独立审查与修复
+
+审查 aea3530..855fa6c，Critical 0、Important 5、Minor 0。5 项分别为：并发保存竞争、入口忽略项目虚拟环境、首次失败残留模板、E 编辑失败退出码丢失、旧 YAML 空值类型绕过。新增回归先观察到 12 个失败、30 个通过；集中修复后安装测试 42 项通过，定向 pyright 无错误。配置保存使用 POSIX/Windows advisory lock；初次发布使用同目录完整临时文件的硬链接原子创建。外部编辑器不遵守锁协议，检查替换之间仍有竞争限制。未修改核心业务模块。
+
+## 最终验证结果
+
+- 后端：410 passed，1 个既有 Starlette/httpx 弃用警告。
+- Chrome 浏览器：22 passed，1 个既有 pytest-playwright fixture 弃用警告。
+- 定向 pyright：0 errors / 0 warnings；setup.command 语法检查通过。
+- Python 3.10：4 个生产文件语法检查通过，51 个运行依赖元数据解析成功；未实际运行 Python 3.10。
+- Windows 未实测，真实 Jira 认证未执行；运行验证均使用脱敏数据及离线替身。
+- 原提交使用假配置的临时副本复现 5 个 AnyIO/Playwright 同进程冲突；回归分两个进程覆盖全部用例。
+
+执行决定及影响：
+1. 用户已要求按上一轮方案输出计划并执行，直接继续，无额外交接确认；理解有误时需返工安装边界。
+2. 使用原项目已有虚拟环境验证隔离工作区，避免重建环境；不证明其他 Python 版本的实际安装。
+3. 新增 config_from_values 复用安装前配置校验，避免写入未验证凭据；新增一个安装侧消费的共享接口。
+4. 三个原有测试补充 cfg fixture，消除对真实配置的隐式依赖；实际账号集成验证仍需另行执行。
+5. constraints 为 Python 3.10/3.11 增加条件版本，避免快照中较新依赖阻断最低版本；低版本仍需实际运行验证。
+6. 全套验证分为后端和 Chrome 两个进程，避免已复现的既有事件循环冲突；默认单次 pytest 命令仍有上述既有失败。
+
+独立审查的 5 项 Important 全部完成一次修复及回归，未暂缓 Minor。BAT 使用 .gitattributes 指定 CRLF 检出并规范仓库文本。改动保留在 Codex 管理的隔离工作区，未合并、推送或发布。

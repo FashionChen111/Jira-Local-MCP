@@ -10,6 +10,8 @@ import tempfile
 import warnings
 from pathlib import Path
 from string import Template
+from contextlib import contextmanager
+from collections.abc import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -79,7 +81,32 @@ def _copy_config_permissions(source: Path, destination: Path) -> None:
         free(descriptor)
 
 
-def _save_configuration(path: Path, original: bytes, changes: dict[str, str]) -> None:
+@contextmanager
+def _configuration_lock(path: Path) -> Iterator[None]:
+    # Keep this inode: unlinking a lock file permits competing writers to lock different files.
+    descriptor = os.open(path.with_name(path.name + ".setup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "r+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _save_configuration(path: Path, original: bytes, changes: dict[str, str], *, create: bool = False) -> None:
     text = original.decode("utf-8-sig")
     literals = {key: _env_literal(key, value) for key, value in changes.items()}
     seen: set[str] = set()
@@ -103,19 +130,24 @@ def _save_configuration(path: Path, original: bytes, changes: dict[str, str]) ->
             result += newline
         result += f"{key}={literals[key]}{newline}"
     data = result.encode("utf-8-sig" if original.startswith(b"\xef\xbb\xbf") else "utf-8")
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".env.", delete=False) as handle:
-            temporary = Path(handle.name)
-        _copy_config_permissions(path, temporary)
-        temporary.write_bytes(data)
-        if path.read_bytes() != original:
-            raise ValueError("配置文件在输入期间发生变化，请重新运行安装。")
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
+    with _configuration_lock(path):
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".env.", delete=False) as handle:
+                temporary = Path(handle.name)
+            if not create:
+                _copy_config_permissions(path, temporary)
+            temporary.write_bytes(data)
+            if create:
+                # Publish complete contents atomically; an existing .env is never overwritten.
+                os.link(temporary, path)
+            else:
+                if path.read_bytes() != original:
+                    raise ValueError("配置文件在输入期间发生变化，请重新运行安装。")
+                os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def _legacy_values(path: Path) -> dict[str, str]:
@@ -143,10 +175,11 @@ def _legacy_values(path: Path) -> dict[str, str]:
     if type(verify) is not bool:
         raise ValueError("旧配置 verify_ssl 必须是布尔值")
     values["ATLASSIAN_JIRA_VERIFY_SSL"] = str(verify).lower()
+    sections = {name: {} if raw.get(name) is None else raw[name] for name in ("web", "files")}
     for section, key, new_key, default in (
         (jira, "timeout", "ATLASSIAN_JIRA_TIMEOUT_SECONDS", 30),
-        (raw.get("web") or {}, "port", "JIRA_MCP_WEB_PORT", 8766),
-        (raw.get("files") or {}, "max_txt_bytes", "JIRA_MCP_MAX_TXT_BYTES", 262144),
+        (sections["web"], "port", "JIRA_MCP_WEB_PORT", 8766),
+        (sections["files"], "max_txt_bytes", "JIRA_MCP_MAX_TXT_BYTES", 262144),
     ):
         if not isinstance(section, dict):
             raise ValueError("旧配置结构不正确")
@@ -207,12 +240,8 @@ def ensure_configuration(root: Path, *, edit: bool = False) -> bool:
         config_from_values({**values, **changes})
         changes = {key: value for key, value in changes.items()
                    if value != original_values.get(key, "pat" if key == "ATLASSIAN_JIRA_AUTH_TYPE" else "")}
-        if not exists:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(original)
-        if changes:
-            _save_configuration(path, original, changes)
+        if changes or not exists:
+            _save_configuration(path, original, changes, create=not exists)
             print("已更新 .env。")
         else:
             print("已保留现有配置。")

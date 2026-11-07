@@ -85,7 +85,7 @@ def test_concurrent_change_is_not_overwritten(tmp_path):
     with pytest.raises(ValueError):
         install._save_configuration(path, b'KEY=old\n', {'KEY': 'new'})
     assert path.read_bytes() == b'KEY=edited\n'
-    assert list(tmp_path.iterdir()) == [path]
+    assert sorted(item.name for item in tmp_path.iterdir()) == ['.env', '.env.setup.lock']
 
 
 def test_failed_replace_preserves_original(tmp_path, monkeypatch):
@@ -97,7 +97,7 @@ def test_failed_replace_preserves_original(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         install._save_configuration(path, path.read_bytes(), {'KEY': 'new'})
     assert path.read_bytes() == b'KEY=old\n'
-    assert list(tmp_path.iterdir()) == [path]
+    assert sorted(item.name for item in tmp_path.iterdir()) == ['.env', '.env.setup.lock']
 
 
 def test_import_yaml_preserves_original_and_data(tmp_path, monkeypatch):
@@ -247,3 +247,97 @@ def test_missing_template_fails_install(tmp_path, monkeypatch):
     monkeypatch.setattr(install.subprocess, 'run', lambda *args, **kwargs: None)
     assert install.run_install(tmp_path) == 1
     assert not (tmp_path / 'MCP_SETUP.md').exists()
+
+
+def test_two_setup_writers_cannot_both_replace_same_original(tmp_path, monkeypatch):
+    import threading
+    path = tmp_path / '.env'
+    original = b'A=old\nB=old\n'; path.write_bytes(original)
+    replacing = threading.Event(); release = threading.Event()
+    real_replace = os.replace
+    results = []
+    def replace(source, destination):
+        if threading.current_thread().name == 'first-writer':
+            replacing.set()
+            assert release.wait(5)
+        real_replace(source, destination)
+    monkeypatch.setattr(os, 'replace', replace)
+    def save(key):
+        try:
+            install._save_configuration(path, original, {key: 'new'})
+            results.append('saved')
+        except (ValueError, OSError):
+            results.append('rejected')
+    first = threading.Thread(target=save, args=('A',), name='first-writer')
+    first.start()
+    try:
+        assert replacing.wait(5)
+        save('B')
+    finally:
+        release.set(); first.join(5)
+    assert not first.is_alive()
+    assert sorted(results) == ['rejected', 'saved']
+    assert path.read_bytes() == b'A="new"\nB=old\n'
+
+
+def test_first_import_save_failure_can_be_retried(tmp_path, monkeypatch):
+    prepare(tmp_path)
+    (tmp_path / 'config.yaml').write_text('jira: {url: https://jira.example.com, token: SECRET}\n')
+    answers(monkeypatch, ['y', '', ''], [''])
+    with monkeypatch.context() as patch:
+        def fail(*args, **kwargs):
+            raise OSError('disk failure')
+        patch.setattr(os, 'replace', fail)
+        patch.setattr(os, 'link', fail)
+        assert not install.ensure_configuration(tmp_path)
+    assert not (tmp_path / '.env').exists()
+    answers(monkeypatch, ['y', '', ''], [''])
+    assert install.ensure_configuration(tmp_path)
+    assert config.load_config(str(tmp_path / '.env')).jira.token == 'SECRET'
+
+
+@pytest.mark.parametrize('section', ['web', 'files'])
+@pytest.mark.parametrize('value', ['false', '0', '[]', '""'])
+def test_falsey_yaml_sections_are_rejected(tmp_path, monkeypatch, section, value):
+    prepare(tmp_path)
+    (tmp_path / 'config.yaml').write_text(f'jira: {{url: https://jira.example.com, token: SECRET}}\n{section}: {value}\n')
+    answers(monkeypatch, ['y'])
+    assert not install.ensure_configuration(tmp_path)
+    assert not (tmp_path / '.env').exists()
+
+
+def shell_setup(root, *, old_system=False):
+    source = Path(__file__).resolve().parents[1]
+    root.mkdir()
+    command = root / 'setup.command'
+    command.write_bytes((source / 'setup.command').read_bytes())
+    executable = root / '.venv/bin/python'; executable.parent.mkdir(parents=True)
+    stub = '#!/bin/sh\nif [ "$1" = "-c" ]; then exit 0; fi\nprintf "%s\\n" "$@" >> "$JIRA_TEST_CALLS"\nif [ "$2" = "--edit" ]; then exit "$JIRA_TEST_EDIT_STATUS"; fi\nexit "$JIRA_TEST_INSTALL_STATUS"\n'
+    executable.write_text(stub); executable.chmod(0o755)
+    bindir = root / 'bin'; bindir.mkdir()
+    system = bindir / 'python3'
+    system.write_text('#!/bin/sh\nexit 1\n' if old_system else stub); system.chmod(0o755)
+    return command, bindir
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX launcher')
+def test_launcher_prefers_existing_environment_with_old_system_python(tmp_path):
+    import subprocess
+    root = tmp_path / '中文 Jira with spaces'
+    command, bindir = shell_setup(root, old_system=True)
+    log = root / 'calls'
+    env = {**os.environ, 'PATH': str(bindir) + ':/usr/bin:/bin', 'JIRA_TEST_CALLS': str(log), 'JIRA_TEST_INSTALL_STATUS': '0', 'JIRA_TEST_EDIT_STATUS': '0'}
+    result = subprocess.run(['/bin/sh', str(command)], input='\n', text=True, capture_output=True, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log.read_text().splitlines() == [str(root / 'scripts/install.py')]
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX launcher')
+@pytest.mark.parametrize('initial,edit,expected', [(0, 7, 7), (4, 0, 4), (0, 0, 0)])
+def test_launcher_preserves_install_and_edit_failure_status(tmp_path, initial, edit, expected):
+    import subprocess
+    root = tmp_path / 'Jira setup'
+    command, bindir = shell_setup(root)
+    env = {**os.environ, 'PATH': str(bindir) + ':/usr/bin:/bin', 'JIRA_TEST_CALLS': str(root / 'calls'), 'JIRA_TEST_INSTALL_STATUS': str(initial), 'JIRA_TEST_EDIT_STATUS': str(edit)}
+    result = subprocess.run(['/bin/sh', str(command)], input='E\n\n', text=True, capture_output=True, env=env)
+    assert result.returncode == expected, result.stdout + result.stderr

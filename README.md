@@ -65,7 +65,7 @@ MCP append → queued → Web submit → staged → executing → success/warnin
 1. 将项目放到准备长期使用的目录。
 2. Windows 双击 `setup.bat`；macOS 双击 `setup.command`。如无执行权限，在终端执行 `chmod +x "/完整路径/setup.command"`。Linux 运行 `python3 scripts/install.py`。
 3. 按提示填写 Jira 地址（含 `/jira` 等实际上下文路径）和认证方式；默认 PAT，也支持 Basic 用户名/密码。凭据输入不显示，不能隐藏输入的终端会被拒绝。
-4. 脚本创建或复用项目 `.venv`，安装受 `constraints.txt` 约束的运行依赖，然后检查 MCP 工具加载及只读 Jira 身份认证。
+4. 入口优先使用可用的项目 `.venv` Python；没有可用项目解释器时再选择系统 Python。脚本创建或复用项目 `.venv`，安装受 `constraints.txt` 约束的运行依赖，然后检查 MCP 工具加载及只读 Jira 身份认证。
 5. 全部通过后，脚本生成 `MCP_SETUP.md` 并显示完整路径。将该文件作为附件交给 Agent，让其配置当前客户端。
 
 安装不需要 Playwright 或 Chromium。审核页通过系统默认浏览器打开。`.venv` 不可用时脚本会停止并提示，不自动删除环境；各阶段失败以非零退出码结束。认证检查只读取当前用户，不启动执行 worker，也不代表该账号对所有项目都有权限。
@@ -92,7 +92,9 @@ ATLASSIAN_JIRA_PAT=YOUR_PERSONAL_ACCESS_TOKEN
 
 支持 UTF-8（含 BOM）、CRLF、注释和 `export KEY=value`。值不执行变量替换；单引号保留字面内容，双引号支持 JSON 转义（例如 `\\` 表示一个反斜线）。包含空格或 `#` 的凭据建议通过 setup 保存。TLS 默认校验，企业证书请按组织要求配置系统或 Requests 信任；不要为解决证书报错直接关闭校验。
 
-`.env` 中凭据为明文，请勿分享、提交或上传到对话；客户端配置不保存凭据。重复运行 setup 时按 Enter 保留已有值，凭据只提示“已配置”。仅编辑连接信息可执行 `python scripts/install.py --edit`；高级设置直接编辑 `.env`。修改后重启 MCP 和正在运行的审核服务，再运行 setup 或 `healthcheck.py` 检查。
+`.env` 中凭据为明文，请勿分享、提交或上传到对话；客户端配置不保存凭据。重复运行 setup 时按 Enter 保留已有值，凭据只提示“已配置”。setup 保存时使用本地 `.env.setup.lock` 串行化多个安装程序，并检查文件是否已被修改；锁文件不含凭据。外部编辑器不遵守该锁，仍可能在最终检查与替换之间产生竞争，因此不要同时手动编辑和运行 setup。首次创建只发布完整配置，失败后可重试导入。
+
+仅编辑连接信息可执行 `python scripts/install.py --edit`；高级设置直接编辑 `.env`。修改后重启 MCP 和正在运行的审核服务，再运行 setup 或 `healthcheck.py` 检查。
 
 ### 从旧版升级或移动目录
 

@@ -1,0 +1,2 @@
+# Keep the Windows launcher usable on checkout while storing normalized text.
+setup.bat text eol=crlf
