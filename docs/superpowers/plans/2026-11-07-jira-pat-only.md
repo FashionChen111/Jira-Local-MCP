@@ -51,3 +51,7 @@ assert not (root / '.env').exists()  # Basic 导入拒绝
 - 定向 pyright：0 errors / 0 warnings，git diff --check 通过。
 - 沙箱内一次 Web 启动测试被本机端口权限阻断；获准运行后完整通过。
 - Windows 和真实 Jira 认证未实测；未读取真实配置或使用用户凭据。
+
+## 最终独立审查
+
+审查范围 b2ddfce..ce42f67。独立审查未发现 Critical/Important/Minor 问题，Declined to judge 为空；独立复跑 81 项定向测试通过。配置模型、两个 SDK 入口、安装提示、旧配置拒绝、日志脱敏消费者和原有保存保护均完成核对。无执行方案偏离或暂缓问题。代码保留在当前隔离工作区，未合并、推送或修改用户真实配置。
