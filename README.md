@@ -147,12 +147,15 @@ Windows 对应 `.venv\Scripts\python.exe`。纯手动安装后，可重新运行
 所有 API 仅接受有效浏览器会话。页面、API 和 ETag `304` 都参与滚动续期；旧会话 ID 不延长，只在自身原到期时间前继续容忍并发在途请求。停止请求后，最后一个有效凭据最多再存活 15 分钟；首次收到 `403` 后，页面会停止轮询、禁用审核控件并提示重新调用 `jira_show_queue`：
 
 - `GET /api/state`：队列、执行区和 revisions，支持 ETag/304。
+- `POST /api/issue-fields`、`POST /api/issue-transition`、`POST /api/issue-preview`：受保护的 Jira 只读预览接口，分别读取字段当前值、状态流转详情和事务全部可编辑字段。
 - `POST /api/queue/cancel`、`POST /api/queue/submit`；待审队列完全自动排序，不提供 reorder API。
 - cancel 请求只接受 `operation_ids` 与 `expected_queue_revision`，不再接受 `cascade_confirmed`。页面确认依赖范围后重发完整 ID 列表并沿用首次请求 revision；与 MCP 共用依赖校验和取消事务。本次变更不修改数据库 schema。
 - `POST /api/execution/indeterminate/resolve`、`/held/resolve`；不确定的附件上传标记为已生效时，前者要求通过 `attachment: {id, filename}` 提供已确认附件身份，返回 `attachment_results` 数组。
 - `GET /api/execution-history`：UTC 时间范围和分页。
 
 审核页面静态资源全部本地化，并启用 CSP、frame 防护、`nosniff`、`no-referrer` 和 `no-store`。
+
+审核台按待审核、执行中、需要处理和执行历史分区；待审核操作支持按事务分组、搜索和风险/类型筛选。字段更新和事务类型变更会通过受保护的本地接口按需读取 Jira 当前字段，与待写入值逐字段对照；状态流转以“字段 / 原值 / 修改后”表格展示当前状态和目标状态；创建/克隆操作展示将写入的新字段，不伪造旧值。页面另提供独立的字段对比预览，可读取事务当前全部可编辑字段并生成标明为示例的修改值；预览不会创建审核操作或写入 Jira。当前值只代表页面查看时的 Jira 状态，执行前可能被其他用户修改；读取失败会明确显示，不能据此把空值当成 Jira 当前值。
 
 ## 已知边界
 

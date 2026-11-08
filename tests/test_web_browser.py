@@ -132,17 +132,82 @@ def test_warning_clone_history_and_review_metadata_render_as_text(page, cfg, mon
         base = _serve(page, cfg, monkeypatch, _state([], [clone, worklog, transition]))
         page.unroute("**/api/execution-history**")
         page.route("**/api/execution-history**", lambda route: route.fulfill(json={"items": [history], "total": 1, "page": 1, "page_size": 50}))
+        page.route(
+            "**/api/issue-transition",
+            lambda route: route.fulfill(
+                json={
+                    "issue_key": "PROJ-1",
+                    "current_status": "处理中",
+                    "transition": {
+                        "id": "21",
+                        "name": "任务结束",
+                        "target_status": "完成",
+                    },
+                }
+            ),
+        )
         page.goto(web_app.create_confirmation_url(base))
+        page.locator(f'.queue-item[data-operation-id="{worklog["operation_id"]}"]').click()
+        expect(page.get_by_text("估算影响：重设剩余估算 3h", exact=True)).to_be_visible()
+        page.locator(f'.queue-item[data-operation-id="{transition["operation_id"]}"]').click()
+        expect(page.get_by_role("table", name="Jira 字段变更前后对比")).to_be_visible()
+        expect(page.locator(".transition-section .diff-header > span")).to_have_text(
+            ["字段", "原值", "修改后"]
+        )
+        expect(page.locator(".transition-section .diff-row > div")).to_have_text(
+            ["状态", "处理中", "完成"]
+        )
+        page.locator(f'.queue-item[data-operation-id="{clone["operation_id"]}"]').click()
+        expect(page.locator(".diff-field")).to_contain_text("customfield_1")
+        expect(page.locator(".diff-value.after")).to_have_text("value")
+        page.locator("#tab-history").click()
         expect(page.locator(".status.warning")).to_have_text("成功（有异常）")
         expect(page.get_by_text("已创建事务：PROJ-20", exact=True)).to_be_visible()
-        expect(page.get_by_text("估算影响：重设剩余估算 3h", exact=True)).to_be_visible()
-        expect(page.get_by_text("transition_id：21", exact=True)).to_be_visible()
-        expect(page.get_by_text("克隆覆盖字段：customfield_1", exact=True).first).to_be_visible()
         expect(page.get_by_text("附件处理：later.txt（源 ID 2）：未尝试", exact=True)).to_be_visible()
         assert page.locator("img").count() == 0
         assert page.evaluate("window.injected") is None
         screenshot = tmp_path / "warning-clone-review.png"
         page.screenshot(path=str(screenshot), full_page=True)
+    finally:
+        _stop()
+
+
+def test_transition_detail_shows_status_change_not_only_transition_id(page, cfg, monkeypatch):
+    transition = _operation(
+        "op-" + "c" * 32,
+        operation_type="transition_issue",
+        issue_key="VODCER-233",
+        payload={"transition_id": "21", "fields": {}, "comment": None},
+        description="VODCER-233 状态流转「21」",
+    )
+    try:
+        base = _serve(page, cfg, monkeypatch, _state([], [transition]))
+        page.route(
+            "**/api/issue-transition",
+            lambda route: route.fulfill(
+                json={
+                    "issue_key": "VODCER-233",
+                    "current_status": "处理中",
+                    "transition": {
+                        "id": "21",
+                        "name": "任务结束",
+                        "target_status": "完成",
+                    },
+                }
+            ),
+        )
+        page.goto(web_app.create_confirmation_url(base))
+        expect(page.locator(".detail-title")).to_have_text("VODCER-233 状态变更")
+        expect(page.locator(".transition-section h3")).to_have_text("变更对比")
+        expect(page.locator(".transition-section .diff-header > span")).to_have_text(
+            ["字段", "原值", "修改后"]
+        )
+        expect(page.locator(".transition-section .diff-row > div")).to_have_text(
+            ["状态", "处理中", "完成"]
+        )
+        expect(page.locator(".transition-summary")).to_have_count(0)
+        expect(page.get_by_text("transition_id：21", exact=True)).to_have_count(0)
+        expect(page.locator(".operation-detail details summary")).to_have_text("查看完整参数")
     finally:
         _stop()
 
@@ -156,15 +221,17 @@ def test_attachment_recovery_submits_confirmed_identity(page, cfg, monkeypatch):
     }
     state = _state([])
     state["execution"]["indeterminate"] = [operation]
-    answers = iter(["55", "a-final.jpg"])
     try:
         base = _serve(page, cfg, monkeypatch, state)
         page.route("**/api/execution/indeterminate/resolve",
                    lambda route: route.fulfill(json={"attachment_results": []}))
-        page.on("dialog", lambda dialog: dialog.accept(next(answers)))
         page.goto(web_app.create_confirmation_url(base))
+        page.locator("#tab-attention").click()
         with page.expect_request("**/api/execution/indeterminate/resolve") as request:
             page.get_by_role("button", name="已生效", exact=True).click()
+            page.locator("#resolution-attachment_id").fill("55")
+            page.locator("#resolution-filename").fill("a-final.jpg")
+            page.get_by_role("button", name="确认信息").click()
         body = request.value.post_data_json
         assert body["attachment"] == {"id": "55", "filename": "a-final.jpg"}
         assert "attachment_result" not in body
@@ -206,6 +273,163 @@ def test_malicious_values_render_inertly_and_queue_has_no_sort_controls(
         assert card.locator("button").count() == 0
         assert "转为零散" not in page.locator("body").text_content()
         assert not any("/api/queue/reorder" in url for url in requested)
+    finally:
+        _stop()
+
+
+def test_field_update_shows_live_before_and_proposed_values(page, cfg, monkeypatch):
+    operation = _operation(
+        "op-" + "7" * 32,
+        operation_type="update_field",
+        issue_key="PROJ-7",
+        payload={
+            "fields": {
+                "summary": "New summary",
+                "priority": {"name": "High"},
+            }
+        },
+        description="更新摘要和优先级",
+    )
+    state = _state(
+        [
+            {
+                "group_key": "PROJ-7",
+                "kind": "jira_issue",
+                "operations": [operation],
+            }
+        ]
+    )
+    requested: list[dict] = []
+    try:
+        base = _serve(page, cfg, monkeypatch, state)
+
+        def fields_route(route):
+            requested.append(route.request.post_data_json)
+            route.fulfill(
+                json={
+                    "key": "PROJ-7",
+                    "fields": {
+                        "summary": "Old summary",
+                        "priority": {"name": "Medium"},
+                    },
+                }
+            )
+
+        page.route("**/api/issue-fields", fields_route)
+        page.goto(web_app.create_confirmation_url(base))
+        expect(page.get_by_role("table", name="Jira 字段变更前后对比")).to_be_visible()
+        expect(page.locator(".diff-row")).to_have_count(2)
+        expect(page.locator(".diff-value").nth(0)).to_have_text("Old summary")
+        expect(page.locator(".diff-value.after").nth(0)).to_have_text("New summary")
+        expect(page.locator(".diff-value").nth(2)).to_have_text("Medium")
+        expect(page.locator(".diff-value.after").nth(1)).to_have_text("High")
+        assert requested == [
+            {"issue_key": "PROJ-7", "fields": ["summary", "priority"]}
+        ]
+        assert page.locator(".operation-detail pre").count() == 1
+    finally:
+        _stop()
+
+
+def test_field_preview_shows_all_rows_without_adding_queue_operations(
+    page, cfg, monkeypatch
+):
+    state = _state([])
+    requested: list[dict] = []
+    mutating_requests: list[str] = []
+    try:
+        base = _serve(page, cfg, monkeypatch, state)
+
+        def preview_route(route):
+            requested.append(route.request.post_data_json)
+            route.fulfill(
+                json={
+                    "key": "PROJ-9",
+                    "fields": [
+                        {
+                            "field_id": "summary",
+                            "name": "Summary",
+                            "schema": {"type": "string"},
+                            "current_value": "Old summary",
+                            "has_current_value": True,
+                        },
+                        {
+                            "field_id": "customfield_123",
+                            "name": "Count",
+                            "schema": {"type": "number"},
+                            "current_value": 3,
+                            "has_current_value": True,
+                        },
+                    ],
+                }
+            )
+
+        page.route("**/api/issue-preview", preview_route)
+        page.on(
+            "request",
+            lambda request: mutating_requests.append(request.url)
+            if request.method == "POST"
+            and "/api/issue-preview" not in request.url
+            else None,
+        )
+        page.goto(web_app.create_confirmation_url(base))
+        page.get_by_role("button", name="字段对比预览").click()
+        page.get_by_label("Jira 事务 Key").fill("PROJ-9")
+        page.get_by_role("button", name="读取字段").click()
+        expect(page.get_by_role("table", name="Jira 字段变更前后对比")).to_be_visible()
+        expect(page.locator("#field-preview-results .diff-row")).to_have_count(2)
+        expect(
+            page.locator("#field-preview-results .diff-row").nth(0).locator(":scope > div")
+        ).to_have_text(["Summary预览修改", "Old summary", "Old summary（预览修改）"])
+        expect(
+            page.locator("#field-preview-results .diff-row").nth(1).locator(":scope > div")
+        ).to_have_text(["Count预览修改", "3", "4"])
+        expect(page.get_by_text("不会写入 Jira，也不会进入审核队列")).to_be_visible()
+        assert requested == [{"issue_key": "PROJ-9"}]
+        assert mutating_requests == []
+    finally:
+        _stop()
+
+
+def test_create_operation_marks_fields_as_new_without_fetching_issue(page, cfg, monkeypatch):
+    operation = _operation(
+        "op-" + "8" * 32,
+        operation_type="create_issue",
+        issue_key=None,
+        payload={
+            "project_key": "PROJ",
+            "issue_type_id": "10001",
+            "summary": "New issue",
+            "description": "First description",
+        },
+        description="创建事务：New issue",
+    )
+    state = _state(
+        [
+            {
+                "group_key": operation["operation_id"],
+                "kind": "pending_issue",
+                "producer_state": "queued",
+                "operations": [operation],
+            }
+        ]
+    )
+    field_requests: list[str] = []
+    try:
+        base = _serve(page, cfg, monkeypatch, state)
+        page.on(
+            "request",
+            lambda request: field_requests.append(request.url)
+            if request.url.endswith("/api/issue-fields")
+            else None,
+        )
+        page.goto(web_app.create_confirmation_url(base))
+        expect(page.get_by_role("table", name="Jira 字段变更前后对比")).to_be_visible()
+        expect(page.locator(".diff-status")).to_have_text(["新增", "新增", "新增", "新增"])
+        expect(page.locator(".diff-value.empty").first).to_have_text("尚无 Jira 当前值")
+        expect(page.locator(".diff-value.after").nth(0)).to_have_text("PROJ")
+        expect(page.locator(".diff-value.after").nth(2)).to_have_text("New issue")
+        assert field_requests == []
     finally:
         _stop()
 
@@ -295,14 +519,13 @@ def test_full_parameters_combine_both_top_level_keys_with_payload(
     try:
         base = _serve(page, cfg, monkeypatch, state)
         page.goto(web_app.create_confirmation_url(base))
-        card = page.locator(f'[data-operation-id="{operation_id}"]')
-        card.locator("summary").click()
-        expect(card.locator("pre")).to_contain_text('"issue_key": "PROJ-1"')
-        expect(card.locator("pre")).to_contain_text(
+        page.locator("#detail-content details summary").click()
+        expect(page.locator("#detail-content details pre")).to_contain_text('"issue_key": "PROJ-1"')
+        expect(page.locator("#detail-content details pre")).to_contain_text(
             '"target_issue_key": "PROJ-2"'
         )
-        expect(card.locator("pre")).to_contain_text('"link_type": "Relates"')
-        assert "field_references" not in card.locator("pre").text_content()
+        expect(page.locator("#detail-content details pre")).to_contain_text('"link_type": "Relates"')
+        assert "field_references" not in page.locator("#detail-content details pre").text_content()
     finally:
         _stop()
 
@@ -351,13 +574,16 @@ def test_high_risk_confirmation_and_history_pagination(page, cfg, monkeypatch) -
         page.unroute("**/api/execution-history**")
         page.route("**/api/execution-history**", history_route)
         page.route("**/api/queue/submit", submit_route)
-        page.on("dialog", lambda dialog: dialog.accept())
         page.goto(web_app.create_confirmation_url(base))
+        page.locator("#tab-history").click()
         expect(page.locator("#history-page")).to_have_text("1 / 2")
         page.locator("#history-next").click()
         expect(page.locator("#history-page")).to_have_text("2 / 2")
         assert history_pages[-1] == 2
+        page.locator("#tab-queue").click()
         page.locator("#submit-selected").click()
+        expect(page.get_by_role("dialog", name="确认提交高风险操作")).to_be_visible()
+        page.locator("#action-confirm-accept").click()
         deadline = time.monotonic() + 5
         while len(submitted) < 2 and time.monotonic() < deadline:
             page.wait_for_timeout(50)
@@ -416,14 +642,6 @@ def test_cancel_scope_confirmation_and_original_revision(page, cfg, monkeypatch,
     child_id = "op-" + "b" * 32
     state = _pending_state(producer_id, child_id)
     requests: list[dict] = []
-    dialogs: list[str] = []
-
-    def on_dialog(dialog):
-        dialogs.append(dialog.message)
-        if outcome == "initial_decline":
-            dialog.dismiss()
-        else:
-            dialog.accept()
 
     try:
         base = _serve(page, cfg, monkeypatch, state)
@@ -444,13 +662,19 @@ def test_cancel_scope_confirmation_and_original_revision(page, cfg, monkeypatch,
                 route.fulfill(json={"cancelled_operation_ids": [producer_id, child_id], "queue_revision": 3})
 
         page.route("**/api/queue/cancel", cancel_route)
-        page.on("dialog", on_dialog)
         page.goto(web_app.create_confirmation_url(base))
         page.locator(f'[data-operation-id="{child_id}"] input[type="checkbox"]').uncheck()
         page.locator("#cancel-selected").click()
+        action_dialog = page.get_by_role("dialog", name="确认取消待审核操作")
+        expect(action_dialog).to_be_visible()
+        if outcome == "initial_decline":
+            page.locator("#action-confirm-cancel").click()
+        else:
+            page.locator("#action-confirm-accept").click()
         scope = page.get_by_role("dialog", name="确认取消范围")
         if outcome == "initial_decline":
             assert requests == []
+            expect(action_dialog).not_to_be_visible()
             expect(scope).not_to_be_visible()
         else:
             expect(scope).to_be_visible()
@@ -490,7 +714,6 @@ def test_cancel_scope_confirmation_and_original_revision(page, cfg, monkeypatch,
                 assert requests[1] == {
                     "operation_ids": [producer_id, child_id], "expected_queue_revision": 2,
                 }
-        assert len(dialogs) == 1
     finally:
         _stop()
 
@@ -524,11 +747,11 @@ def test_browser_cancels_real_queue_dependency_scope(page, queue, cfg, monkeypat
     try:
         base = web_app.ensure_started()
         page.on("request", on_request)
-        page.on("dialog", lambda dialog: dialog.accept())
         page.goto(web_app.create_confirmation_url(base))
         page.locator(f'[data-operation-id="{child.operation_id}"] input[type="checkbox"]').uncheck()
         page.locator(f'[data-operation-id="{attachment.operation_id}"] input[type="checkbox"]').uncheck()
         page.locator("#cancel-selected").click()
+        page.locator("#action-confirm-accept").click()
         scope = page.get_by_role("dialog", name="确认取消范围")
         expect(scope.locator(".cancel-scope-label")).to_have_text(["原先选择", "新增依赖", "新增依赖"])
         screenshots = Path(".pytest-tmp/screenshots")
@@ -572,10 +795,10 @@ def test_cancel_failures_release_flow_without_retry(page, cfg, monkeypatch, fail
                 })
 
         page.route("**/api/queue/cancel", cancel_route)
-        page.on("dialog", lambda dialog: dialog.accept())
         page.goto(web_app.create_confirmation_url(base))
         page.locator(f'[data-operation-id="{child_id}"] input').uncheck()
         page.locator("#cancel-selected").click()
+        page.locator("#action-confirm-accept").click()
         scope = page.get_by_role("dialog", name="确认取消范围")
         if failure != "first_request":
             expect(scope).to_be_visible()
@@ -599,9 +822,14 @@ def test_cancel_failures_release_flow_without_retry(page, cfg, monkeypatch, fail
             expect(page.locator("#cancel-selected")).to_be_enabled()
             # Recovery of the entry permits a new explicit attempt, without auto-retrying.
             page.locator("#cancel-selected").click()
+            page.locator("#action-confirm-accept").click()
+            expected_requests = 3 if failure == "confirmed_request" else 2
+            deadline = time.monotonic() + 5
+            while len(requests) < expected_requests and time.monotonic() < deadline:
+                page.wait_for_timeout(25)
             expect(page.locator("#queue-message")).to_contain_text("取消请求失败")
             expect(page.locator("#cancel-selected")).to_be_enabled()
-            assert len(requests) == (3 if failure == "confirmed_request" else 2)
+            assert len(requests) == expected_requests
     finally:
         _stop()
 
@@ -638,8 +866,8 @@ def test_cancel_preview_limits_and_safe_text(page, cfg, monkeypatch, scenario):
         # Select a producer without thousands of individual checkbox interactions.
         expect(page.locator(f'[data-operation-id="{producer_id}"]')).to_be_visible()
         page.evaluate("id => { explicitSelected.clear(); setExplicitSelection(id, true); }", producer_id)
-        page.on("dialog", lambda dialog: dialog.accept())
         page.locator("#cancel-selected").click()
+        page.locator("#action-confirm-accept").click()
         scope = page.get_by_role("dialog", name="确认取消范围")
         if scenario == "missing_snapshot":
             expect(page.locator("#queue-message")).to_contain_text("展示记录不完整")

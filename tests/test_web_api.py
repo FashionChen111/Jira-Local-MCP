@@ -56,6 +56,185 @@ def test_state_supports_etag_304_and_security_headers(web_client, queue):
     assert first.headers["x-content-type-options"] == "nosniff"
 
 
+def test_issue_fields_reads_only_requested_fields(web_client, monkeypatch):
+    class FakeJira:
+        def issue(self, issue_key, fields):
+            assert issue_key == "PROJ-9"
+            assert fields == "summary,customfield_123"
+            return type(
+                "Issue",
+                (),
+                {
+                    "raw": {
+                        "key": issue_key,
+                        "fields": {
+                            "summary": "Old summary",
+                            "customfield_123": {"value": "Old value", "self": "hidden"},
+                            "unused": "not requested",
+                        },
+                    }
+                },
+            )()
+
+    monkeypatch.setattr(web_app.jira_client, "get_client", lambda: FakeJira())
+    response = web_client.post(
+        "/api/issue-fields",
+        json={
+            "issue_key": "PROJ-9",
+            "fields": ["summary", "customfield_123"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "key": "PROJ-9",
+        "fields": {
+            "summary": "Old summary",
+            "customfield_123": {"value": "Old value"},
+        },
+    }
+
+
+def test_issue_fields_rejects_non_field_ids(web_client):
+    response = web_client.post(
+        "/api/issue-fields",
+        json={"issue_key": "PROJ-9", "fields": ["summary,*"]},
+    )
+    assert response.status_code == 422
+
+
+def test_issue_preview_reads_all_editable_fields_without_writing(web_client, monkeypatch):
+    class FakeJira:
+        def editmeta(self, issue_key):
+            assert issue_key == "PROJ-9"
+            return {
+                "fields": {
+                    "summary": {
+                        "name": "Summary",
+                        "schema": {"type": "string", "system": "summary"},
+                    },
+                    "customfield_123": {
+                        "name": "Count",
+                        "schema": {"type": "number"},
+                    },
+                }
+            }
+
+        def issue(self, issue_key, fields):
+            assert issue_key == "PROJ-9"
+            assert fields == "summary,customfield_123"
+            return type(
+                "Issue",
+                (),
+                {
+                    "raw": {
+                        "key": issue_key,
+                        "fields": {
+                            "summary": "Old summary",
+                            "customfield_123": 3,
+                        },
+                    }
+                },
+            )()
+
+    monkeypatch.setattr(web_app.jira_client, "get_client", lambda: FakeJira())
+    response = web_client.post(
+        "/api/issue-preview", json={"issue_key": "PROJ-9"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "key": "PROJ-9",
+        "fields": [
+            {
+                "field_id": "summary",
+                "name": "Summary",
+                "schema": {"type": "string"},
+                "current_value": "Old summary",
+                "has_current_value": True,
+            },
+            {
+                "field_id": "customfield_123",
+                "name": "Count",
+                "schema": {"type": "number"},
+                "current_value": 3,
+                "has_current_value": True,
+            },
+        ],
+    }
+
+
+def test_issue_preview_rejects_invalid_issue_key(web_client):
+    response = web_client.post(
+        "/api/issue-preview", json={"issue_key": "invalid"}
+    )
+    assert response.status_code == 422
+
+
+def test_issue_transition_returns_current_and_target_status(web_client, monkeypatch):
+    class FakeJira:
+        def issue(self, issue_key, fields):
+            assert issue_key == "VODCER-233"
+            assert fields == "status"
+            return type(
+                "Issue",
+                (),
+                {
+                    "raw": {
+                        "key": issue_key,
+                        "fields": {"status": {"id": "3", "name": "处理中"}},
+                    }
+                },
+            )()
+
+        def transitions(self, issue):
+            return [
+                {
+                    "id": "21",
+                    "name": "任务结束",
+                    "to": {"id": "6", "name": "完成"},
+                    "fields": {},
+                }
+            ]
+
+    monkeypatch.setattr(web_app.jira_client, "get_client", lambda: FakeJira())
+    response = web_client.post(
+        "/api/issue-transition",
+        json={"issue_key": "VODCER-233", "transition_id": "21"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "issue_key": "VODCER-233",
+        "current_status": "处理中",
+        "transition": {
+            "id": "21",
+            "name": "任务结束",
+            "target_status": "完成",
+        },
+    }
+
+
+def test_issue_transition_rejects_invalid_id_and_stale_transition(web_client, monkeypatch):
+    invalid = web_client.post(
+        "/api/issue-transition",
+        json={"issue_key": "PROJ-9", "transition_id": "21x"},
+    )
+    assert invalid.status_code == 422
+
+    class FakeJira:
+        def issue(self, issue_key, fields):
+            return type("Issue", (), {"raw": {"fields": {"status": {"name": "处理中"}}}})()
+
+        def transitions(self, issue):
+            return [{"id": "22", "name": "其他流转", "to": {"name": "待处理"}}]
+
+    monkeypatch.setattr(web_app.jira_client, "get_client", lambda: FakeJira())
+    stale = web_client.post(
+        "/api/issue-transition",
+        json={"issue_key": "PROJ-9", "transition_id": "21"},
+    )
+    assert stale.status_code == 404
+    assert "不再适用于" in stale.json()["error"]
+
+
 def test_mutation_models_reject_extra_empty_duplicate_and_malformed(web_client):
     valid = "op-" + "a" * 32
     bodies = [

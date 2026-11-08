@@ -3,52 +3,113 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Jira Operation 审核</title>
+    <title>Jira 操作审核台</title>
     <link rel="stylesheet" href="/static/confirm.css" />
   </head>
   <body>
-    <header>
-      <h1>Jira Operation 审核</h1>
-      <p>所有写入必须在本页面明确提交；入队和打开页面均不代表已执行。</p>
+    <header class="topbar">
+      <a class="brand" href="/queue" aria-label="Jira 操作审核台首页">
+        <span class="brand-mark">J</span>
+        <span><strong>Jira 操作审核台</strong><small>本地安全授权</small></span>
+      </a>
+      <span class="session-state"><i></i>审核会话有效</span>
     </header>
     <main>
-      <section class="panel" id="queue-panel">
-        <div class="panel-title">
-          <h2>实时审核队列</h2>
-          <span id="queue-revision"></span>
+      <header class="page-heading">
+        <div>
+          <h1>操作审核</h1>
+          <p>确认要提交到 Jira 的变更；未提交的操作不会执行。</p>
         </div>
-        <div class="actions">
-          <button id="select-all">全选</button
-          ><button id="submit-selected" class="primary">提交勾选</button>
-          <button id="cancel-selected" class="danger">取消勾选</button
-          ><span id="queue-message"></span>
+        <div class="page-heading-actions">
+          <button id="field-preview-open" class="secondary-action" type="button">字段对比预览</button>
+          <span class="live-state">实时同步</span>
         </div>
-        <div id="queue-content"></div>
+      </header>
+
+      <section class="metrics" aria-label="操作概览">
+        <article class="metric"><span>待审核</span><strong id="metric-queue">—</strong><i class="metric-icon blue">≡</i></article>
+        <article class="metric"><span>执行中</span><strong id="metric-executing">—</strong><i class="metric-icon green">↗</i></article>
+        <article class="metric"><span>需要处理</span><strong id="metric-attention">—</strong><i class="metric-icon amber">!</i></article>
+        <article class="metric"><span>今日完成</span><strong id="metric-today">—</strong><i class="metric-icon slate">✓</i></article>
       </section>
-      <section class="panel">
-        <h2>暂存与阻塞</h2>
-        <div id="staging-content"></div>
-      </section>
-      <section class="panel">
-        <h2>执行中</h2>
-        <div id="executing-content"></div>
-      </section>
-      <section class="panel">
-        <div class="panel-title">
-          <h2>执行历史</h2>
-          <div>
-            <label>本地日期 <input id="history-date" type="date" /></label
-            ><button id="history-refresh">查询</button>
+
+      <section class="workspace">
+        <nav class="tabs" aria-label="操作状态">
+          <button class="tab active" id="tab-queue" type="button" aria-selected="true">待审核 <span class="count" id="tab-count-queue">0</span></button>
+          <button class="tab" id="tab-executing" type="button" aria-selected="false">执行中 <span class="count" id="tab-count-executing">0</span></button>
+          <button class="tab" id="tab-attention" type="button" aria-selected="false">需要处理 <span class="count" id="tab-count-attention">0</span></button>
+          <button class="tab" id="tab-history" type="button" aria-selected="false">执行历史</button>
+        </nav>
+
+        <section class="tab-panel" id="queue-panel" aria-labelledby="tab-queue">
+          <div class="filters">
+            <label class="search"><span aria-hidden="true">⌕</span><input id="queue-search" type="search" placeholder="搜索事务 Key 或操作说明" aria-label="搜索事务 Key 或操作说明" /></label>
+            <label class="visually-hidden" for="risk-filter">风险等级</label>
+            <select id="risk-filter" class="filter-control"><option value="">所有风险</option><option value="low">低风险</option><option value="medium">中风险</option><option value="high">高风险</option></select>
+            <label class="visually-hidden" for="type-filter">操作类型</label>
+            <select id="type-filter" class="filter-control"><option value="">所有操作</option></select>
+            <span class="filter-spacer"></span>
+            <button id="select-all" class="text-button" type="button">全选</button>
           </div>
-        </div>
-        <div id="history-content"></div>
-        <div class="actions">
-          <button id="history-prev">上一页</button
-          ><span id="history-page"></span
-          ><button id="history-next">下一页</button>
-        </div>
+          <div class="queue-layout">
+            <section class="queue-list">
+              <div class="column-heading"><strong>待审核操作</strong><span>选择操作查看详情</span></div>
+              <div id="queue-content"></div>
+            </section>
+            <aside class="operation-detail" id="operation-detail" aria-live="polite">
+              <div id="detail-empty" class="detail-empty">选择一项操作，查看变更内容和授权影响。</div>
+              <div id="detail-content" hidden></div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="executing-panel" aria-labelledby="tab-executing" hidden>
+          <div class="status-section">
+            <div class="column-heading"><strong>等待执行</strong><span>已授权，等待后台 worker</span></div>
+            <div id="staging-content"></div>
+          </div>
+          <div class="status-section">
+            <div class="column-heading"><strong>正在执行</strong><span>Jira 写操作进行中</span></div>
+            <div id="executing-content"></div>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="attention-panel" aria-labelledby="tab-attention" hidden>
+          <div class="status-section">
+            <div class="column-heading"><strong>需要人工核对</strong><span>处置前请确认 Jira 上的实际结果</span></div>
+            <div id="attention-content"></div>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="history-panel" aria-labelledby="tab-history" hidden>
+          <div class="history-tools">
+            <label>本地日期 <input id="history-date" type="date" /></label>
+            <button id="history-refresh" type="button">查询</button>
+          </div>
+          <div id="history-content"></div>
+          <div class="history-pagination">
+            <button id="history-prev" type="button">上一页</button>
+            <span id="history-page"></span>
+            <button id="history-next" type="button">下一页</button>
+          </div>
+        </section>
       </section>
+      <p class="page-message" id="queue-message" role="status"></p>
     </main>
+
+    <footer class="actionbar">
+      <div class="actionbar-inner">
+        <div class="selection-summary">
+          <span class="selection-count" id="selected-count">0</span>
+          <span><strong>已选择 <span id="selected-label">0 项</span></strong><small id="selection-hint">依赖操作会自动一并纳入提交</small></span>
+        </div>
+        <div class="action-buttons">
+          <button id="cancel-selected" class="secondary-action" type="button">取消所选</button>
+          <button id="submit-selected" class="primary-action" type="button">审核并提交 <span aria-hidden="true">→</span></button>
+        </div>
+      </div>
+    </footer>
+
     <dialog id="cancel-scope-dialog" aria-labelledby="cancel-scope-title" aria-describedby="cancel-scope-summary">
       <h2 id="cancel-scope-title">确认取消范围</h2>
       <p id="cancel-scope-summary"></p>
@@ -58,6 +119,43 @@
       <div class="actions">
         <button id="cancel-scope-back" autofocus>返回</button>
         <button id="cancel-scope-confirm" class="danger">确认取消全部</button>
+      </div>
+    </dialog>
+    <dialog id="action-confirm-dialog" aria-labelledby="action-confirm-title" aria-describedby="action-confirm-message">
+      <h2 id="action-confirm-title"></h2>
+      <p id="action-confirm-message"></p>
+      <ul id="action-confirm-list"></ul>
+      <div class="actions">
+        <button id="action-confirm-cancel" type="button">返回</button>
+        <button id="action-confirm-accept" class="primary" type="button">确认</button>
+      </div>
+    </dialog>
+    <dialog id="resolution-dialog" aria-labelledby="resolution-title" aria-describedby="resolution-description">
+      <h2 id="resolution-title"></h2>
+      <p id="resolution-description"></p>
+      <form id="resolution-form">
+        <div id="resolution-fields"></div>
+        <p id="resolution-error" role="status"></p>
+        <div class="actions">
+          <button id="resolution-cancel" type="button">返回</button>
+          <button class="primary" type="submit">确认信息</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="field-preview-dialog" class="field-preview-dialog" aria-labelledby="field-preview-title">
+      <h2 id="field-preview-title">字段对比预览</h2>
+      <p>读取事务当前可编辑字段，并生成仅供查看的示例修改值。不会写入 Jira，也不会进入审核队列。</p>
+      <form id="field-preview-form">
+        <label for="field-preview-issue-key">Jira 事务 Key</label>
+        <div class="field-preview-input-row">
+          <input id="field-preview-issue-key" name="issue_key" type="text" required maxlength="255" placeholder="例如 PROJ-123" />
+          <button id="field-preview-load" class="primary" type="submit">读取字段</button>
+        </div>
+      </form>
+      <p id="field-preview-message" role="status"></p>
+      <div id="field-preview-results" hidden></div>
+      <div class="actions">
+        <button id="field-preview-close" type="button">关闭</button>
       </div>
     </dialog>
     <script src="/static/confirm.js" defer></script>

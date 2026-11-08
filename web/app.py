@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 import threading
 import time
@@ -23,6 +24,7 @@ from pydantic import (
 
 from config import get_config
 from core import jira_client
+from core.jira_metadata import IssueContext, error_response, object_value, project_value
 from core.executing import worker as execution_worker
 from core.runtime_logger import get_logger, redact
 from core.operations import (
@@ -112,6 +114,55 @@ class ResolveIndeterminateRequest(StrictModel):
 
 class ResolveHeldRequest(IdListModel):
     action: Literal["resume", "requeue", "abandon"]
+
+
+class IssueFieldsRequest(StrictModel):
+    issue_key: str = Field(min_length=3, max_length=255)
+    fields: list[str] = Field(min_length=1, max_length=100)
+
+    @field_validator("issue_key")
+    @classmethod
+    def valid_issue_key(cls, value: str) -> str:
+        IssueContext(kind="issue", issue_key=value)
+        return value
+
+    @field_validator("fields")
+    @classmethod
+    def valid_field_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)) or any(
+            not re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9_]*|customfield_[0-9]+)", value)
+            for value in values
+        ):
+            raise ValueError("fields 必须是唯一且有效的 Jira 字段 ID")
+        return values
+
+
+class IssuePreviewRequest(StrictModel):
+    issue_key: str = Field(min_length=3, max_length=255)
+
+    @field_validator("issue_key")
+    @classmethod
+    def valid_issue_key(cls, value: str) -> str:
+        IssueContext(kind="issue", issue_key=value)
+        return value
+
+
+class IssueTransitionRequest(StrictModel):
+    issue_key: str = Field(min_length=3, max_length=255)
+    transition_id: str = Field(min_length=1, max_length=32)
+
+    @field_validator("issue_key")
+    @classmethod
+    def valid_issue_key(cls, value: str) -> str:
+        IssueContext(kind="issue", issue_key=value)
+        return value
+
+    @field_validator("transition_id")
+    @classmethod
+    def valid_transition_id(cls, value: str) -> str:
+        if not value.isascii() or not value.isdecimal():
+            raise ValueError("transition_id 必须是十进制 ID")
+        return value
 
 
 def create_confirmation_url(base_url: str) -> str:
@@ -218,6 +269,158 @@ def create_app(
         if request.headers.get("if-none-match") == etag:
             return Response(status_code=304, headers={"ETag": etag})
         return JSONResponse(state, headers={"ETag": etag})
+
+    @app.post("/api/issue-fields")
+    def api_issue_fields(body: IssueFieldsRequest) -> Any:
+        try:
+            issue = jira_client.get_client().issue(
+                body.issue_key, fields=",".join(body.fields)
+            )
+            raw = object_value(issue)
+            fields = object_value(raw.get("fields", {}))
+            return JSONResponse(
+                {
+                    "key": raw.get("key", body.issue_key),
+                    "fields": {
+                        field_id: project_value(fields[field_id])
+                        for field_id in body.fields
+                        if field_id in fields
+                    },
+                }
+            )
+        except Exception as exc:
+            get_logger().error(
+                f"/api/issue-fields 异常: {type(exc).__name__}"
+            )
+            return JSONResponse(
+                {
+                    "error": "读取 Jira 当前字段失败",
+                    "details": error_response(exc),
+                },
+                status_code=502,
+            )
+
+    @app.post("/api/issue-preview")
+    def api_issue_preview(body: IssuePreviewRequest) -> Any:
+        try:
+            client = jira_client.get_client()
+            metadata = object_value(client.editmeta(body.issue_key))
+            editable_fields = object_value(metadata.get("fields", {}))
+            field_ids = list(editable_fields)
+            if len(field_ids) > 100:
+                return JSONResponse(
+                    {"error": "可编辑字段超过 100 项，无法安全展示完整预览"},
+                    status_code=422,
+                )
+            if any(
+                not re.fullmatch(
+                    r"(?:[A-Za-z][A-Za-z0-9_]*|customfield_[0-9]+)",
+                    field_id,
+                )
+                for field_id in field_ids
+            ):
+                return JSONResponse(
+                    {"error": "Jira 返回了无法安全展示的字段 ID"},
+                    status_code=502,
+                )
+            if field_ids:
+                issue = client.issue(body.issue_key, fields=",".join(field_ids))
+                issue_data = object_value(issue)
+                current_fields = object_value(issue_data.get("fields", {}))
+                issue_key = issue_data.get("key", body.issue_key)
+            else:
+                current_fields = {}
+                issue_key = body.issue_key
+            rows = []
+            for field_id in field_ids:
+                metadata_row = object_value(editable_fields[field_id])
+                schema = metadata_row.get("schema")
+                rows.append(
+                    {
+                        "field_id": field_id,
+                        "name": metadata_row.get("name", field_id),
+                        "schema": (
+                            {
+                                key: project_value(schema[key])
+                                for key in ("type", "items")
+                                if key in schema
+                            }
+                            if isinstance(schema, dict)
+                            else {}
+                        ),
+                        "current_value": (
+                            project_value(current_fields[field_id])
+                            if field_id in current_fields
+                            else None
+                        ),
+                        "has_current_value": field_id in current_fields,
+                    }
+                )
+            return JSONResponse(
+                {"key": issue_key, "fields": rows}
+            )
+        except Exception as exc:
+            get_logger().error(
+                f"/api/issue-preview 异常: {type(exc).__name__}"
+            )
+            return JSONResponse(
+                {
+                    "error": "读取 Jira 可编辑字段预览失败",
+                    "details": error_response(exc),
+                },
+                status_code=502,
+            )
+
+    @app.post("/api/issue-transition")
+    def api_issue_transition(body: IssueTransitionRequest) -> Any:
+        try:
+            client = jira_client.get_client()
+            issue = client.issue(body.issue_key, fields="status")
+            issue_data = object_value(issue)
+            issue_fields = object_value(issue_data.get("fields", {}))
+            status_data = issue_fields.get("status")
+            current_status = (
+                object_value(status_data) if isinstance(status_data, dict) else {}
+            )
+            transition_data = None
+            for item in client.transitions(issue):
+                item_data = object_value(item)
+                if str(item_data.get("id")) == body.transition_id:
+                    transition_data = item_data
+                    break
+            if transition_data is None:
+                return JSONResponse(
+                    {"error": "该流转已不再适用于此事务，请刷新后重新审核"},
+                    status_code=404,
+                )
+            target_status = transition_data.get("to")
+            target = (
+                object_value(target_status)
+                if isinstance(target_status, dict)
+                else {}
+            )
+            return JSONResponse(
+                {
+                    "issue_key": body.issue_key,
+                    "current_status": current_status.get("name"),
+                    "transition": {
+                        "id": body.transition_id,
+                        "name": transition_data.get("name"),
+                        "target_status": target.get("name"),
+                    },
+                }
+            )
+        except Exception as exc:
+            get_logger().error(
+                f"/api/issue-transition 异常: {type(exc).__name__}"
+            )
+            return JSONResponse(
+                {
+                    "error": "读取 Jira 状态流转信息失败",
+                    "details": error_response(exc),
+                },
+                status_code=502,
+            )
 
     @app.post("/api/queue/cancel")
     def api_cancel(body: CancelRequest) -> Any:
