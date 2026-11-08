@@ -360,6 +360,16 @@ def test_field_preview_shows_all_rows_without_adding_queue_operations(
                             "current_value": 3,
                             "has_current_value": True,
                         },
+                        {
+                            "field_id": "attachment",
+                            "name": "Attachments",
+                            "schema": {"type": "array", "items": "attachment"},
+                            "current_value": [
+                                {"filename": "first.eml"},
+                                {"filename": "second.eml"},
+                            ],
+                            "has_current_value": True,
+                        },
                     ],
                 }
             )
@@ -377,13 +387,18 @@ def test_field_preview_shows_all_rows_without_adding_queue_operations(
         page.get_by_label("Jira 事务 Key").fill("PROJ-9")
         page.get_by_role("button", name="读取字段").click()
         expect(page.get_by_role("table", name="Jira 字段变更前后对比")).to_be_visible()
-        expect(page.locator("#field-preview-results .diff-row")).to_have_count(2)
+        expect(page.locator("#field-preview-results .diff-row")).to_have_count(3)
         expect(
             page.locator("#field-preview-results .diff-row").nth(0).locator(":scope > div")
         ).to_have_text(["Summary预览修改", "Old summary", "Old summary（预览修改）"])
         expect(
             page.locator("#field-preview-results .diff-row").nth(1).locator(":scope > div")
         ).to_have_text(["Count预览修改", "3", "4"])
+        expect(
+            page.locator("#field-preview-results .diff-row").nth(2).locator(":scope > div")
+        ).to_have_text(
+            ["Attachments预览修改", "first.eml、second.eml", "示例Attachments（仅预览）"]
+        )
         expect(page.get_by_text("不会写入 Jira，也不会进入审核队列")).to_be_visible()
         assert requested == [{"issue_key": "PROJ-9"}]
         assert mutating_requests == []

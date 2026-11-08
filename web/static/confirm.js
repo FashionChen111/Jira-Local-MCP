@@ -409,7 +409,17 @@ function displayFieldValue(value) {
     return value.map(displayFieldValue).join("、") || "未设置";
   }
   if (typeof value === "object") {
-    for (const key of ["displayName", "name", "value", "key"]) {
+    for (const key of [
+      "displayName",
+      "name",
+      "value",
+      "key",
+      "filename",
+      "timeSpent",
+      "remainingEstimate",
+      "originalEstimate",
+      "body",
+    ]) {
       if (value[key] !== undefined && value[key] !== null) {
         return String(value[key]);
       }

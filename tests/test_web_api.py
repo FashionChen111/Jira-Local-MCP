@@ -116,12 +116,16 @@ def test_issue_preview_reads_all_editable_fields_without_writing(web_client, mon
                         "name": "Count",
                         "schema": {"type": "number"},
                     },
+                    "attachment": {
+                        "name": "Attachments",
+                        "schema": {"type": "array", "items": "attachment"},
+                    },
                 }
             }
 
         def issue(self, issue_key, fields):
             assert issue_key == "PROJ-9"
-            assert fields == "summary,customfield_123"
+            assert fields == "summary,customfield_123,attachment"
             return type(
                 "Issue",
                 (),
@@ -131,6 +135,12 @@ def test_issue_preview_reads_all_editable_fields_without_writing(web_client, mon
                         "fields": {
                             "summary": "Old summary",
                             "customfield_123": 3,
+                            "attachment": [
+                                {
+                                    "filename": "first.eml",
+                                    "content": "https://jira.invalid/attachment/1",
+                                }
+                            ],
                         },
                     }
                 },
@@ -156,6 +166,13 @@ def test_issue_preview_reads_all_editable_fields_without_writing(web_client, mon
                 "name": "Count",
                 "schema": {"type": "number"},
                 "current_value": 3,
+                "has_current_value": True,
+            },
+            {
+                "field_id": "attachment",
+                "name": "Attachments",
+                "schema": {"type": "array", "items": "attachment"},
+                "current_value": [{"filename": "first.eml"}],
                 "has_current_value": True,
             },
         ],

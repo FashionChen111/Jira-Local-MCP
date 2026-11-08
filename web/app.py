@@ -185,6 +185,34 @@ def _store_error(exc: Exception) -> JSONResponse:
     return JSONResponse(data, status_code=409)
 
 
+def _issue_preview_value(field_id: str, value: Any) -> Any:
+    if field_id == "attachment" and isinstance(value, list):
+        return [
+            {"filename": item["filename"]}
+            for item in value
+            if isinstance(item, dict) and isinstance(item.get("filename"), str)
+        ]
+    if field_id == "timetracking" and isinstance(value, dict):
+        return {
+            key: project_value(value[key])
+            for key in ("originalEstimate", "remainingEstimate", "timeSpent")
+            if key in value
+        }
+    if field_id == "comment" and isinstance(value, dict):
+        comments = value.get("comments")
+        if isinstance(comments, list):
+            return [
+                {
+                    key: project_value(comment[key])
+                    for key in ("author", "created", "body")
+                    if key in comment
+                }
+                for comment in comments
+                if isinstance(comment, dict)
+            ]
+    return project_value(value)
+
+
 def create_app(
     session_manager: ReviewSessionManager | None = None,
 ) -> FastAPI:
@@ -349,7 +377,9 @@ def create_app(
                             else {}
                         ),
                         "current_value": (
-                            project_value(current_fields[field_id])
+                            _issue_preview_value(
+                                field_id, current_fields[field_id]
+                            )
                             if field_id in current_fields
                             else None
                         ),
