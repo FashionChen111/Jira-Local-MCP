@@ -237,7 +237,9 @@ def test_generated_document_contains_exact_absolute_json_without_reading_credent
     import re
     root = tmp_path / '中文 Jira "path" with spaces'; root.mkdir()
     source = Path(__file__).resolve().parents[1]
-    (root / 'MCP_SETUP.template.md').write_bytes((source / 'MCP_SETUP.template.md').read_bytes())
+    template = root / 'docs/installation/MCP_SETUP.template.md'
+    template.parent.mkdir(parents=True)
+    template.write_bytes((source / 'docs/installation/MCP_SETUP.template.md').read_bytes())
     python = root / '.venv/bin/python'
     (root / '.env').write_text('THIS FILE IS NOT VALID ENV SECRET')
     document = install._write_agent_setup(root, python)

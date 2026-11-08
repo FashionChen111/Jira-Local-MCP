@@ -299,7 +299,7 @@ def run_install(root: Path) -> int:
     try:
         document = _write_agent_setup(root, venv_python)
     except (OSError, ValueError, KeyError):
-        print("生成接入文档失败，请检查 MCP_SETUP.template.md 和目录权限。", file=sys.stderr)
+        print("生成接入文档失败，请检查 docs/installation/MCP_SETUP.template.md 和目录权限。", file=sys.stderr)
         return 1
     print(f"请将 {document} 发给 Agent 完成 MCP 配置。")
     return 0
@@ -322,7 +322,9 @@ def _write_agent_setup(root: Path, venv_python: Path) -> Path:
     command = str(venv_python.absolute())
     args = [str(root / "server.py")]
     config = {"mcpServers": {"jira-local-mcp": {"command": command, "args": args}}}
-    template = Template((root / "MCP_SETUP.template.md").read_text(encoding="utf-8"))
+    template = Template(
+        (root / "docs" / "installation" / "MCP_SETUP.template.md").read_text(encoding="utf-8")
+    )
     document = template.substitute(
         SYSTEM={"win32": "Windows", "darwin": "macOS", "linux": "Linux"}.get(sys.platform, sys.platform),
         PROJECT_DIR=json.dumps(str(root), ensure_ascii=False),

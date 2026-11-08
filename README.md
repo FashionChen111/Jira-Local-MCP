@@ -4,6 +4,8 @@
 
 Jira Local MCP 是面向 Jira Server/Data Center 的本地 STDIO MCP 安全网关。Jira 只读工具立即查询；`*_append` 工具创建不可编辑的 operation，必须由用户在 `127.0.0.1` 本地审核页提交后，才会被后台串行 worker 执行。Agent 还可以查询本地队列与执行状态，并撤回尚未提交的 queued 操作。
 
+产品需求文档见 [docs/PRD.md](docs/PRD.md)。
+
 ## 安全边界
 
 - MCP 不暴露提交、执行、人工对账或 Jira 删除能力；撤回只影响本地 queued 操作。
